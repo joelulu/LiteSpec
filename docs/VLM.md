@@ -4,6 +4,11 @@ This branch adds a **single-device HF reference trainer and evaluator** for
 `Qwen/Qwen3.5-4B`. Start with one local image and one question per sample.
 Text-only records can use the same manifest. Target weights are frozen.
 
+For large-scale answer regeneration, use the separate [SGLang vision client and
+FineVision adapter](VLM_SERVING_DATA.md). It supports bounded concurrency,
+multiple GPU servers and resume without loading target GPU weights in the client.
+The single-request HF generator below remains a correctness/debugging reference.
+
 The legacy distributed/text launchers are unchanged. They pin SGLang 0.5.9,
 which requires Transformers 4.57.1. The new HF path uses an independent,
 locked environment with Transformers 5.20.1 instead of breaking that stack.

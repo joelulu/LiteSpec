@@ -1,0 +1,7 @@
+{
+  "prefill_text": "keep",
+  "prefill_vision": "keep",
+  "decode_mode": "drop_recent",
+  "window_size": 16,
+  "implementation": "compact"
+}

@@ -1,0 +1,7 @@
+{
+  "prefill_text": "drop",
+  "prefill_vision": "drop",
+  "decode_mode": "keep_last",
+  "window_size": 16,
+  "implementation": "mask"
+}

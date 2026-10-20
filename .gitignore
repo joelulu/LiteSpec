@@ -240,3 +240,8 @@ inductor-cache/
 triton-cache/
 *.nsys-rep
 *.ncu-rep
+# Local VLM reference environment and generated test artifacts
+.venv-vlm/
+environments/vlm/.venv/
+tests/results/
+tests/outputs/

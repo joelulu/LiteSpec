@@ -1,0 +1,7 @@
+{
+  "prefill_text": "drop",
+  "prefill_vision": "keep",
+  "decode_mode": "all",
+  "window_size": 0,
+  "implementation": "compact"
+}

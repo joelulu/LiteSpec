@@ -114,6 +114,13 @@ Native total wall time includes prefill and decode. Detailed stage times are
 marked unavailable, rather than adding synchronization to this timing control.
 
 The second stage runs the same text prompts through the VLM reference path.
+Both reference stages also compare the trained DSpark checkpoint, defaulting to
+`runs/vlm_three_3ep_20261021_045040_2983971/dspark/last` under the workspace;
+override it with `DSPARK_3EP`. DSpark uses its own draft implementation and cache
+through the shared HF reference scheduler. The native text stage remains DLite
+only because `spec_generate` there is a DLite-specific entry point. DSpark token
+matches and timing are reported independently; they do not change the DLite
+text gate. The general `tests/compare_vlm_16.sh` also includes DSpark by default.
 This isolates the effect of changing the execution path with fixed prompts.
 Only if both text paths match their respective AR tokens exactly and the native
 text path has wall-time speedup greater than one does the script start image

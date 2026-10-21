@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Three supplied checkpoints + AR, same 16 prompts, C=1/4/8 on one GPU.
+# Four supplied checkpoints + AR, same 16 prompts, C=1/4/8 on one GPU.
 set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -d "$HERE/LiteSpec" ]]; then
@@ -16,9 +16,11 @@ THREE_RUN="$DLITE_WORKSPACE/runs/vlm_three_3ep_20261021_045040_2983971"
 DLITE_6EP="${DLITE_6EP:-$DLITE_WORKSPACE/runs/dlite_vlm_aligned_6ep_20261021_022447/last}"
 DLITE_3EP="${DLITE_3EP:-$THREE_RUN/dlite/last}"
 DFLASH_3EP="${DFLASH_3EP:-$THREE_RUN/dflash/last}"
+DSPARK_3EP="${DSPARK_3EP:-$THREE_RUN/dspark/last}"
 checkpoints=(--checkpoint dlite_6ep "$DLITE_6EP"
              --checkpoint dlite_3ep "$DLITE_3EP"
-             --checkpoint dflash_3ep "$DFLASH_3EP")
+             --checkpoint dflash_3ep "$DFLASH_3EP"
+             --checkpoint dspark_3ep "$DSPARK_3EP")
 if [[ "${ONLY_ORIGINAL:-0}" == 1 ]]; then
     checkpoints=(--checkpoint dlite_original "${ORIGINAL_DLITE:-$HOME/LMM/lmm_model/Qwen3.5-4B-DLite}")
 elif [[ -n "${ORIGINAL_DLITE:-}" ]]; then

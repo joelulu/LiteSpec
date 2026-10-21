@@ -42,6 +42,9 @@ if visible < workers:
 PY
 mkdir -p "$OUTPUT_DIR"
 limits=()
+if [[ -n "${REPORT_TO:-}" ]]; then
+    limits+=(--report-to "$REPORT_TO")
+fi
 # No implicit 1000-step cap. Only explicit debug requests may stop early.
 if [[ -n "${MAX_STEPS:-}" ]]; then
     limits+=(--max-steps "$MAX_STEPS")

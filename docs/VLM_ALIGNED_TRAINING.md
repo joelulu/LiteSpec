@@ -78,6 +78,32 @@ separate output directory for the first GPU integration check, then unset both
 for the real run. CPU numerical tests use an independent-block SDPA reference
 because PyTorch FlexAttention has no CPU backward; CUDA never takes this fallback.
 
+## Optional training curves
+
+Install `tensorboard` into the explicit `.venv-vlm/bin/python` environment without
+upgrading the model stack. Set `REPORT_TO=tensorboard` when launching either
+`scripts/dlite/run_training_vlm.sh` or `train_eval_vlm.sh`. Native events are
+written by rank zero to `OUTPUT_DIR/runs`. The optimizer-step axis records loss,
+CE/L1 components, AdamW/Muon learning rates, pre-clipping gradient norm, epoch
+progress, token accuracy and acceptance diagnostics. Training acceptance metrics
+use teacher-forced training blocks; they are not held-out autoregressive decoding
+measurements. `REPORT_TO=wandb` also reuses the original tracker and its login
+configuration; tracking remains off unless explicitly selected.
+
+For a job already running with tracking disabled, keep it running and execute:
+
+```bash
+.venv-vlm/bin/python tests/vlm_log_to_tensorboard.py \
+  --log /absolute/path/to/run/train.log --follow
+.venv-vlm/bin/tensorboard --logdir /absolute/path/to/run --port 6006 --host 0.0.0.0
+```
+
+Run the two commands in separate terminals. The converter replays existing step
+records and follows new ones, writing `tensorboard_from_log`; omit `--follow`
+for a completed job. Start one converter per run to avoid duplicated events.
+Stopping it with Ctrl-C does not stop training. Converted logs contain completed
+epoch counts instead of the native fractional epoch progress.
+
 ## Checkpoints and resume
 
 The 2-layer/rank-64 smoke checkpoint is architecturally incompatible: start the

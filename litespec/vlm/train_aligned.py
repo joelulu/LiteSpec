@@ -245,7 +245,12 @@ def source_batches(session, phase):
 
 def log(session, window, grad_norm):
     metrics = window.metrics.reduce()
-    session.tracker.log({k: float(v) for k, v in metrics.items()}, step=session.state.optimizer_step)
+    scalars = {k: float(v) for k, v in metrics.items()}
+    scalars.update({f"learning_rate/{k}": float(v)
+                    for k, v in session.optimizer.get_learning_rates().items()})
+    scalars.update(grad_norm=float(grad_norm),
+                   epoch_progress=session.state.global_step / session.steps_per_epoch)
+    session.tracker.log(scalars, step=session.state.optimizer_step)
     completed = session.state.global_step // session.steps_per_epoch
     if rank() == 0:
         print(json.dumps(dict(optimizer_step=session.state.optimizer_step,
@@ -267,8 +272,12 @@ def run(argv=None):
         parser.add_argument("--" + flag)
     parser.add_argument("--max-steps", type=int, help="explicit debug optimizer-update cap; unset trains all six epochs")
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--report-to", choices=["none", "tensorboard", "wandb"],
+                        help="optional scalar tracking; defaults to YAML report_to")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
+    if args.report_to is not None:
+        cfg["report_to"] = args.report_to
     for key in ("target_model", "train_data", "output_dir"):
         if getattr(args, key) is not None:
             cfg[key] = getattr(args, key)

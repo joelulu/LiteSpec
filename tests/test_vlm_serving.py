@@ -17,7 +17,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from litespec.vlm.serving_data import (
     LengthValidator, chat_payload, first_image_record, normalize_server,
-    output_lock, prepare_manifest, read_jsonl, regenerate, request_answer,
+    output_lock, prepare_manifest, read_jsonl, regenerate, request_answer, ShortAnswer,
 )
 
 
@@ -142,6 +142,14 @@ class ServingTests(unittest.TestCase):
         result = prepare_manifest(source, self.root / "manifest", 2)
         self.assertEqual(sum(result["counts"].get(x, 0) for x in ("train", "val")), 2)
 
+    def test_manifest_duplicates_do_not_consume_sample_budget(self):
+        source = self.root / "source.jsonl"
+        rows = [self.raw(), self.raw(), self.raw("second")]
+        source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        result = prepare_manifest(source, self.root / "manifest", 2)
+        self.assertEqual(result["counts"]["duplicate"], 1)
+        self.assertEqual(sum(result["counts"].get(x, 0) for x in ("train", "val")), 2)
+
     def test_image_payload_contains_bytes_not_placeholder(self):
         record = first_image_record(self.raw(), self.root)
         payload = chat_payload(record, "qwen35-vlm", 32)
@@ -210,6 +218,18 @@ class ServingTests(unittest.TestCase):
         with server(model="different-checkpoint") as (address, _):
             result = regenerate(self.args(self.manifest(1), [address]), Validator())
             self.assertEqual(result["failed"], 1)
+
+    def test_deterministic_short_answers_are_reported_and_not_retried(self):
+        class ShortValidator(Validator):
+            def answer(self, record, prefix):
+                raise ShortAnswer("answer too short")
+        with server() as (address, state):
+            args = self.args(self.manifest(1), [address])
+            result = regenerate(args, ShortValidator())
+            self.assertEqual(result["skipped"], 1)
+            self.assertEqual(result.get("failed", 0), 0)
+            self.assertEqual(regenerate(args, ShortValidator())["submitted"], 0)
+            self.assertEqual(len(state["requests"]), 1)
 
     def test_lock_and_url_validation(self):
         with output_lock(self.root):

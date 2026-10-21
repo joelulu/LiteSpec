@@ -19,7 +19,7 @@ from pathlib import Path
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, ProxyHandler
 
 
 def read_jsonl(path):
@@ -108,7 +108,7 @@ def prepare_manifest(source, output_dir, max_samples=10000):
     settings = {"source": str(source), "source_sha256": file_digest(source),
                 "max_samples": max_samples, "prompt_path": "conversations[0].content",
                 "turn_mode": "first", "split": "image_path_sha256_mod100_val5",
-                "schema_version": 1}
+                "schema_version": 2}
     with output_lock(directory):
         meta, manifest = directory / "manifest_config.json", directory / "prompts.jsonl"
         if meta.exists():
@@ -134,11 +134,11 @@ def prepare_manifest(source, output_dir, max_samples=10000):
                     counts[str(exc)] += 1
                     append_json(skipped, {"line": number, "reason": str(exc)})
                     continue
-                eligible += 1
                 if record["id"] in seen:
                     counts["duplicate"] += 1
                     continue
                 seen.add(record["id"])
+                eligible += 1
                 append_json(handle, record)
                 counts[record["split"]] += 1
         if not seen:
@@ -169,7 +169,8 @@ def http_json(url, *, body=None, timeout=600, api_key=None):
     if api_key:
         headers["Authorization"] = "Bearer " + api_key
     request = Request(url, data=None if body is None else json.dumps(body).encode(), headers=headers)
-    with urlopen(request, timeout=timeout) as response:
+    opener = build_opener(ProxyHandler({})) if urlsplit(url).hostname in {"localhost", "127.0.0.1", "::1"} else None
+    with (opener.open(request, timeout=timeout) if opener else urlopen(request, timeout=timeout)) as response:
         return json.load(response)
 
 
@@ -186,14 +187,19 @@ def chat_payload(record, model, max_tokens):
         "chat_template_kwargs": {"enable_thinking": False}}
 
 
+class ShortAnswer(ValueError):
+    pass
+
+
 class LengthValidator:
     """CPU-only, native HF processor matching the training input contract."""
 
-    def __init__(self, target_model, max_length, max_new_tokens):
+    def __init__(self, target_model, max_length, max_new_tokens, min_answer_tokens=2):
         from transformers import AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(target_model)
         self.max_length, self.max_new_tokens = max_length, max_new_tokens
+        self.min_answer_tokens = min_answer_tokens
 
     def encode(self, record, *, answer=None):
         from PIL import Image
@@ -222,8 +228,8 @@ class LengthValidator:
         prefix_length = len(prefix)
         if tokens[:prefix_length] != prefix:
             raise ValueError("chat template is not prefix-stable")
-        if len(tokens) < prefix_length + 2:
-            raise ValueError("answer too short for a supervised draft position")
+        if len(tokens) < prefix_length + getattr(self, "min_answer_tokens", 2):
+            raise ShortAnswer("answer too short for the requested supervision budget")
 
 
 def request_answer(record, server, *, model, max_tokens, timeout, retries, api_key=None):
@@ -245,6 +251,7 @@ def request_answer(record, server, *, model, max_tokens, timeout, retries, api_k
                 "backend": "sglang", "model": response["model"],
                 "server": server, "finish_reason": choice.get("finish_reason"),
                 "completion_tokens": response.get("usage", {}).get("completion_tokens"),
+                "prompt_tokens": response.get("usage", {}).get("prompt_tokens"),
                 "request_seconds": time.monotonic() - started, "attempts": attempt + 1}}
         except (HTTPError, URLError, TimeoutError, ConnectionError, OSError) as exc:
             transient = not isinstance(exc, HTTPError) or exc.code in {408, 429, 500, 502, 503, 504}
@@ -260,6 +267,9 @@ def regenerate(args, validator=None):
         raise ValueError("invalid concurrency, retries or timeout")
     if args.max_tokens < 1 or args.max_length <= args.max_tokens:
         raise ValueError("invalid token/length budget")
+    min_answer_tokens = getattr(args, "min_answer_tokens", 2)
+    if not 1 <= min_answer_tokens <= args.max_tokens:
+        raise ValueError("min_answer_tokens must lie between 1 and max_tokens")
     servers = list(dict.fromkeys(normalize_server(x) for x in args.server_address))
     manifest, directory = Path(args.manifest).resolve(), Path(args.output_dir).resolve()
     records = [row for _, row in read_jsonl(manifest)]
@@ -276,6 +286,21 @@ def regenerate(args, validator=None):
                     "backend": "sglang", "model": args.model, "temperature": 0.0,
                     "enable_thinking": False, "max_tokens": args.max_tokens,
                     "max_length": args.max_length, "schema_version": 1}
+        if min_answer_tokens != 2:
+            settings["min_answer_tokens"] = min_answer_tokens
+        image_budget = None
+        if getattr(args, "image_max_tokens", 0):
+            from transformers import AutoProcessor
+            processor = AutoProcessor.from_pretrained(args.target_model).image_processor
+            factor = int(processor.patch_size) * int(processor.merge_size)
+            native_min = getattr(processor, "min_pixels", processor.size["shortest_edge"])
+            native_max = getattr(processor, "max_pixels", processor.size["longest_edge"])
+            image_budget = dict(factor=factor, min_pixels=int(native_min),
+                                max_pixels=int(args.image_max_tokens) * factor * factor)
+            if not native_min <= image_budget["max_pixels"] <= native_max:
+                raise ValueError("image token cap must lie within the native processor pixel range")
+            settings.update(schema_version=2, image_budget=image_budget)
+            settings["split"] = "image_content_sha256_mod100_val5"
         meta = directory / "generation_config.json"
         if meta.exists():
             if json.loads(meta.read_text()) != settings:
@@ -298,7 +323,7 @@ def regenerate(args, validator=None):
             available = http_json(server + "/models", timeout=min(args.timeout, 30), api_key=api_key)
             if args.model not in {x["id"] for x in available.get("data", [])}:
                 raise ValueError(f"model {args.model!r} is not served at {server}")
-        validator = validator or LengthValidator(args.target_model, args.max_length, args.max_tokens)
+        validator = validator or LengthValidator(args.target_model, args.max_length, args.max_tokens, min_answer_tokens)
         counts = Counter(already_done=len(done))
         started = time.monotonic()
         workers = args.concurrency * len(servers)
@@ -319,7 +344,13 @@ def regenerate(args, validator=None):
                     try:
                         result = {**record, **future.result(), "answer_target": args.target_model,
                                   "prefill_tokens": len(prefix)}
+                        reported = result["generation"].get("prompt_tokens")
+                        if reported is not None and reported != len(prefix):
+                            raise ValueError(f"server/CPU prompt token mismatch: {reported} != {len(prefix)}")
                         validator.answer(result, prefix)
+                    except ShortAnswer as exc:
+                        counts["skipped"] += 1
+                        append_json(skipped, {"id": record["id"], "reason": str(exc)})
                     except Exception as exc:
                         counts["failed"] += 1
                         append_json(errors, {"id": record["id"], "error_type": type(exc).__name__,
@@ -339,6 +370,9 @@ def regenerate(args, validator=None):
                 # Drain completed requests before CPU validation of the next input.
                 finish({f for f in pending if f.done()})
                 try:
+                    if image_budget:
+                        from .image_budget import materialize_image
+                        record = materialize_image(record, directory / "images", **image_budget)
                     prefix = validator.prompt(record)
                 except (ValueError, OSError) as exc:
                     append_json(skipped, {"id": record["id"], "reason": str(exc)})
@@ -386,6 +420,10 @@ def serving_main():
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--api-key-env", default="SGLANG_API_KEY")
+    parser.add_argument("--image-max-tokens", type=int, default=0,
+                        help="cap merged visual tokens via persistent resized PNGs; 0 keeps native images")
+    parser.add_argument("--min-answer-tokens", type=int, default=2,
+                        help="skip answers with fewer supervised tokens (includes chat end marker)")
     args = parser.parse_args()
     summary = regenerate(args)
     print(json.dumps(summary, indent=2))

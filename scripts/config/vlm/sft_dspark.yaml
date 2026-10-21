@@ -1,0 +1,13 @@
+upstream_config: scripts/config/dspark.yaml
+algorithm: dspark
+target_model: Qwen/Qwen3.5-4B
+train_data: /path/to/train.jsonl
+output_dir: outputs/vlm_dspark
+device: cuda
+target_model_backend: hf_vlm
+batch_size: 1
+accumulation_steps: 4
+loss_decay_gamma: 4
+log_interval: 1
+save_interval: 4000
+report_to: none

@@ -14,8 +14,10 @@ export DLITE_WORKSPACE="${DLITE_WORKSPACE:-$DEFAULT_WORKSPACE}"
 REPO_ROOT="$DLITE_WORKSPACE/LiteSpec"
 export PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv-vlm/bin/python}"
 export TARGET_MODEL="${TARGET_MODEL:-$HOME/LMM/lmm_model/Qwen3.5-4B}"
+export ALGORITHM="${ALGORITHM:-dlite}"
+case "$ALGORITHM" in dlite|dflash|dspark) ;; *) echo 'ALGORITHM must be dlite, dflash or dspark' >&2; exit 2 ;; esac
 export TRAIN_DATA="${TRAIN_DATA:-$DLITE_WORKSPACE/data/finevision_qwen35_sglang_20000/train.jsonl}"
-EVAL_DATA="${EVAL_DATA:-$DLITE_WORKSPACE/data/finevision_qwen35_sglang_20000/val.jsonl}"
+EVAL_DATA="${EVAL_DATA:-$(dirname -- "$TRAIN_DATA")/val.jsonl}"
 if [[ "$MODE" == eval && -z "${OUTPUT_DIR:-}" && -z "${CHECKPOINT:-}" ]]; then
     echo 'For eval, set OUTPUT_DIR to the completed run, or CHECKPOINT to its last directory.' >&2
     exit 2
@@ -24,7 +26,7 @@ if [[ -z "${OUTPUT_DIR:-}" && -n "${CHECKPOINT:-}" ]]; then
     export OUTPUT_DIR="$(dirname -- "$CHECKPOINT")"
 fi
 if [[ -z "${OUTPUT_DIR:-}" ]]; then
-    export OUTPUT_DIR="$DLITE_WORKSPACE/runs/dlite_vlm_aligned_6ep_$(date +%Y%m%d_%H%M%S)"
+    export OUTPUT_DIR="$DLITE_WORKSPACE/runs/${ALGORITHM}_vlm_6ep_$(date +%Y%m%d_%H%M%S)"
 fi
 CHECKPOINT="${CHECKPOINT:-$OUTPUT_DIR/last}"
 [[ -x "$PYTHON_BIN" ]] || { echo "Missing Python: $PYTHON_BIN" >&2; exit 1; }
@@ -36,7 +38,7 @@ mkdir -p "$OUTPUT_DIR"
 if [[ "$MODE" != eval ]]; then
     # This wrapper always requests the full aligned recipe, without smoke caps.
     unset MAX_STEPS MAX_SAMPLES
-    export CONFIG="$REPO_ROOT/scripts/config/vlm/sft_student_aligned.yaml"
+    unset CONFIG
     export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS:-0,1,2,3,4,5,6,7}"
     export NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
     echo "Training output: $OUTPUT_DIR"

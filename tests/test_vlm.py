@@ -138,6 +138,30 @@ def tiny_qwen35():
     return Qwen3_5ForConditionalGeneration(config).eval()
 
 
+def test_rejection_uses_replayed_hidden_not_old_chunk(monkeypatch):
+    from litespec.vlm import runtime
+    class ChunkSensitiveTarget(FakeTarget):
+        def forward(self, input_ids, **kwargs):
+            result = super().forward(input_ids, **kwargs)
+            if input_ids.size(1) > 1:
+                result.hidden_states = tuple(x + 100 for x in result.hidden_states)
+            return result
+    target = ChunkSensitiveTarget()
+    draft = DLiteDraftModel(draft_config()).eval()
+    draft.sample_draft_tokens = lambda **kwargs: (torch.zeros(1, 3, dtype=torch.long), None)
+    captured = []
+    original = runtime.draft_block
+    def capture(*args, **kwargs):
+        captured.append(kwargs["pivot"].clone())
+        return original(*args, **kwargs)
+    monkeypatch.setattr(runtime, "draft_block", capture)
+    example = PreparedExample({"input_ids": torch.tensor([[1, 2, 3]])}, 3,
+                              torch.zeros(3, dtype=torch.bool), "replay")
+    spec = generate(target, draft, example, max_new_tokens=4)
+    expected = target.embedding(torch.tensor([[spec["token_ids"][0]]])).unsqueeze(2).expand(-1, -1, 2, -1)
+    torch.testing.assert_close(captured[1], expected)
+
+
 def tiny_image_inputs():
     return dict(input_ids=torch.tensor([[1, 90, 91, 91, 91, 91, 92, 2]]),
                 pixel_values=torch.randn(4, 24), image_grid_thw=torch.tensor([[1, 2, 2]]),

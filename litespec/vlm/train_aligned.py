@@ -46,7 +46,10 @@ def load_config(path):
     root = Path(__file__).resolve().parents[2]
     reference = root / source.pop("upstream_config")
     upstream = yaml.safe_load(reference.read_text())
-    if upstream["mode"] != "sft":
+    family = source.get("algorithm", "dlite")
+    if family not in {"dlite", "dflash", "dspark"}:
+        raise ValueError("unsupported VLM algorithm")
+    if family == "dlite" and upstream.get("mode") != "sft":
         raise ValueError("this VLM adapter implements the upstream direct-SFT recipe")
     cfg = {**upstream["arguments"], **source}
     if cfg.get("batch_size") != 1 or cfg.get("model_role", "student") != "student":
@@ -56,6 +59,10 @@ def load_config(path):
     cfg["upstream_config_sha256"] = hashlib.sha256(reference.read_bytes()).hexdigest()
     cfg["context_policy"] = dict(prefill_text="drop", prefill_vision="drop", decode_mode="none",
                                  window_size=0, implementation="compact")
+    if family != "dlite":
+        if upstream.get("algorithm") != family:
+            raise ValueError("baseline recipe algorithm does not match")
+        cfg["context_policy"].update(prefill_text="keep", prefill_vision="keep", decode_mode="all")
     if isinstance(cfg.get("target_layer_ids"), str):
         cfg["target_layer_ids"] = [int(x) for x in cfg["target_layer_ids"].split(",")]
     return cfg
@@ -129,6 +136,9 @@ class CPUReferenceDLite(OnlineDLiteModel):
 
 
 def make_online(target, draft, cfg):
+    if cfg.get("algorithm", "dlite") != "dlite":
+        from .baselines import make_online as baseline_online
+        return baseline_online(target, draft, cfg)
     cls = CPUReferenceDLite if draft.device.type == "cpu" else OnlineDLiteModel
     return cls(
         draft, target.get_output_embeddings(), target.get_input_embeddings(),
@@ -144,6 +154,9 @@ def prepare_forward(target, online, example):
     """Original anchors/labels/positions; HF target retains its image and MRoPE inputs."""
     ids = example.inputs["input_ids"]
     mask = loss_mask(example)
+    from .baselines import is_baseline, prepare_forward as baseline_forward
+    if is_baseline(online.draft_model):
+        return baseline_forward(target, online, example, mask)
     anchors, keep = online.sample_anchor_positions(ids.size(1), mask)
     offsets = torch.arange(online.block_size - 1, device=ids.device)
     positions = anchors.unsqueeze(-1) + offsets
@@ -346,12 +359,16 @@ def run(argv=None):
         if saved["schema"] != "vlm_upstream_sft_v1" or saved["config"] != cfg:
             raise ValueError("resume configuration/data/world-size differs")
     torch.manual_seed(cfg["seed"])
-    draft = make_draft(target, processor, cfg)
+    if cfg.get("algorithm", "dlite") == "dlite":
+        draft = make_draft(target, processor, cfg)
+    else:
+        from .baselines import make_draft as make_baseline
+        draft = make_baseline(target, processor, cfg)
     draft.config._attn_implementation = "sdpa" if device == "cpu" else "flex_attention"
     draft.config.vlm_config["training"] = "upstream_sft_v1"
     if saved is not None:
-        from litespec.modeling.draft.dlite import DLiteDraftModel
-        loaded = DLiteDraftModel.from_pretrained(args.resume, attn_implementation="flex_attention")
+        from .baselines import load_draft
+        loaded = load_draft(args.resume, attn_implementation="sdpa" if device == "cpu" else "flex_attention")
         draft.load_state_dict(loaded.state_dict())
         del loaded
     online = make_online(target, draft, cfg)

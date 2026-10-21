@@ -40,4 +40,6 @@ exec "$CLIENT_PYTHON" scripts/data/regenerate_vlm_serving.py \
     --max-tokens "${MAX_NEW_TOKENS:-256}" \
     --max-length "${MAX_LENGTH:-4096}" \
     --timeout "${REQUEST_TIMEOUT:-600}" \
-    --retries "${REQUEST_RETRIES:-2}"
+    --retries "${REQUEST_RETRIES:-2}" \
+    --image-max-tokens "${IMAGE_MAX_TOKENS:-0}" \
+    --min-answer-tokens "${MIN_ANSWER_TOKENS:-2}"

@@ -181,8 +181,12 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
     inputs = example.inputs
     if inputs["input_ids"].shape != (1, example.prefill_length):
         raise ValueError("generation accepts one unpadded prompt, not a training answer")
-    policy = policy or ContextPolicy.no_history()
-    if draft is not None and draft.is_student and not policy.is_empty:
+    from .baselines import is_baseline, DraftCache
+    baseline = draft is not None and is_baseline(draft)
+    policy = policy or (ContextPolicy() if baseline else ContextPolicy.no_history())
+    if baseline and (policy.prefill_text != "keep" or policy.prefill_vision != "keep" or policy.decode_mode != "all"):
+        raise ValueError("baseline cached inference currently requires full history")
+    if draft is not None and not baseline and draft.is_student and not policy.is_empty:
         raise ValueError("non-empty history policy is incompatible with a student checkpoint")
     device = inputs["input_ids"].device
     started = clock(device)
@@ -196,10 +200,11 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
     anchor = example.prefill_length
     history = None
     pivot = None
+    baseline_cache = DraftCache(draft, target, output, anchor) if baseline else None
     if draft is not None:
         pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
                                 draft.config.num_target_layers)[:, -1:].detach()
-        if not draft.is_student:
+        if not baseline and not draft.is_student:
             history = HistoryBank(
                 selected_layers(output.hidden_states, draft.history_layer_ids,
                                 draft.config.num_target_layers).detach(),
@@ -224,14 +229,17 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
             pending = output.logits[:, -1:].argmax(-1)
             continue
         t = clock(device)
-        hidden, counts = draft_block(
-            draft, target.get_input_embeddings(), anchor_ids=pending, pivot=pivot,
-            history=history, anchor=anchor, prefill_length=example.prefill_length,
-            vision_mask=example.vision_mask, policy=policy,
-        )
-        proposals, _ = draft.sample_draft_tokens(
-            draft_hidden=hidden, first_prev_token_ids=pending[:, 0], temperature=0.0,
-        )
+        if baseline:
+            proposals, counts = baseline_cache.propose(draft, target, pending, anchor)
+        else:
+            hidden, counts = draft_block(
+                draft, target.get_input_embeddings(), anchor_ids=pending, pivot=pivot,
+                history=history, anchor=anchor, prefill_length=example.prefill_length,
+                vision_mask=example.vision_mask, policy=policy,
+            )
+            proposals, _ = draft.sample_draft_tokens(
+                draft_hidden=hidden, first_prev_token_ids=pending[:, 0], temperature=0.0,
+            )
         candidates = torch.cat([pending, proposals], dim=1)
         candidates = candidates[:, :max_new_tokens - len(emitted)]
         draft_seconds += clock(device) - t
@@ -270,13 +278,19 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
         if verification == "block" and kept != candidates.shape[1]:
             t = clock(device)
             restored = target(input_ids=candidates[:, :kept], past_key_values=before,
-                              use_cache=True, output_hidden_states=False)
+                              use_cache=True, output_hidden_states=True)
             cache = restored.past_key_values
+            # The committed prefix is the authoritative state after replay.
+            # Chunk-vs-prefix execution may differ numerically on hybrid targets.
+            output = restored
+            predictions = restored.logits.argmax(-1)
             recovery_seconds += clock(device) - t
         del before
         pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
                                 draft.config.num_target_layers)[:, kept - 1:kept].detach()
-        if not draft.is_student:
+        if baseline:
+            baseline_cache.commit(draft, output, kept)
+        elif not draft.is_student:
             new = selected_layers(output.hidden_states, draft.history_layer_ids,
                                   draft.config.num_target_layers)[:, :kept].detach()
             history.hidden = torch.cat([history.hidden, new], dim=1)

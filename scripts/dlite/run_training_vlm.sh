@@ -4,10 +4,16 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORKSPACE="$(dirname -- "$REPO_ROOT")"
 PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv-vlm/bin/python}"
-CONFIG="${CONFIG:-$REPO_ROOT/scripts/config/vlm/sft_student_aligned.yaml}"
+ALGORITHM="${ALGORITHM:-dlite}"
+case "$ALGORITHM" in
+    dlite) DEFAULT_CONFIG="$REPO_ROOT/scripts/config/vlm/sft_student_aligned.yaml" ;;
+    dflash|dspark) DEFAULT_CONFIG="$REPO_ROOT/scripts/config/vlm/sft_${ALGORITHM}.yaml" ;;
+    *) echo "ALGORITHM must be dlite, dflash or dspark" >&2; exit 2 ;;
+esac
+CONFIG="${CONFIG:-$DEFAULT_CONFIG}"
 TRAIN_DATA="${TRAIN_DATA:-$WORKSPACE/data/finevision_qwen35_sglang_20000/train.jsonl}"
 TARGET_MODEL="${TARGET_MODEL:-$HOME/LMM/lmm_model/Qwen3.5-4B}"
-OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE/runs/dlite_vlm_aligned_6ep_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-$WORKSPACE/runs/${ALGORITHM}_vlm_6ep_$(date +%Y%m%d_%H%M%S)}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"

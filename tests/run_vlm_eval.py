@@ -10,7 +10,7 @@ import torch
 # Permit `python tests/run_vlm_eval.py` without a global editable installation.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from litespec.modeling.draft.dlite import DLiteDraftModel
+from litespec.vlm.baselines import load_draft
 from litespec.vlm.runtime import generate, load_target, prepare_example, read_records
 from litespec.vlm.context import ContextPolicy
 
@@ -32,7 +32,7 @@ def main():
     args = parser.parse_args()
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
     target, processor = load_target(args.target_model, device=args.device, dtype=dtype)
-    draft = DLiteDraftModel.from_pretrained(args.draft_model, attn_implementation="sdpa").to(args.device, dtype).eval()
+    draft = load_draft(args.draft_model, attn_implementation="sdpa").to(args.device, dtype).eval()
     stored = getattr(draft.config, "vlm_config", {}).get("context_policy")
     policy = ContextPolicy(**json.loads(Path(args.policy).read_text())) if args.policy else (
         ContextPolicy(**stored) if stored else ContextPolicy.no_history()

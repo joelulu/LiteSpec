@@ -5,7 +5,7 @@ REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export DLITE_WORKSPACE="${DLITE_WORKSPACE:-$(dirname -- "$REPO_ROOT")}"
 export PYTHON_BIN="${PYTHON_BIN:-$REPO_ROOT/.venv-vlm/bin/python}"
 export ORIGINAL_DLITE="${ORIGINAL_DLITE:-$HOME/LMM/lmm_model/Qwen3.5-4B-DLite}"
-export MODELS="ar dlite_original"
+export MODELS="${MODELS-ar dlite_original}"
 export BENCHMARK_MODE=static_batch
 export BATCH_SIZES="${BATCH_SIZES:-1}"
 export REFERENCE_INPUT=1
@@ -45,7 +45,8 @@ fi
 for dataset in "${datasets[@]}"; do
     for mode in "${modes[@]}"; do
         echo "=== $dataset / $mode / B=$BATCH_SIZES ==="
-        EVAL_DATA="$DATA_DIR/$dataset.jsonl" EVAL_DATASET_NAME="$dataset" EVAL_SPLIT=unspecified \
+        source_data="$("$PYTHON_BIN" tests/reference_vlm_data.py --data-dir "$DATA_DIR" --resolve-dataset "$dataset")"
+        EVAL_DATA="$source_data" EVAL_DATASET_NAME="$dataset" EVAL_SPLIT=unspecified \
         INPUT_MODE="$mode" RESULT_DIR="$GROUP_DIR/$dataset/$mode" \
             bash tests/compare_vlm_16.sh 2>&1 | tee "$GROUP_DIR/${dataset}_${mode}.log"
     done

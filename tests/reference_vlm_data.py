@@ -9,6 +9,23 @@ from pathlib import Path
 import random
 
 DATASETS = ("charxiv_val", "flickr30k", "textvqa", "hr_bench_4k", "hr_bench_8k")
+DATASET_FILES = dict(charxiv_val="charxiv_val.jsonl", flickr30k="flickr30k_test.jsonl",
+                    textvqa="textvqa_test.jsonl", hr_bench_4k="hr_bench_4k.jsonl", hr_bench_8k="hr_bench_8k.jsonl")
+
+
+def dataset_path(directory, name):
+    if name not in DATASET_FILES:
+        raise ValueError(f"unknown dataset: {name}; choose {' '.join(DATASETS)}")
+    directory = Path(directory).expanduser().resolve()
+    # Prefer the explicit evaluation split even when a legacy filename exists.
+    path = directory / DATASET_FILES[name]
+    if path.is_file():
+        return path
+    legacy = directory / f"{name}.jsonl"
+    if legacy.is_file():
+        return legacy
+    available = ', '.join(p.name for p in sorted(directory.glob('*.jsonl')))
+    raise FileNotFoundError(f"Dataset not found: {path}; available JSONL files: {available}")
 
 
 def resolve_image_path(value, image_root):
@@ -82,6 +99,7 @@ def load_reference_records(path, max_samples=16, seed=42, image_root=None, requi
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--resolve-dataset", choices=DATASETS, help="print the selected evaluation file and exit")
     parser.add_argument("--image-root", type=Path)
     parser.add_argument("--datasets", nargs="+", default=list(DATASETS))
     parser.add_argument("--samples", type=int, default=16)
@@ -91,11 +109,14 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     directory = args.data_dir.expanduser()
+    if args.resolve_dataset:
+        print(dataset_path(directory, args.resolve_dataset))
+        return
     inspections = []
     for name in args.datasets:
         if name not in DATASETS:
             parser.error(f"unsupported dataset {name}; choose {' '.join(DATASETS)}")
-        _, info = load_reference_records(directory/f"{name}.jsonl", args.samples, args.seed,
+        _, info = load_reference_records(dataset_path(directory, name), args.samples, args.seed,
             args.image_root, "vision" in args.modes, args.prompt_field)
         inspections.append(info)
         print(json.dumps(info, ensure_ascii=False, indent=2), flush=True)

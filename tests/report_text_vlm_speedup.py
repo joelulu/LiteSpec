@@ -4,6 +4,8 @@ import csv
 import json
 from pathlib import Path
 
+from reference_vlm_data import DATASETS
+
 
 def comparison_rows(root, selected_cases=None):
     combined = []
@@ -14,6 +16,9 @@ def comparison_rows(root, selected_cases=None):
         cases = [("text", "text", "smoke"), ("multimodal", "multimodal", "unspecified")]
     known = dict(text=("text", "smoke"), multimodal_train=("multimodal", "train"),
                  multimodal_val=("multimodal", "validation"), multimodal=("multimodal", "unspecified"))
+    for name in DATASETS:
+        for mode in ('text', 'vision'):
+            known[f'{name}_{mode}'] = ('text' if mode == 'text' else 'multimodal', 'unspecified')
     if selected_cases is not None:
         cases = [(case, *known[case]) for case in selected_cases]
     else:
@@ -33,6 +38,8 @@ def comparison_rows(root, selected_cases=None):
                 dataset_name=row.get("dataset_name", settings.get("dataset_name", "unspecified")),
                 model=row["model"], concurrency=row["concurrency"],
                 batch_size=row.get("batch_size"),
+                mean_input_tokens=row.get("mean_input_tokens"),
+                mean_image_tokens=row.get("mean_image_tokens"),
                 output_tokens_per_second=row["output_tokens_per_second"],
                 throughput_speedup=row["output_tokens_per_second"] / base["output_tokens_per_second"],
                 wall_time_speedup=base["wall_seconds"] / row["wall_seconds"],
@@ -64,6 +71,9 @@ def tables(rows):
               "每格为 speedup / 平均接受长度（含保证推进的 token）；AR 无接受长度。", ""]
     titles = dict(text="纯文本", multimodal_train="多模态：训练集", multimodal_val="多模态：验证集",
                   multimodal="多模态（来源未标注）")
+    for name in DATASETS:
+        titles[f'{name}_vision'] = f'多模态：{name}'
+        titles[f'{name}_text'] = f'同题去图：{name}'
     for case in dict.fromkeys(row["case"] for row in rows):
         selected = [row for row in rows if row["case"] == case]
         concurrencies = sorted({row["concurrency"] for row in selected})
@@ -90,7 +100,7 @@ def tables(rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--cases", nargs="+", choices=["text", "multimodal_train", "multimodal_val", "multimodal"])
+    parser.add_argument("--cases", nargs="+", choices=["text", "multimodal_train", "multimodal_val", "multimodal"] + [f"{name}_{mode}" for name in DATASETS for mode in ("text", "vision")])
     args = parser.parse_args()
     rows = comparison_rows(args.root, args.cases)
     with (args.root / "comparison.csv").open("w", newline="") as handle:

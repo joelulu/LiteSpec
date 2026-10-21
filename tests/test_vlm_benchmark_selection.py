@@ -41,6 +41,7 @@ def shell_fixture(tmp_path):
     for name in ("compare_text_vlm_16.sh", "compare_vlm_16.sh", "compare_static_batch_text_vlm.sh",
                  "report_text_vlm_speedup.py", "vlm_benchmark_data.py"):
         shutil.copy(ROOT/"tests"/name, scripts/name)
+    shutil.copy(ROOT/"tests/reference_vlm_data.py", scripts/"reference_vlm_data.py")
     (repo/"litespec").symlink_to(ROOT/"litespec", target_is_directory=True)
     runner = tmp_path/"python"
     runner.write_text(f"#!{sys.executable}\n" + '''import json, os, pathlib, sys
@@ -77,7 +78,8 @@ else:
     runner.chmod(0o755)
     env = os.environ.copy()
     for name in ("TEXT_DATA", "TRAIN_EVAL_DATA", "VAL_EVAL_DATA", "EVAL_DATA", "BENCHMARK_MODE",
-                 "ONLY_ORIGINAL", "MODELS", "TESTS", "TEXT_SPLIT", "TEXT_DATASET_NAME"):
+                 "ONLY_ORIGINAL", "MODELS", "TESTS", "TEXT_SPLIT", "TEXT_DATASET_NAME", "DATASETS",
+                 "DATA_DIR", "IMAGE_ROOT", "MODES", "INSPECT_ONLY", "REFERENCE_INPUT"):
         env.pop(name, None)
     env.update(HOME=str(tmp_path/"home"), DLITE_WORKSPACE=str(repo.parent), PYTHON_BIN=str(runner),
                EVAL_SAMPLES="1", CONCURRENCIES="1", BATCH_SIZES="1 8", RESULT_DIR=str(tmp_path/"result"),
@@ -118,6 +120,60 @@ def test_shell_runs_only_selected_datasets_and_models(tmp_path, static, selectio
     assert (Path(env["RESULT_DIR"])/stage/"summary.json").exists()
     if selection == "text-only":
         assert "gsm8k" in report
+
+
+@pytest.mark.parametrize('name', ['charxiv_val', 'flickr30k', 'textvqa', 'hr_bench_4k', 'hr_bench_8k'])
+@pytest.mark.parametrize('group', [False, True])
+def test_named_dataset_selection_and_models(tmp_path, name, group):
+    from PIL import Image
+    from reference_vlm_data import DATASET_FILES
+    repo, env = shell_fixture(tmp_path)
+    data = tmp_path / 'datasets'
+    images = data / 'imgs'
+    images.mkdir(parents=True)
+    Image.new('RGB', (16, 16)).save(images / 'image.png')
+    source = data / DATASET_FILES[name]
+    source.write_text(json.dumps(dict(prompt='describe', image='imgs/image.png'))+'\n')
+    env.update(DATA_DIR=str(data), TESTS='visual-datasets' if group else name, DATASETS=name,
+        MODELS='ar dlite_original dflash_3ep dspark_3ep dlite_3ep dlite_6ep', MODES='text vision')
+    result = subprocess.run(['bash', str(repo/'tests/compare_static_batch_text_vlm.sh')],
+        env=env, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout+result.stderr
+    calls = [json.loads(line) for line in Path(env['CAPTURE']).read_text().splitlines()]
+    assert len(calls) == 2
+    for mode, call in zip(('text', 'vision'), calls):
+        assert call[call.index('--data')+1] == str(source)
+        assert call[call.index('--input-mode')+1] == mode
+        assert '--reference-input' in call
+        assert [call[i+1] for i, arg in enumerate(call) if arg == '--checkpoint'] == env['MODELS'].split()[1:]
+    report = (Path(env['RESULT_DIR'])/'speedup_tables.md').read_text()
+    assert report.count('### ') == 2 and name in report
+    assert '| dspark_3ep |' in report
+
+
+def test_combines_legacy_groups_with_named_datasets(tmp_path):
+    from PIL import Image
+    repo, env = shell_fixture(tmp_path)
+    data = tmp_path/'datasets'
+    (data/'imgs').mkdir(parents=True)
+    Image.new('RGB', (16,16)).save(data/'imgs/image.png')
+    (data/'flickr30k_test.jsonl').write_text(json.dumps(dict(prompt='caption', image='image.png'))+'\n')
+    gsm = tmp_path/'gsm8k.jsonl'
+    gsm.write_text(json.dumps(dict(turns=['question']))+'\n')
+    fine = tmp_path/'finevision'
+    fine.mkdir()
+    for split in ('train', 'val'):
+        (fine/f'{split}.jsonl').write_text(json.dumps(dict(id=split, question='describe', image='image.png'))+'\n')
+    env.update(DATA_DIR=str(data), TEXT_DATA=str(gsm), TRAIN_EVAL_DATA=str(fine/'train.jsonl'),
+        VAL_EVAL_DATA=str(fine/'val.jsonl'), TESTS='text-only visual-eval visual-training flickr30k',
+        MODELS='ar', MODES='vision')
+    result = subprocess.run(['bash', str(repo/'tests/compare_static_batch_text_vlm.sh')], env=env, text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout+result.stderr
+    calls = [json.loads(line) for line in Path(env['CAPTURE']).read_text().splitlines()]
+    assert len(calls) == 4
+    assert all('--reference-input' not in call for call in calls[:3])
+    assert '--reference-input' in calls[3]
+    assert (Path(env['RESULT_DIR'])/'speedup_tables.md').read_text().count('### ') == 4
 
 
 @pytest.mark.parametrize("static", [False, True])

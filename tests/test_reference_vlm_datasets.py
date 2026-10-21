@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from PIL import Image
 import pytest
 
-from reference_vlm_data import get_prompt, load_reference_records, resolve_image_path
+from reference_vlm_data import DATASET_FILES, dataset_path, get_prompt, load_reference_records, resolve_image_path
 from reference_vlm_image_budget import configure_image_budget
 from report_original_vlm_datasets import collect, render
 
@@ -24,6 +24,23 @@ def dataset_fixture(root, count=8):
     path = root / "textvqa.jsonl"
     path.write_text("\n".join(json.dumps(row) for row in records) + "\n")
     return path, images
+
+
+@pytest.mark.parametrize("name", list(DATASET_FILES))
+def test_actual_evaluation_filenames_preferred_over_legacy(tmp_path, name):
+    preferred = tmp_path / DATASET_FILES[name]
+    preferred.write_text('{}\n')
+    if name in ('flickr30k', 'textvqa'):
+        (tmp_path / f'{name}.jsonl').write_text('{}\n')
+        (tmp_path / f'{name}_train.jsonl').write_text('{}\n')
+    assert dataset_path(tmp_path, name) == preferred
+    if name in ('flickr30k', 'textvqa'):
+        preferred.unlink()
+        legacy = tmp_path / f'{name}.jsonl'
+        assert dataset_path(tmp_path, name) == legacy
+        legacy.unlink()
+        with pytest.raises(FileNotFoundError, match='available JSONL files'):
+            dataset_path(tmp_path, name)  # Never silently select the training file.
 
 
 @pytest.mark.parametrize("value", ["sample.png", "imgs/sample.png", r"imgs\/sample.png"])
@@ -80,8 +97,9 @@ def test_inspection_cli_loads_no_models(tmp_path):
     assert json.loads(out.read_text())[0]["selected_records"] == 3
 
 
+@pytest.mark.parametrize("models", ['ar dlite_original', 'ar dflash_3ep dspark_3ep dlite_3ep dlite_6ep'])
 @pytest.mark.parametrize("inspect_only", [False, True])
-def test_wrapper_preflight_and_argument_forwarding(tmp_path, inspect_only):
+def test_wrapper_preflight_and_argument_forwarding(tmp_path, inspect_only, models):
     from test_vlm_benchmark_selection import shell_fixture
     repo, env = shell_fixture(tmp_path)
     for name in ("compare_original_vlm_datasets.sh", "reference_vlm_data.py", "report_original_vlm_datasets.py"):
@@ -100,7 +118,7 @@ def test_wrapper_preflight_and_argument_forwarding(tmp_path, inspect_only):
     path, images = dataset_fixture(data)
     env.update(DATA_DIR=str(data), DATASETS="textvqa", MODES="text vision",
                SAMPLES_PER_DATASET="3", MAX_NEW_TOKENS="512", IMAGE_MAX_PIXELS="2048",
-               INSPECT_ONLY="1" if inspect_only else "0")
+               INSPECT_ONLY="1" if inspect_only else "0", MODELS=models)
     env.pop("IMAGE_ROOT", None)
     run = subprocess.run(["bash", str(repo / "tests/compare_original_vlm_datasets.sh")],
                          env=env, text=True, capture_output=True)
@@ -118,7 +136,7 @@ def test_wrapper_preflight_and_argument_forwarding(tmp_path, inspect_only):
         assert option("--data") == str(path)
         assert option("--max-samples") == "3" and option("--max-new-tokens") == "512"
         assert option("--image-max-pixels") == "2048"
-        assert [call[i+1] for i, value in enumerate(call) if value == "--checkpoint"] == ["dlite_original"]
+        assert [call[i+1] for i, value in enumerate(call) if value == "--checkpoint"] == models.split()[1:]
     report = (Path(env["RESULT_DIR"]) / "comparison.md").read_text()
     assert "同题去图" in report and "图文输入" in report
 

@@ -30,6 +30,7 @@ from litespec.training.optimizer import BF16Optimizer, optimizer_step_count, reg
 from litespec.training.runner import configure_rank_caches, run_draft
 from .runtime import load_target, prepare_example, read_records
 from .train import make_draft
+from .progress import StepProgress
 
 
 def rank():
@@ -185,7 +186,7 @@ def restore_rng(value):
 
 
 def save(session, name):
-    """Atomic, rank-local FP32/Muon checkpoint plus an inference-compatible export."""
+    """Atomic inference export, with optional rank-local resumable state."""
     root = Path(session.args.output_dir)
     destination = root / f"step_{session.state.optimizer_step:07d}"
     exists = destination.exists() if rank() == 0 else None
@@ -202,9 +203,10 @@ def save(session, name):
         staging = values[0]
     staging = Path(staging)
     staging.mkdir(parents=True, exist_ok=True)
-    state = dict(schema="vlm_upstream_sft_v1", config=session.vlm_config,
-                 cursor=asdict(session.state), rng=rng_state(), optimizer=session.optimizer.state_dict())
-    torch.save(state, staging / f"training_state_rank_{rank():05d}.pt")
+    if session.save_training_state:
+        state = dict(schema="vlm_upstream_sft_v1", config=session.vlm_config,
+                     cursor=asdict(session.state), rng=rng_state(), optimizer=session.optimizer.state_dict())
+        torch.save(state, staging / f"training_state_rank_{rank():05d}.pt")
     if isinstance(session.fsdp_model, FSDP):
         with FSDP.state_dict_type(session.fsdp_model, StateDictType.FULL_STATE_DICT,
                                  FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
@@ -218,7 +220,8 @@ def save(session, name):
     if rank() == 0:
         session.draft.save_pretrained(staging, state_dict=weights)
         (staging / "vlm_run.json").write_text(json.dumps(session.vlm_config, indent=2))
-        (staging / "checkpoint.json").write_text(json.dumps(dict(world_size=world(), cursor=asdict(session.state))))
+        (staging / "checkpoint.json").write_text(json.dumps(dict(world_size=world(), cursor=asdict(session.state),
+                                                               resumable=session.save_training_state)))
         os.replace(staging, destination)
         link = root / (".last-" + uuid.uuid4().hex)
         link.symlink_to(destination.name, target_is_directory=True)
@@ -245,17 +248,20 @@ def source_batches(session, phase):
 
 def log(session, window, grad_norm):
     metrics = window.metrics.reduce()
+    progress = session.progress.update(session.state.optimizer_step)
     scalars = {k: float(v) for k, v in metrics.items()}
     scalars.update({f"learning_rate/{k}": float(v)
                     for k, v in session.optimizer.get_learning_rates().items()})
     scalars.update(grad_norm=float(grad_norm),
                    epoch_progress=session.state.global_step / session.steps_per_epoch)
+    scalars.update({f"progress/{k}": v for k, v in progress.items() if isinstance(v, (int, float))})
     session.tracker.log(scalars, step=session.state.optimizer_step)
     completed = session.state.global_step // session.steps_per_epoch
     if rank() == 0:
         print(json.dumps(dict(optimizer_step=session.state.optimizer_step,
                               micro_step=session.state.global_step, epoch=session.state.epoch,
                               completed_epochs=completed, loss=float(metrics["objective/loss"]),
+                              **progress,
                               grad_norm=grad_norm, learning_rates=session.optimizer.get_learning_rates(),
                               metrics={k: float(v) for k, v in metrics.items()})), flush=True)
     # Preserve upstream cross-epoch accumulation: export at the first update
@@ -272,6 +278,8 @@ def run(argv=None):
         parser.add_argument("--" + flag)
     parser.add_argument("--max-steps", type=int, help="explicit debug optimizer-update cap; unset trains all six epochs")
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--save-training-state", action="store_true",
+                        help="also save per-rank optimizer/RNG state for resume; default exports inference weights only")
     parser.add_argument("--report-to", choices=["none", "tensorboard", "wandb"],
                         help="optional scalar tracking; defaults to YAML report_to")
     args = parser.parse_args(argv)
@@ -331,7 +339,10 @@ def run(argv=None):
         checkpoint = Path(args.resume)
         if not (checkpoint / "checkpoint.json").exists():
             raise ValueError("resume requires an aligned checkpoint; the old 2-layer/rank-64 smoke model is incompatible")
-        saved = torch.load(checkpoint / f"training_state_rank_{rank():05d}.pt", map_location="cpu", weights_only=False)
+        state_path = checkpoint / f"training_state_rank_{rank():05d}.pt"
+        if not state_path.is_file():
+            raise ValueError("checkpoint contains inference weights only; resume requires a checkpoint saved with --save-training-state")
+        saved = torch.load(state_path, map_location="cpu", weights_only=False)
         if saved["schema"] != "vlm_upstream_sft_v1" or saved["config"] != cfg:
             raise ValueError("resume configuration/data/world-size differs")
     torch.manual_seed(cfg["seed"])
@@ -370,6 +381,7 @@ def run(argv=None):
     session.vlm_config, session.records, session.processor = cfg, records, processor
     session.sampler, session.device, session.base_dir = sampler, device, path.parent
     session.last_exported_epoch = 0
+    session.save_training_state = args.save_training_state
     session.tracker = SimpleNamespace(log=lambda *a, **kw: None, close=lambda: None)
     if cfg["report_to"] != "none":
         from litespec.training.logging import TrackerArgs, create_tracker, get_tracker_class
@@ -396,6 +408,8 @@ def run(argv=None):
         (root / "effective_config.json").write_text(json.dumps(cfg, indent=2))
         print(json.dumps(dict(config=cfg, global_batch=world() * cfg["accumulation_steps"],
                               full_epochs=cfg["num_epochs"], debug_cap=args.max_steps)), flush=True)
+    session.progress = StepProgress(min(total, args.max_steps) if args.max_steps else total,
+                                    session.state.optimizer_step)
     try:
         run_draft(session, batch_source=source_batches, save=save, log=log)
     finally:

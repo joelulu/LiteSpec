@@ -108,13 +108,17 @@ epoch counts instead of the native fractional epoch progress.
 
 The 2-layer/rank-64 smoke checkpoint is architecturally incompatible: start the
 aligned 5-layer/rank-320 model from scratch. Checkpoints are immutable
-`step_0000001` directories. They contain ordinary draft weights/config,
-rank-local optimizer/FP32 master/scheduler/RNG/cursor state, and `vlm_run.json`.
+`step_0000001` directories. By default they contain only ordinary draft weights,
+config and small metadata files, including `vlm_run.json`; no
+`training_state_rank_*.pt` files are written. Enable `SAVE_TRAINING_STATE=1`
+explicitly to also export rank-local optimizer/FP32 master/scheduler/RNG/cursor
+state for exact resume. Weights-only exports remain valid for inference but
+cannot resume training.
 A staging directory is atomically committed after all ranks finish; `last` is an
 atomically updated symlink. Resume accepts only the same data/config/world size.
 
 ```bash
-OUTPUT_DIR="/absolute/path/to/the/run" \
+SAVE_TRAINING_STATE=1 OUTPUT_DIR="/absolute/path/to/the/run" \
 bash scripts/dlite/run_training_vlm.sh --resume /absolute/path/to/the/run/last
 ```
 
@@ -124,6 +128,27 @@ The upstream runner carries partial windows across epochs: an epoch export may
 therefore include the first 1-3 microbatches of the following epoch. No partial
 gradient window is dropped or incorrectly resumed. Tail normalization follows the
 original runner. Final total updates are `ceil(6 * ceil(N_eligible/world) / 4)`.
+
+## Progress and remaining time
+
+Each optimizer log now reports total/remaining updates, progress percent, average
+seconds per update over the last 50 logging intervals, and estimated remaining
+time as both `eta_seconds` and `eta` (HH:MM:SS). Intervals include data preparation
+and checkpoint pauses after the preceding log; estimates fluctuate with image
+sizes, compilation and checkpointing. Initial validation/loading and evaluation
+after training are outside this estimate. Debug runs use their explicit step cap.
+Native trackers also receive numeric progress fields.
+
+For an already running job, no restart is needed to monitor remaining time:
+
+```bash
+python tests/watch_vlm_progress.py --run /absolute/path/to/the/run
+```
+
+The observer uses the saved total and new log arrivals, ignoring historical
+records without timestamps. It starts estimating after two new optimizer logs.
+Ctrl-C stops only the observer. Updating repository files does not change the
+save behavior of a job whose Python process is already running.
 
 ## Token-mismatch diagnostics
 

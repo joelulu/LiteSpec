@@ -110,7 +110,14 @@ def test_six_epoch_muon_runner_accumulation_tail_and_exact_resume(monkeypatch, t
         path = tmp_path / (name + ".yaml")
         path.write_text(yaml.safe_dump(cfg))
         configs[name] = path
-    aligned.run(["--config", str(configs["full"])])
+    aligned.run(["--config", str(configs["full"]), "--save-training-state"])
+    export = tmp_path / "weights_only"
+    aligned.run(["--config", str(configs["full"]), "--output-dir", str(export), "--max-steps", "1"])
+    assert (export / "last/model.safetensors").is_file()
+    assert not list((export / "last").glob("training_state_rank_*.pt"))
+    assert json.loads((export / "last/checkpoint.json").read_text())["resumable"] is False
+    with pytest.raises(ValueError, match="inference weights only"):
+        aligned.run(["--config", str(configs["full"]), "--resume", str(export / "last")])
     original_log = aligned.log
 
     def interrupt(session, window, grad_norm):
@@ -120,10 +127,10 @@ def test_six_epoch_muon_runner_accumulation_tail_and_exact_resume(monkeypatch, t
 
     monkeypatch.setattr(aligned, "log", interrupt)
     with pytest.raises(RuntimeError, match="simulated interruption"):
-        aligned.run(["--config", str(configs["resumed"])])
+        aligned.run(["--config", str(configs["resumed"]), "--save-training-state"])
     monkeypatch.setattr(aligned, "log", original_log)
     last = tmp_path / "resumed/last"
-    aligned.run(["--config", str(configs["resumed"]), "--resume", str(last)])
+    aligned.run(["--config", str(configs["resumed"]), "--resume", str(last), "--save-training-state"])
     full = tmp_path / "full/last"
     assert_tree_equal(load_file(full / "model.safetensors"), load_file(last / "model.safetensors"))
     a = torch.load(full / "training_state_rank_00000.pt", weights_only=False)

@@ -42,6 +42,9 @@ if visible < workers:
 PY
 mkdir -p "$OUTPUT_DIR"
 limits=()
+if [[ "${SAVE_TRAINING_STATE:-0}" == 1 ]]; then
+    limits+=(--save-training-state)
+fi
 if [[ -n "${REPORT_TO:-}" ]]; then
     limits+=(--report-to "$REPORT_TO")
 fi

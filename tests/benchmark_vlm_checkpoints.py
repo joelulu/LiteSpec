@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--target-model", required=True)
     parser.add_argument("--checkpoint", nargs=2, action="append", required=True, metavar=("LABEL", "PATH"))
     parser.add_argument("--data", required=True)
+    parser.add_argument("--data-split", choices=["train", "validation", "smoke", "unspecified"], default="unspecified")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-samples", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -68,7 +69,7 @@ def main():
                                                    "scope": "single GPU, round-robin unbatched; excludes model loading, warmup and CPU preprocessing"}, indent=2))
     dtype = torch.float32 if args.device == "cpu" else torch.bfloat16
     target, processor = load_target(args.target_model, device=args.device, dtype=dtype)
-    examples = [prepare_example(processor, target.config, record, device=args.device, base_dir=data.parent)
+    examples = [prepare_example(processor, target.config, record, device=args.device, base_dir=data.parent, training=False)
                 for record in records]
     sync = (lambda: torch.cuda.synchronize(args.device)) if torch.device(args.device).type == "cuda" else (lambda: None)
     references, rows = {}, []
@@ -120,6 +121,7 @@ def main():
                 reference_consistent = base["valid_token_match"]
                 speedup = base["wall_seconds"] / elapsed
             summary = dict(model=label, checkpoint=checkpoint, concurrency=concurrency, peak_active_requests=peak,
+                           dataset_split=args.data_split, dataset_path=str(data),
                            verification=args.verification, **summarize(results, elapsed), matched=matched,
                            execution=args.execution,
                            stage_profile_available=args.execution == "reference",

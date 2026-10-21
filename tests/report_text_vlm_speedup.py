@@ -1,4 +1,4 @@
-"""Two observed throughput speedup tables, independent of token-match flags."""
+"""Text, multimodal train/validation speedup tables without token-match gating."""
 import argparse
 import csv
 import json
@@ -7,12 +7,22 @@ from pathlib import Path
 
 def comparison_rows(root):
     combined = []
-    for modality in ("text", "multimodal"):
-        source = json.loads((root / modality / "summary.json").read_text())
+    cases = [("text", "text", "smoke"), ("multimodal_train", "multimodal", "train"),
+             ("multimodal_val", "multimodal", "validation")]
+    if not any((root / name).exists() for name in ("multimodal_train", "multimodal_val")):
+        # Keep old two-stage results readable; their split was not recorded.
+        cases = [("text", "text", "smoke"), ("multimodal", "multimodal", "unspecified")]
+    for case, modality, split in cases:
+        source = json.loads((root / case / "summary.json").read_text())
+        settings_path = root / case / "settings.json"
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
         bases = {row["concurrency"]: row for row in source if row["model"] == "ar"}
         for row in source:
             base = bases[row["concurrency"]]
-            combined.append(dict(modality=modality, model=row["model"], concurrency=row["concurrency"],
+            combined.append(dict(case=case, modality=modality,
+                dataset_split=row.get("dataset_split", split),
+                dataset_path=row.get("dataset_path", settings.get("data", "")),
+                model=row["model"], concurrency=row["concurrency"],
                 output_tokens_per_second=row["output_tokens_per_second"],
                 throughput_speedup=row["output_tokens_per_second"] / base["output_tokens_per_second"],
                 wall_time_speedup=base["wall_seconds"] / row["wall_seconds"],
@@ -27,17 +37,28 @@ def comparison_rows(root):
 
 def tables(rows):
     output = ["Observed throughput speedup = output tok/s divided by AR output tok/s at the same concurrency.",
-              "Token mismatches do not suppress these ratios. HF round-robin, unbatched; not a serving benchmark.", ""]
-    for modality, title in (("text", "纯文本"), ("multimodal", "多模态")):
-        selected = [row for row in rows if row["modality"] == modality]
+              "Token mismatches do not suppress these ratios. HF round-robin, unbatched; not a serving benchmark.",
+              "每格为 speedup / 平均接受长度（含保证推进的 token）；AR 无接受长度。", ""]
+    titles = dict(text="纯文本", multimodal_train="多模态：训练集", multimodal_val="多模态：验证集",
+                  multimodal="多模态（来源未标注）")
+    for case in dict.fromkeys(row["case"] for row in rows):
+        selected = [row for row in rows if row["case"] == case]
         concurrencies = sorted({row["concurrency"] for row in selected})
         models = list(dict.fromkeys(row["model"] for row in selected))
         indexed = {(row["model"], row["concurrency"]): row for row in selected}
-        output += [f"### {title}", "", "| 模型 | " + " | ".join(f"C={c} speedup" for c in concurrencies) + " |",
+        output += [f"### {titles[case]}", "", f"数据来源：`{selected[0]['dataset_split']}`；路径：`{selected[0]['dataset_path']}`。", "",
+                   "| 模型 | " + " | ".join(f"C={c} speedup / 接受长度" for c in concurrencies) + " |",
                    "|---|" + "---:|" * len(concurrencies)]
         for model in models:
-            cells = [f"{indexed[(model, c)]['throughput_speedup']:.3f}×" if (model, c) in indexed else "—"
-                     for c in concurrencies]
+            cells = []
+            for c in concurrencies:
+                row = indexed.get((model, c))
+                if row is None:
+                    cells.append("—")
+                else:
+                    length = row["mean_committed_length"]
+                    acceptance = f"{length:.3f}" if length is not None else "—"
+                    cells.append(f"{row['throughput_speedup']:.3f}× / {acceptance}")
             output.append(f"| {model} | " + " | ".join(cells) + " |")
         output.append("")
     return "\n".join(output)

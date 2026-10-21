@@ -37,7 +37,7 @@ if [[ "${REPORT_RAW_SPEEDUP:-0}" == 1 ]]; then
 fi
 cd "$REPO_ROOT"
 exec "$PYTHON_BIN" tests/benchmark_vlm_checkpoints.py \
-    --target-model "$TARGET_MODEL" --data "$EVAL_DATA" \
+    --target-model "$TARGET_MODEL" --data "$EVAL_DATA" --data-split "${EVAL_SPLIT:-unspecified}" \
     "${checkpoints[@]}" \
     --max-samples "${EVAL_SAMPLES:-16}" --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-128}" \
     --concurrency "${concurrency[@]}" --warmup "${WARMUP:-1}" \

@@ -175,17 +175,38 @@ state/output inconsistency but does not guarantee chunk/token bitwise equality.
 ## Text/image concurrency tables ignoring match gating
 
 Run `EVAL_GPU=6 CONCURRENCIES="1 4 8" bash tests/compare_text_vlm_16.sh`.
-This independently tests text and image prompts through the same HF reference
+This independently tests text, multimodal training prompts, and multimodal
+validation prompts through the same HF reference
 runtime, 16 requests per model/concurrency cell, 128 output-token cap, one warmup
 by default. It includes AR, original DLite, local DLite 6/3 epochs, DFlash 3 epochs,
 and DSpark 3 epochs, using the paths configured in `compare_vlm_16.sh`.
-Neither modality is gated by token matches or acceleration in the other modality.
+No group is gated by token matches or acceleration in another group.
 The shell preflight checks that the chosen text prompts have no image and the
 image prompts have one. Runtime/setup failures still abort.
+Training and validation manifests must be different paths. The first 16 records
+of each split are used by default, with the same sample/output caps for all models.
+Training-set evaluation uses only image/question prompts: saved `answer` fields
+are not supplied to the target and are not used as the generated output.
 
-`speedup_tables.md` contains separate text and multimodal tables, with models as
-rows and concurrency levels as columns. These use **observed throughput ratio**:
-model output tok/s divided by AR output tok/s at the same concurrency/modality.
+Default inputs and overrides:
+
+| Group | Input | Override |
+|---|---|---|
+| Text | `tests/data/text_smoke_16.jsonl` | `TEXT_DATA` |
+| Multimodal train | `data/finevision_qwen35_sglang_20000/train.jsonl` | `TRAIN_EVAL_DATA` |
+| Multimodal validation | `data/finevision_qwen35_sglang_20000/val.jsonl` | `VAL_EVAL_DATA` (legacy `EVAL_DATA` also supported) |
+
+The image paths are relative to the workspace. Stage outputs are `text/`,
+`multimodal_train/`, and `multimodal_val/`. Dataset split and absolute manifest
+path are recorded in summaries and combined CSV/JSON. `--data-split` or shell
+`EVAL_SPLIT` labels standalone comparisons. The split denotes the source manifest,
+not proof that a specific checkpoint actually saw every selected record.
+
+`speedup_tables.md` contains three tables: text, multimodal training set, and
+multimodal validation set. Models are rows and concurrency levels are columns;
+each cell shows speedup / accepted length, and each table names its data source.
+These use **observed throughput ratio**: model output tok/s divided by AR output
+tok/s at the same concurrency and in the same group.
 This differs from the previous wall-time ratio when output token counts differ.
 `comparison.csv` and `comparison.json` retain both ratios, tokens, wall time,
 acceptance length, latency and token matches. This does not establish lossless
@@ -198,7 +219,7 @@ mismatches. It adds `raw_wall_speedup_vs_ar` and
 correctness gate. Without the flag, CLI mismatch failure behavior is unchanged.
 Raw reporting requires block verification, never sequential diagnostics.
 
-Both tables are single-GPU unbatched round-robin results. C=4/8 means several
+All three tables are single-GPU unbatched round-robin results. C=4/8 means several
 independent request caches are active; target forwards are serialized rather
 than continuously batched or overlapping. Do not interpret these tables as
 SGLang/vLLM high-concurrency serving performance. Loading, warmup and CPU image

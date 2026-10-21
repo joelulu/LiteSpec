@@ -49,15 +49,18 @@ def test_mrope_state_restores_even_on_exception():
     assert target.rope_deltas == "outer"
 
 
-@pytest.mark.parametrize("family", ["ar", "dlite", "dflash"])
+@pytest.mark.parametrize("family", ["ar", "dlite", "dlite_v1", "dflash"])
 def test_interleaved_real_image_and_text_requests_match_single_request(family):
     from litespec.vlm import baselines, train_aligned
     from test_vlm_aligned import Processor, ROOT
     torch.set_num_threads(1)
     torch.manual_seed(16)
     target = tiny_qwen35().requires_grad_(False)
-    if family == "dlite":
-        draft = DLiteDraftModel(draft_config()).eval()
+    if family.startswith("dlite"):
+        config = draft_config()
+        if family == "dlite_v1":
+            config.dlite_config["architecture_version"] = "dlite_v1"
+        draft = DLiteDraftModel(config).eval()
     elif family == "dflash":
         cfg = train_aligned.load_config(ROOT / "scripts/config/vlm/sft_dflash.yaml")
         cfg.update(num_draft_layers=1, block_size=4)
@@ -88,7 +91,9 @@ def test_benchmark_cli_writes_comparable_csv_and_request_records(monkeypatch, tm
     torch.manual_seed(4)
     target = tiny_qwen35().requires_grad_(False)
     checkpoint = tmp_path / "draft"
-    DLiteDraftModel(draft_config()).save_pretrained(checkpoint)
+    config = draft_config()
+    config.dlite_config["architecture_version"] = "dlite_v1"
+    DLiteDraftModel(config).save_pretrained(checkpoint)
     manifest = tmp_path / "val.jsonl"
     manifest.write_text(''.join(json.dumps(dict(id=str(i), question="describe")) + '\n' for i in range(2)))
     monkeypatch.setattr(cli, "load_target", lambda *a, **kw: (target, Processor()))
@@ -103,3 +108,16 @@ def test_benchmark_cli_writes_comparable_csv_and_request_records(monkeypatch, tm
     assert all(row["output_tokens_per_second"] > 0 and row["speedup_valid"] for row in summaries)
     assert (tmp_path / "results/summary.csv").is_file()
     assert len((tmp_path / "results/dlite_c2.jsonl").read_text().splitlines()) == 2
+
+
+def test_profile_and_first_mismatch():
+    from benchmark_vlm_checkpoints import mismatch_details
+    records = [dict(latency_seconds=5, result=dict(token_ids=[1, 2], accept_lengths=[2],
+                    prefill_seconds=1, draft_seconds=.5, verify_seconds=2, recovery_seconds=1))]
+    row = summarize(records, 5)
+    assert row["speculative_rounds"] == 1
+    assert row["verify_and_snapshot_seconds"] == 2
+    assert row["other_seconds"] == .5
+    assert mismatch_details([1, 3], [1, 2]) == dict(position=1, ar=[2], spec=[3])
+    assert mismatch_details([1], [1, 2])["position"] == 1
+    assert mismatch_details([1], [1]) is None

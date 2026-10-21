@@ -74,6 +74,10 @@ def summarize(records, elapsed):
     lengths = [n for row in records for n in row["result"]["accept_lengths"]]
     tokens = sum(len(row["result"]["token_ids"]) for row in records)
     latencies = sorted(row["latency_seconds"] for row in records)
+    prefill = sum(row["result"].get("prefill_seconds", 0) for row in records)
+    draft = sum(row["result"].get("draft_seconds", 0) for row in records)
+    verify = sum(row["result"].get("verify_seconds", 0) for row in records)
+    recovery = sum(row["result"].get("recovery_seconds", 0) for row in records)
     return dict(requests=len(records), output_tokens=tokens, wall_seconds=elapsed,
                 output_tokens_per_second=tokens / elapsed,
                 requests_per_second=len(records) / elapsed,
@@ -81,4 +85,7 @@ def summarize(records, elapsed):
                 p95_latency_seconds=latencies[max(0, math.ceil(.95 * len(latencies)) - 1)],
                 mean_committed_length=sum(lengths) / len(lengths) if lengths else None,
                 mean_accepted_draft_tokens=sum(n-1 for n in lengths) / len(lengths) if lengths else None,
+                speculative_rounds=len(lengths), prefill_seconds=prefill, draft_seconds=draft,
+                verify_and_snapshot_seconds=verify, recovery_seconds=recovery,
+                other_seconds=max(0, elapsed-prefill-draft-verify-recovery),
                 scheduler="round_robin_unbatched", scope="single_gpu_hf_reference")

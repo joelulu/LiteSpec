@@ -15,6 +15,13 @@ from litespec.vlm.context import ContextPolicy
 from litespec.vlm.runtime import generate, generate_steps, load_target, prepare_example, read_records
 
 
+def mismatch_details(actual, expected):
+    if actual == expected:
+        return None
+    index = next((i for i, (a, b) in enumerate(zip(actual, expected)) if a != b), min(len(actual), len(expected)))
+    return dict(position=index, ar=expected[index:index+8], spec=actual[index:index+8])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model", required=True)
@@ -97,14 +104,17 @@ def main():
                            if torch.device(args.device).type == "cuda" else None,
                            throughput_is_production_benchmark=False)
             any_failure |= not summary["valid_token_match"]
+            expected = canonical_ar if label == "ar" else references[concurrency]
+            summary["mismatch_sample_ids"] = [example.sample_id for example, actual, ref in zip(examples, tokens, expected)
+                                               if actual != ref]
             summary["speedup_valid"] = summary["valid_token_match"] and args.verification == "block"
             if not summary["speedup_valid"]:
                 summary["speedup_vs_ar"] = None
             with (root / f"{label}_c{concurrency}.jsonl").open("w") as handle:
-                expected = canonical_ar if label == "ar" else references[concurrency]
                 for example, result, reference in zip(examples, results, expected):
                     handle.write(json.dumps(dict(sample_id=example.sample_id,
                                                  token_match=result["result"]["token_ids"] == reference,
+                                                 first_mismatch=mismatch_details(result["result"]["token_ids"], reference),
                                                  **result)) + "\n")
             rows.append(summary)
             (root / "summary.json").write_text(json.dumps(rows, indent=2))

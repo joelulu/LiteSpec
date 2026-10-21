@@ -18,6 +18,11 @@ bash tests/compare_vlm_16.sh
 CONCURRENCIES=1 bash tests/compare_vlm_16.sh
 # Correctness diagnostic, whose timings must not be used as speed benchmarks:
 VERIFICATION=sequential bash tests/compare_vlm_16.sh
+# Add the original local checkpoint to the same comparison:
+ORIGINAL_DLITE="$HOME/LMM/lmm_model/Qwen3.5-4B-DLite" \
+CONCURRENCIES=1 bash tests/compare_vlm_16.sh
+# Compare only AR and the original checkpoint:
+ONLY_ORIGINAL=1 CONCURRENCIES=1 bash tests/compare_vlm_16.sh
 ```
 
 The shell script may also be copied to the parent `dlite-vlm` directory. Override
@@ -61,11 +66,19 @@ as C increases; that is not evidence about an optimized serving scheduler.
   reference is also checked for consistency between concurrency levels.
 * Peak allocated GiB: total allocated GPU memory including model weights, retained
   input tensors and request caches; not KV-only memory or allocator reserved bytes.
+* Profile totals: `prefill_seconds`, `draft_seconds`,
+  `verify_and_snapshot_seconds`, and `recovery_seconds` sum existing per-request
+  stage timers. Verification includes copying the hybrid cache; replay is separate.
+  `other_seconds` is the remaining wall time (including AR decode for the AR row).
+  These fields do not add new CUDA synchronization points.
 
 Each run writes `settings.json` (checkpoint paths and exact sample IDs),
 `summary.csv`, `summary.json`, and one JSONL per model/concurrency with output
 tokens, acceptance lengths, timing and match flags. The terminal prints a compact
-summary. Any mismatch makes the final command fail and invalidates the affected
+summary, mismatch sample IDs, and per-request first divergent token positions.
+The original checkpoint retains its own architecture version when loaded; it is
+not converted into the locally trained model's version.
+Any mismatch makes the final command fail and invalidates the affected
 speedup; remaining comparisons are still collected. Exceptions such as OOM abort
 the run and leave already written results intact.
 

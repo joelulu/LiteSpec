@@ -172,7 +172,7 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
 
 
 @torch.no_grad()
-def generate(target, draft, example, *, max_new_tokens=128, policy=None, verification="block"):
+def generate_steps(target, draft, example, *, max_new_tokens=128, policy=None, verification="block"):
     """Greedy chain verification with exact accepted-prefix cache recovery."""
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
@@ -190,7 +190,7 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
         raise ValueError("non-empty history policy is incompatible with a student checkpoint")
     device = inputs["input_ids"].device
     started = clock(device)
-    output = target(**inputs, use_cache=True,
+    output = target(**inputs, use_cache=True, logits_to_keep=1,
                     output_hidden_states=draft is not None or verification == "sequential")
     cache = output.past_key_values
     if cache is None:
@@ -203,7 +203,7 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
     baseline_cache = DraftCache(draft, target, output, anchor) if baseline else None
     if draft is not None:
         pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
-                                draft.config.num_target_layers)[:, -1:].detach()
+                                draft.config.num_target_layers)[:, -1:].detach().clone()
         if not baseline and not draft.is_student:
             history = HistoryBank(
                 selected_layers(output.hidden_states, draft.history_layer_ids,
@@ -217,6 +217,8 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
     emitted, rounds, context_counts = [], [], []
     draft_seconds = verify_seconds = recovery_seconds = 0.0
     decode_started = clock(device)
+    del output
+    yield None  # Allow other requests to prefill before the next decode round.
     while len(emitted) < max_new_tokens:
         if draft is None:
             token = int(pending.item())
@@ -227,6 +229,8 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
                             output_hidden_states=verification == "sequential")
             cache = output.past_key_values
             pending = output.logits[:, -1:].argmax(-1)
+            del output
+            yield None
             continue
         t = clock(device)
         if baseline:
@@ -287,7 +291,7 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
             recovery_seconds += clock(device) - t
         del before
         pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
-                                draft.config.num_target_layers)[:, kept - 1:kept].detach()
+                                draft.config.num_target_layers)[:, kept - 1:kept].detach().clone()
         if baseline:
             baseline_cache.commit(draft, output, kept)
         elif not draft.is_student:
@@ -300,6 +304,7 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
         if history is not None:
             history.prune(policy, anchor=anchor, prefill_length=example.prefill_length,
                           vision_mask=example.vision_mask)
+        del output
         context_counts.append(counts)
         previous_count = len(emitted)
         for token in candidates[0, :kept].tolist():
@@ -309,6 +314,8 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
         rounds.append(len(emitted) - previous_count)
         if emitted[-1] in eos:
             break
+        if len(emitted) < max_new_tokens:
+            yield None
     decode_seconds = clock(device) - decode_started
     return {
         "token_ids": emitted, "accept_lengths": rounds, "context_counts": context_counts,
@@ -321,6 +328,17 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None, verific
         "verification": verification,
         "cache_recovery": "full_snapshot_and_prefix_replay" if verification == "block" else "never_commit_rejected_tokens",
     }
+
+
+@torch.no_grad()
+def generate(target, draft, example, **kwargs):
+    """Run one request to completion with the same scheduler-ready implementation."""
+    steps = generate_steps(target, draft, example, **kwargs)
+    while True:
+        try:
+            next(steps)
+        except StopIteration as completed:
+            return completed.value
 
 
 def read_records(path, limit=None):

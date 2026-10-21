@@ -94,10 +94,10 @@ class DraftCache:
                                draft.config.num_target_layers).flatten(-2).detach()
 
     def propose(self, draft, target, pending, anchor):
-        ids = pending.new_full((1, draft.block_size), draft.mask_token_id)
+        ids = pending.new_full((pending.shape[0], draft.block_size), draft.mask_token_id)
         ids[:, :1] = pending
         start = self.cache.get_seq_length()
-        positions = torch.arange(start, anchor + draft.block_size, device=pending.device)[None]
+        positions = torch.arange(start, anchor + draft.block_size, device=pending.device)[None].expand(pending.shape[0], -1)
         hidden = draft(noise_embedding=target.get_input_embeddings()(ids), target_hidden=self.hidden,
                        position_ids=positions, past_key_values=self.cache, use_cache=True, is_causal=False)
         remove = self.cache.get_seq_length() - anchor

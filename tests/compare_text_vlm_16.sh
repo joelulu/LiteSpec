@@ -15,7 +15,13 @@ export ONLY_ORIGINAL=0
 TEXT_DATA="${TEXT_DATA:-$REPO_ROOT/tests/data/text_smoke_16.jsonl}"
 TRAIN_EVAL_DATA="${TRAIN_EVAL_DATA:-$DLITE_WORKSPACE/data/finevision_qwen35_sglang_20000/train.jsonl}"
 VAL_EVAL_DATA="${VAL_EVAL_DATA:-${EVAL_DATA:-$DLITE_WORKSPACE/data/finevision_qwen35_sglang_20000/val.jsonl}}"
-GROUP_DIR="${RESULT_DIR:-$DLITE_WORKSPACE/runs/text_vlm_compare_$(date +%Y%m%d_%H%M%S)_$$}"
+RUN_KIND=text_vlm_compare
+AXIS="C=$CONCURRENCIES"
+if [[ "${BENCHMARK_MODE:-reference}" == static_batch ]]; then
+    RUN_KIND=static_batch_text_vlm
+    AXIS="B=${BATCH_SIZES:-1 8}"
+fi
+GROUP_DIR="${RESULT_DIR:-$DLITE_WORKSPACE/runs/${RUN_KIND}_$(date +%Y%m%d_%H%M%S)_$$}"
 [[ ! -e "$GROUP_DIR" ]] || { echo "Choose a fresh RESULT_DIR" >&2; exit 1; }
 mkdir -p "$GROUP_DIR"
 GROUP_DIR="$(cd -- "$GROUP_DIR" && pwd)"
@@ -38,7 +44,7 @@ for stage in text multimodal_train multimodal_val; do
         multimodal_train) data="$TRAIN_EVAL_DATA"; split=train ;;
         multimodal_val) data="$VAL_EVAL_DATA"; split=validation ;;
     esac
-    echo "=== $stage: split=$split, data=$data, C=$CONCURRENCIES, $EVAL_SAMPLES requests per cell ==="
+    echo "=== $stage: split=$split, data=$data, $AXIS, $EVAL_SAMPLES unique prompts per cell ==="
     EVAL_DATA="$data" EVAL_SPLIT="$split" RESULT_DIR="$GROUP_DIR/$stage" \
         bash tests/compare_vlm_16.sh 2>&1 | tee "$GROUP_DIR/$stage.log"
 done

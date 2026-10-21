@@ -1,5 +1,9 @@
 # Sixteen-prompt checkpoint comparison
 
+For true replicated-input static batches with decode-only timing, use
+`tests/compare_static_batch_text_vlm.sh`; see [the static batch guide](VLM_STATIC_BATCH.md).
+The C-based round-robin tests below remain available as reference diagnostics.
+
 `tests/compare_vlm_16.sh` defaults to the three supplied checkpoints:
 
 * `../runs/dlite_vlm_aligned_6ep_20261021_022447/last`

@@ -124,16 +124,17 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
     if student and not policy.is_empty:
         raise ValueError("student checkpoints have no history interface; use dlite_no_history")
     device, dtype = pivot.device, pivot.dtype
+    batch_size = anchor_ids.shape[0]
     block_size = draft.block_size
-    query_ids = torch.full((1, block_size), draft.mask_token_id, device=device, dtype=torch.long)
-    query_ids[:, 0] = anchor_ids.reshape(1)
+    query_ids = torch.full((batch_size, block_size), draft.mask_token_id, device=device, dtype=torch.long)
+    query_ids[:, 0] = anchor_ids.reshape(batch_size)
     query = draft.build_inference_query_embeddings(embedding, query_ids)
     physical = visible = 0
     if student:
-        context_pos = torch.zeros((1, draft.condition_slot_count), device=device, dtype=torch.long)
+        context_pos = torch.zeros((batch_size, draft.condition_slot_count), device=device, dtype=torch.long)
         offset = 0 if draft.architecture_version == "dlite_v1" else 1
-        q_pos = torch.arange(offset, offset + block_size, device=device).view(1, -1)
-        kwargs = {"history_hidden": pivot.new_empty(1, 1, 0, pivot.size(-1))}
+        q_pos = torch.arange(offset, offset + block_size, device=device).view(1, -1).expand(batch_size, -1)
+        kwargs = {"history_hidden": pivot.new_empty(batch_size, 1, 0, pivot.size(-1))}
         attention_mask = None
     else:
         if history is None:

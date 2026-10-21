@@ -57,13 +57,21 @@ fi
 cd "$REPO_ROOT"
 if [[ "${BENCHMARK_MODE:-reference}" == static_batch ]]; then
     read -r -a batches <<< "${BATCH_SIZES:-1 8}"
+    input_args=()
+    if [[ "${REFERENCE_INPUT:-0}" == 1 ]]; then
+        input_args+=(--reference-input --input-mode "${INPUT_MODE:-vision}" --seed "${SAMPLE_SEED:-42}"
+                     --prompt-field "${PROMPT_FIELD:-reference}")
+        [[ -z "${IMAGE_ROOT:-}" ]] || input_args+=(--image-root "$IMAGE_ROOT")
+    fi
+    [[ -z "${IMAGE_MAX_PIXELS:-}" ]] || input_args+=(--image-max-pixels "$IMAGE_MAX_PIXELS")
+    [[ -z "${IMAGE_MIN_PIXELS:-}" ]] || input_args+=(--image-min-pixels "$IMAGE_MIN_PIXELS")
     exec "$PYTHON_BIN" tests/benchmark_vlm_static_batch.py \
         --target-model "$TARGET_MODEL" --data "$EVAL_DATA" --data-split "${EVAL_SPLIT:-unspecified}" \
         --dataset-name "${EVAL_DATASET_NAME:-unspecified}" \
         "${checkpoints[@]}" --batch-sizes "${batches[@]}" \
         --max-samples "${EVAL_SAMPLES:-16}" --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-128}" \
         --warmup "${WARMUP:-1}" --attention-backend "${ATTENTION_BACKEND:-auto}" \
-        --output-dir "$RESULT_DIR"
+        --output-dir "$RESULT_DIR" "${input_args[@]}"
 fi
 exec "$PYTHON_BIN" tests/benchmark_vlm_checkpoints.py \
     --target-model "$TARGET_MODEL" --data "$EVAL_DATA" --data-split "${EVAL_SPLIT:-unspecified}" \

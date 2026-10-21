@@ -44,6 +44,13 @@ def main():
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--data-split", choices=["train", "validation", "smoke", "unspecified"], default="unspecified")
     parser.add_argument("--dataset-name", default="unspecified")
+    parser.add_argument("--reference-input", action="store_true", help="read prompt or first conversations.content, sample with seed")
+    parser.add_argument("--input-mode", choices=["text", "vision"], default="vision")
+    parser.add_argument("--image-root", type=Path)
+    parser.add_argument("--prompt-field", choices=["reference", "prompt", "question", "first-content"], default="reference")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--image-max-pixels", type=int)
+    parser.add_argument("--image-min-pixels", type=int)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 8])
     parser.add_argument("--max-samples", type=int, default=16)
@@ -54,8 +61,12 @@ def main():
     parser.add_argument("--verification", choices=["block"], default="block")
     parser.add_argument("--report-raw-speedup", action="store_true", help="accepted for compatibility; observed ratios are always reported")
     args = parser.parse_args()
-    if min([args.max_samples, args.max_new_tokens, *args.batch_sizes]) < 1 or args.warmup < 0:
+    if min([args.max_new_tokens, *args.batch_sizes]) < 1 or args.max_samples < (0 if args.reference_input else 1) or args.warmup < 0:
         parser.error("positive sample/token/batch limits and nonnegative warmup required")
+    if any(value is not None and value < 1 for value in (args.image_min_pixels, args.image_max_pixels)):
+        parser.error("image pixel limits must be positive")
+    if args.image_min_pixels and args.image_max_pixels and args.image_min_pixels > args.image_max_pixels:
+        parser.error("image minimum must not exceed maximum")
     labels = [label for label, _ in args.checkpoint]
     if len(labels) != len(set(labels)) or "ar" in labels:
         parser.error("checkpoint labels must be unique and not ar")
@@ -66,8 +77,14 @@ def main():
         if not (Path(path)/"config.json").is_file():
             parser.error(f"missing checkpoint {label}: {path}")
     data = args.data.expanduser().resolve()
-    records = list(read_eval_records(data, args.max_samples))
-    if len(records) != args.max_samples or len({record["id"] for record in records}) != len(records):
+    inspection = None
+    if args.reference_input:
+        from reference_vlm_data import load_reference_records
+        records, inspection = load_reference_records(data, args.max_samples, args.seed, args.image_root,
+                                                     args.input_mode == "vision", args.prompt_field)
+    else:
+        records = list(read_eval_records(data, args.max_samples))
+    if not records or (not args.reference_input and len(records) != args.max_samples) or len({record["id"] for record in records}) != len(records):
         parser.error("requested number of unique samples required")
     attention = args.attention_backend
     if attention == "auto":
@@ -77,12 +94,37 @@ def main():
     settings = {**vars(args), "data": str(data), "output_dir": str(root),
         "resolved_checkpoints": checkpoints, "sample_ids": [row["id"] for row in records],
         "actual_attention_backend": attention,
-        "benchmark_mode": "static_replicated_batch", "timing_scope": "decode_only_after_prefill"}
+        "benchmark_mode": "static_replicated_batch", "timing_scope": "decode_only_after_prefill",
+        "data_inspection": inspection}
     (root/"settings.json").write_text(json.dumps(settings, default=str, indent=2))
     dtype = torch.float32 if torch.device(args.device).type == "cpu" else torch.bfloat16
     target, processor = load_target(args.target_model, device=args.device, dtype=dtype, attention=attention)
+    if args.image_max_pixels is not None or args.image_min_pixels is not None:
+        from reference_vlm_image_budget import configure_image_budget
+        configure_image_budget(processor, args.image_min_pixels, args.image_max_pixels)
+    image_size = getattr(getattr(processor, "image_processor", None), "size", None)
+    settings["effective_image_processor_size"] = dict(image_size) if image_size is not None else None
+    (root/"settings.json").write_text(json.dumps(settings, default=str, indent=2))
     examples = [prepare_example(processor, target.config, record, device=args.device,
                                base_dir=data.parent, training=False) for record in records]
+    input_metadata = []
+    for record, example in zip(records, examples):
+        grid = example.inputs.get("image_grid_thw")
+        image_id = getattr(target.config, "image_token_id", None)
+        patch_size = getattr(getattr(target.config, "vision_config", None), "patch_size", None)
+        metadata = dict(sample_id=example.sample_id, source_id=record.get("source_id"),
+            source_row=record.get("source_row"), image_path=record.get("image"),
+            original_image_size=record.get("original_image_size"),
+            input_tokens=example.prefill_length,
+            visual_tokens_with_delimiters=int(example.vision_mask.sum()),
+            image_tokens=int((example.inputs["input_ids"] == image_id).sum()) if image_id is not None else 0,
+            processed_image_hw=[[int(row[1])*patch_size, int(row[2])*patch_size] for row in grid.tolist()]
+                if grid is not None and patch_size is not None else None,
+            image_grid_thw=grid.tolist() if grid is not None else None)
+        input_metadata.append(metadata)
+    (root/"inputs.json").write_text(json.dumps(input_metadata, indent=2))
+    if args.reference_input:
+        print("First processed input: " + json.dumps(input_metadata[0]), flush=True)
     rows, references = [], {}
     print(f"True static replicated batches: {sorted(set(args.batch_sizes))}; attention={attention}", flush=True)
     print("Decode-only throughput; prefill reported separately. No continuous batching. Match does not gate ratios.", flush=True)
@@ -105,6 +147,9 @@ def main():
             matched = sum(a == b for a, b in zip(tokens, expected))*batch_size
             summary = dict(model=label, checkpoint=checkpoint, dataset_split=args.data_split,
                 dataset_path=str(data), dataset_name=args.dataset_name,
+                input_mode=args.input_mode if args.reference_input else "from_manifest",
+                mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),
+                mean_image_tokens=sum(meta["image_tokens"] for meta in input_metadata)/len(input_metadata),
                 attention_backend=attention, **summarize_batches(results, batch_size))
             base = summary if label == "ar" else next(row for row in rows if row["model"] == "ar" and row["batch_size"] == batch_size)
             summary.update(matched=matched, valid_token_match=matched == summary["requests"],
@@ -116,8 +161,10 @@ def main():
                     if torch.device(args.device).type == "cuda" else None)
             with (root/f"{label}_b{batch_size}.jsonl").open("w") as handle:
                 for example, result, reference in zip(examples, results, expected):
+                    decode = getattr(getattr(processor, "tokenizer", None), "decode", None)
                     handle.write(json.dumps(dict(sample_id=example.sample_id, token_match=result["token_ids"] == reference,
-                                                 result=result)) + "\n")
+                        decoded_text=decode(result["token_ids"], skip_special_tokens=True) if callable(decode) else None,
+                        result=result)) + "\n")
             rows.append(summary)
             (root/"summary.json").write_text(json.dumps(rows, indent=2))
             with (root/"summary.csv").open("w", newline="") as handle:

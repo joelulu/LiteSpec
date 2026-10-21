@@ -1,5 +1,9 @@
 # Qwen3.5 image/text DLite direct SFT on multiple GPUs
 
+**Historical smoke trainer:** the default launcher now uses the original-recipe
+FSDP/Muon six-epoch adapter. See [VLM_ALIGNED_TRAINING.md](VLM_ALIGNED_TRAINING.md).
+The DDP details below describe the older `litespec.vlm.train` entry point only.
+
 This is the same CE + probability-L1 direct-SFT objective as the original VLM
 reference entry point. It is not the paper's two-stage recipe or a DFlash baseline.
 Each process loads one frozen target and one trainable draft. Only the draft is

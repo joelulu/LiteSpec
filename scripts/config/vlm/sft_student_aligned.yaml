@@ -1,0 +1,14 @@
+# Training hyperparameters are inherited from the original direct-SFT recipe.
+upstream_config: scripts/config/dlite_sft.yaml
+target_model: Qwen/Qwen3.5-4B
+train_data: /path/to/train.jsonl
+output_dir: outputs/vlm_sft_aligned
+device: cuda
+model_role: student
+# HF is required for image tensors and Qwen3.5 hidden-state extraction.
+target_model_backend: hf_vlm
+# Operational checkpoint cadence only; does not affect the optimizer schedule.
+save_interval: 4000
+log_interval: 1
+# Operational logging stays local by default; set wandb explicitly if desired.
+report_to: none

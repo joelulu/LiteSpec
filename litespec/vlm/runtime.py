@@ -172,10 +172,12 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
 
 
 @torch.no_grad()
-def generate(target, draft, example, *, max_new_tokens=128, policy=None):
+def generate(target, draft, example, *, max_new_tokens=128, policy=None, verification="block"):
     """Greedy chain verification with exact accepted-prefix cache recovery."""
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
+    if verification not in {"block", "sequential"}:
+        raise ValueError("verification must be block or sequential")
     inputs = example.inputs
     if inputs["input_ids"].shape != (1, example.prefill_length):
         raise ValueError("generation accepts one unpadded prompt, not a training answer")
@@ -184,7 +186,8 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None):
         raise ValueError("non-empty history policy is incompatible with a student checkpoint")
     device = inputs["input_ids"].device
     started = clock(device)
-    output = target(**inputs, use_cache=True, output_hidden_states=draft is not None)
+    output = target(**inputs, use_cache=True,
+                    output_hidden_states=draft is not None or verification == "sequential")
     cache = output.past_key_values
     if cache is None:
         raise RuntimeError("target must return a cache for incremental verification")
@@ -215,7 +218,8 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None):
             emitted.append(token)
             if token in eos or len(emitted) == max_new_tokens:
                 break
-            output = target(input_ids=pending, past_key_values=cache, use_cache=True)
+            output = target(input_ids=pending, past_key_values=cache, use_cache=True,
+                            output_hidden_states=verification == "sequential")
             cache = output.past_key_values
             pending = output.logits[:, -1:].argmax(-1)
             continue
@@ -233,19 +237,37 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None):
         draft_seconds += clock(device) - t
         t = clock(device)
         # Snapshot includes GDN convolution/recurrent state AND attention KV.
-        before = copy.deepcopy(cache)
-        output = target(input_ids=candidates, past_key_values=cache, use_cache=True,
-                        output_hidden_states=True)
-        cache = output.past_key_values
-        predictions = output.logits.argmax(-1)
-        accepted = 0
-        for j in range(candidates.shape[1] - 1):
-            if int(candidates[0, j + 1]) != int(predictions[0, j]):
-                break
-            accepted += 1
-        kept = accepted + 1
+        before = None
+        if verification == "sequential":
+            # Diagnostic path: identical one-token calls to AR. Wrong proposals
+            # never enter the hybrid cache. This is not a speed benchmark.
+            from types import SimpleNamespace
+            states, predictions = [], []
+            for j in range(candidates.shape[1]):
+                one = target(input_ids=candidates[:, j:j+1], past_key_values=cache,
+                             use_cache=True, output_hidden_states=True)
+                cache = one.past_key_values
+                states.append(one.hidden_states)
+                predictions.append(one.logits[:, -1:].argmax(-1))
+                if j + 1 == candidates.shape[1] or not torch.equal(candidates[:, j+1:j+2], predictions[-1]):
+                    break
+            kept = len(states)
+            predictions = torch.cat(predictions, dim=1)
+            output = SimpleNamespace(hidden_states=tuple(torch.cat(parts, dim=1) for parts in zip(*states)))
+        else:
+            before = copy.deepcopy(cache)
+            output = target(input_ids=candidates, past_key_values=cache, use_cache=True,
+                            output_hidden_states=True)
+            cache = output.past_key_values
+            predictions = output.logits.argmax(-1)
+            accepted = 0
+            for j in range(candidates.shape[1] - 1):
+                if int(candidates[0, j + 1]) != int(predictions[0, j]):
+                    break
+                accepted += 1
+            kept = accepted + 1
         verify_seconds += clock(device) - t
-        if kept != candidates.shape[1]:
+        if verification == "block" and kept != candidates.shape[1]:
             t = clock(device)
             restored = target(input_ids=candidates[:, :kept], past_key_values=before,
                               use_cache=True, output_hidden_states=False)
@@ -282,7 +304,8 @@ def generate(target, draft, example, *, max_new_tokens=128, policy=None):
         "policy": policy.to_dict(), "prefill_tokens": example.prefill_length,
         "visual_tokens_with_delimiters": int(example.vision_mask.sum().item()),
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
-        "cache_recovery": "full_snapshot_and_prefix_replay",
+        "verification": verification,
+        "cache_recovery": "full_snapshot_and_prefix_replay" if verification == "block" else "never_commit_rejected_tokens",
     }
 
 

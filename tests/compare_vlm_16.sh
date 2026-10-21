@@ -21,7 +21,26 @@ checkpoints=(--checkpoint dlite_6ep "$DLITE_6EP"
              --checkpoint dlite_3ep "$DLITE_3EP"
              --checkpoint dflash_3ep "$DFLASH_3EP"
              --checkpoint dspark_3ep "$DSPARK_3EP")
-if [[ "${ONLY_ORIGINAL:-0}" == 1 ]]; then
+if [[ ${MODELS+x} ]]; then
+    read -r -a models <<< "${MODELS//,/ }"
+    ((${#models[@]})) || { echo "MODELS must not be empty; use ar for target only" >&2; exit 1; }
+    checkpoints=()
+    declare -A seen_models=()
+    for model in "${models[@]}"; do
+        [[ ! ${seen_models[$model]+yes} ]] || { echo "Duplicate model: $model" >&2; exit 1; }
+        seen_models[$model]=1
+        case "$model" in
+            ar) ;;
+            dlite_original) checkpoints+=(--checkpoint "$model" "${ORIGINAL_DLITE:-$HOME/LMM/lmm_model/Qwen3.5-4B-DLite}") ;;
+            dlite_6ep) checkpoints+=(--checkpoint "$model" "$DLITE_6EP") ;;
+            dlite_3ep) checkpoints+=(--checkpoint "$model" "$DLITE_3EP") ;;
+            dflash_3ep) checkpoints+=(--checkpoint "$model" "$DFLASH_3EP") ;;
+            dspark_3ep) checkpoints+=(--checkpoint "$model" "$DSPARK_3EP") ;;
+            *) echo "Unknown model: $model" >&2; exit 1 ;;
+        esac
+    done
+    echo "Selected models: ${models[*]}; AR baseline is always included"
+elif [[ "${ONLY_ORIGINAL:-0}" == 1 ]]; then
     checkpoints=(--checkpoint dlite_original "${ORIGINAL_DLITE:-$HOME/LMM/lmm_model/Qwen3.5-4B-DLite}")
 elif [[ -n "${ORIGINAL_DLITE:-}" ]]; then
     checkpoints+=(--checkpoint dlite_original "$ORIGINAL_DLITE")
@@ -40,6 +59,7 @@ if [[ "${BENCHMARK_MODE:-reference}" == static_batch ]]; then
     read -r -a batches <<< "${BATCH_SIZES:-1 8}"
     exec "$PYTHON_BIN" tests/benchmark_vlm_static_batch.py \
         --target-model "$TARGET_MODEL" --data "$EVAL_DATA" --data-split "${EVAL_SPLIT:-unspecified}" \
+        --dataset-name "${EVAL_DATASET_NAME:-unspecified}" \
         "${checkpoints[@]}" --batch-sizes "${batches[@]}" \
         --max-samples "${EVAL_SAMPLES:-16}" --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-128}" \
         --warmup "${WARMUP:-1}" --attention-backend "${ATTENTION_BACKEND:-auto}" \
@@ -47,6 +67,7 @@ if [[ "${BENCHMARK_MODE:-reference}" == static_batch ]]; then
 fi
 exec "$PYTHON_BIN" tests/benchmark_vlm_checkpoints.py \
     --target-model "$TARGET_MODEL" --data "$EVAL_DATA" --data-split "${EVAL_SPLIT:-unspecified}" \
+    --dataset-name "${EVAL_DATASET_NAME:-unspecified}" \
     "${checkpoints[@]}" \
     --max-samples "${EVAL_SAMPLES:-16}" --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-128}" \
     --concurrency "${concurrency[@]}" --warmup "${WARMUP:-1}" \

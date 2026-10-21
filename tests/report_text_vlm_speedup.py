@@ -5,13 +5,21 @@ import json
 from pathlib import Path
 
 
-def comparison_rows(root):
+def comparison_rows(root, selected_cases=None):
     combined = []
     cases = [("text", "text", "smoke"), ("multimodal_train", "multimodal", "train"),
              ("multimodal_val", "multimodal", "validation")]
     if not any((root / name).exists() for name in ("multimodal_train", "multimodal_val")):
         # Keep old two-stage results readable; their split was not recorded.
         cases = [("text", "text", "smoke"), ("multimodal", "multimodal", "unspecified")]
+    known = dict(text=("text", "smoke"), multimodal_train=("multimodal", "train"),
+                 multimodal_val=("multimodal", "validation"), multimodal=("multimodal", "unspecified"))
+    if selected_cases is not None:
+        cases = [(case, *known[case]) for case in selected_cases]
+    else:
+        cases = [case for case in cases if (root/case[0]/"summary.json").exists()]
+    if not cases:
+        raise ValueError("no completed dataset comparisons found")
     for case, modality, split in cases:
         source = json.loads((root / case / "summary.json").read_text())
         settings_path = root / case / "settings.json"
@@ -22,6 +30,7 @@ def comparison_rows(root):
             combined.append(dict(case=case, modality=modality,
                 dataset_split=row.get("dataset_split", split),
                 dataset_path=row.get("dataset_path", settings.get("data", "")),
+                dataset_name=row.get("dataset_name", settings.get("dataset_name", "unspecified")),
                 model=row["model"], concurrency=row["concurrency"],
                 batch_size=row.get("batch_size"),
                 output_tokens_per_second=row["output_tokens_per_second"],
@@ -60,7 +69,7 @@ def tables(rows):
         concurrencies = sorted({row["concurrency"] for row in selected})
         models = list(dict.fromkeys(row["model"] for row in selected))
         indexed = {(row["model"], row["concurrency"]): row for row in selected}
-        output += [f"### {titles[case]}", "", f"数据来源：`{selected[0]['dataset_split']}`；路径：`{selected[0]['dataset_path']}`。", "",
+        output += [f"### {titles[case]}", "", f"数据集：`{selected[0]['dataset_name']}`；划分：`{selected[0]['dataset_split']}`；路径：`{selected[0]['dataset_path']}`。", "",
                    "| 模型 | " + " | ".join(f"{axis}={c} speedup / 接受长度" for c in concurrencies) + " |",
                    "|---|" + "---:|" * len(concurrencies)]
         for model in models:
@@ -81,8 +90,9 @@ def tables(rows):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--cases", nargs="+", choices=["text", "multimodal_train", "multimodal_val", "multimodal"])
     args = parser.parse_args()
-    rows = comparison_rows(args.root)
+    rows = comparison_rows(args.root, args.cases)
     with (args.root / "comparison.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()

@@ -11,8 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from litespec.vlm.baselines import load_draft
 from litespec.vlm.benchmark import RequestPositionState
-from litespec.vlm.runtime import load_target, prepare_example, read_records
+from litespec.vlm.runtime import load_target, prepare_example
 from litespec.vlm.static_batch import generate_static_batch
+from vlm_benchmark_data import read_eval_records
 
 
 def summarize_batches(results, batch_size):
@@ -39,9 +40,10 @@ def summarize_batches(results, batch_size):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model", required=True)
-    parser.add_argument("--checkpoint", nargs=2, action="append", required=True, metavar=("LABEL", "PATH"))
+    parser.add_argument("--checkpoint", nargs=2, action="append", default=[], metavar=("LABEL", "PATH"))
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--data-split", choices=["train", "validation", "smoke", "unspecified"], default="unspecified")
+    parser.add_argument("--dataset-name", default="unspecified")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 8])
     parser.add_argument("--max-samples", type=int, default=16)
@@ -63,8 +65,8 @@ def main():
     for label, path in checkpoints:
         if not (Path(path)/"config.json").is_file():
             parser.error(f"missing checkpoint {label}: {path}")
-    data = args.data.resolve()
-    records = list(read_records(data, args.max_samples))
+    data = args.data.expanduser().resolve()
+    records = list(read_eval_records(data, args.max_samples))
     if len(records) != args.max_samples or len({record["id"] for record in records}) != len(records):
         parser.error("requested number of unique samples required")
     attention = args.attention_backend
@@ -102,7 +104,8 @@ def main():
             expected = references[batch_size]
             matched = sum(a == b for a, b in zip(tokens, expected))*batch_size
             summary = dict(model=label, checkpoint=checkpoint, dataset_split=args.data_split,
-                dataset_path=str(data), attention_backend=attention, **summarize_batches(results, batch_size))
+                dataset_path=str(data), dataset_name=args.dataset_name,
+                attention_backend=attention, **summarize_batches(results, batch_size))
             base = summary if label == "ar" else next(row for row in rows if row["model"] == "ar" and row["batch_size"] == batch_size)
             summary.update(matched=matched, valid_token_match=matched == summary["requests"],
                 raw_throughput_speedup_vs_ar=summary["output_tokens_per_second"]/base["output_tokens_per_second"],

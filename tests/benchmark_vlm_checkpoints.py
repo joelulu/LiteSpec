@@ -12,7 +12,8 @@ import torch
 from litespec.vlm.baselines import load_draft
 from litespec.vlm.benchmark import RequestPositionState, run_closed_loop, summarize
 from litespec.vlm.context import ContextPolicy
-from litespec.vlm.runtime import generate, generate_steps, load_target, prepare_example, read_records
+from litespec.vlm.runtime import generate, generate_steps, load_target, prepare_example
+from vlm_benchmark_data import read_eval_records
 
 
 def mismatch_details(actual, expected):
@@ -25,9 +26,10 @@ def mismatch_details(actual, expected):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model", required=True)
-    parser.add_argument("--checkpoint", nargs=2, action="append", required=True, metavar=("LABEL", "PATH"))
+    parser.add_argument("--checkpoint", nargs=2, action="append", default=[], metavar=("LABEL", "PATH"))
     parser.add_argument("--data", required=True)
     parser.add_argument("--data-split", choices=["train", "validation", "smoke", "unspecified"], default="unspecified")
+    parser.add_argument("--dataset-name", default="unspecified")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-samples", type=int, default=16)
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -56,8 +58,8 @@ def main():
     for label, path in checkpoints:
         if not (Path(path) / "config.json").is_file():
             parser.error(f"missing checkpoint {label}: {path}")
-    data = Path(args.data).resolve()
-    records = list(read_records(data, args.max_samples))
+    data = Path(args.data).expanduser().resolve()
+    records = list(read_eval_records(data, args.max_samples))
     if args.execution == "native_text" and any(record.get("image") for record in records):
         parser.error("native_text requires a manifest without image fields")
     if len(records) != args.max_samples or len({r["id"] for r in records}) != len(records):
@@ -121,7 +123,7 @@ def main():
                 reference_consistent = base["valid_token_match"]
                 speedup = base["wall_seconds"] / elapsed
             summary = dict(model=label, checkpoint=checkpoint, concurrency=concurrency, peak_active_requests=peak,
-                           dataset_split=args.data_split, dataset_path=str(data),
+                           dataset_split=args.data_split, dataset_path=str(data), dataset_name=args.dataset_name,
                            verification=args.verification, **summarize(results, elapsed), matched=matched,
                            execution=args.execution,
                            stage_profile_available=args.execution == "reference",

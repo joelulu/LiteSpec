@@ -196,7 +196,7 @@ Default inputs and overrides:
 
 | Group | Input | Override |
 |---|---|---|
-| Text | `tests/data/text_smoke_16.jsonl` | `TEXT_DATA` |
+| Text | `$HOME/LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/DeepSpec-main-0708-new/eval_datasets/gsm8k.jsonl` | `TEXT_DATA` |
 | Multimodal train | `data/finevision_qwen35_sglang_20000/train.jsonl` | `TRAIN_EVAL_DATA` |
 | Multimodal validation | `data/finevision_qwen35_sglang_20000/val.jsonl` | `VAL_EVAL_DATA` (legacy `EVAL_DATA` also supported) |
 
@@ -205,6 +205,32 @@ The image paths are relative to the workspace. Stage outputs are `text/`,
 path are recorded in summaries and combined CSV/JSON. `--data-split` or shell
 `EVAL_SPLIT` labels standalone comparisons. The split denotes the source manifest,
 not proof that a specific checkpoint actually saw every selected record.
+
+The current comparison wrappers support `MODELS` and `TESTS`:
+
+```bash
+MODELS="ar dlite_original" TESTS="text-only" EVAL_GPU=6 CONCURRENCIES="1 8" \
+    bash tests/compare_text_vlm_16.sh
+
+MODELS="ar dflash_3ep dspark_3ep dlite_3ep dlite_6ep" \
+TESTS="visual-eval visual-training" EVAL_GPU=6 BATCH_SIZES="1 8" \
+    bash tests/compare_static_batch_text_vlm.sh
+```
+
+Models: `ar dlite_original dflash_3ep dspark_3ep dlite_3ep dlite_6ep`.
+Groups: `text-only visual-eval visual-training`. Defaults include all models and
+groups. AR is always included as the speedup baseline; AR-only runs are allowed.
+Selected order is preserved and only selected datasets/checkpoints are required.
+The report writes only selected groups' tables. Typographical/duplicate selection
+values fail rather than silently changing scope.
+
+Text evaluation now directly reads single-string `turns` records from the user's
+GSM8K JSONL without changing the prompt or rewriting the source file. Question
+records remain supported. Multi-turn records are rejected; no user turns are
+silently discarded. Dataset name (`TEXT_DATASET_NAME`, default `gsm8k`) and split
+(`TEXT_SPLIT`, default `unspecified`) are recorded separately. The historical
+text-first mismatch diagnostic still defaults to its original smoke prompts for
+reproducibility; it is a separate script.
 
 `speedup_tables.md` contains three tables: text, multimodal training set, and
 multimodal validation set. Models are rows and concurrency levels are columns;

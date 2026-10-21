@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Text, multimodal train and multimodal validation; no correctness gate.
+# Selectable text, multimodal train and validation; no correctness gate.
 set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export DLITE_WORKSPACE="${DLITE_WORKSPACE:-$(dirname -- "$REPO_ROOT")}"
@@ -10,11 +10,36 @@ export EVAL_SAMPLES="${EVAL_SAMPLES:-16}"
 export EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-128}"
 export REPORT_RAW_SPEEDUP=1
 export VERIFICATION=block
-# Always include the trained drafts plus the original DLite control.
-export ONLY_ORIGINAL=0
-TEXT_DATA="${TEXT_DATA:-$REPO_ROOT/tests/data/text_smoke_16.jsonl}"
+export MODELS="${MODELS-ar dlite_original dflash_3ep dspark_3ep dlite_3ep dlite_6ep}"
+TEXT_DATA="${TEXT_DATA:-$HOME/LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/DeepSpec-main-0708-new/eval_datasets/gsm8k.jsonl}"
 TRAIN_EVAL_DATA="${TRAIN_EVAL_DATA:-$DLITE_WORKSPACE/data/finevision_qwen35_sglang_20000/train.jsonl}"
 VAL_EVAL_DATA="${VAL_EVAL_DATA:-${EVAL_DATA:-$DLITE_WORKSPACE/data/finevision_qwen35_sglang_20000/val.jsonl}}"
+read -r -a selected_tests <<< "${TESTS-text-only visual-eval visual-training}"
+((${#selected_tests[@]})) || { echo "TESTS must not be empty" >&2; exit 1; }
+stages=()
+data_paths=()
+splits=()
+dataset_names=()
+declare -A seen_tests=()
+for test_name in "${selected_tests[@]}"; do
+    [[ ! ${seen_tests[$test_name]+yes} ]] || { echo "Duplicate test: $test_name" >&2; exit 1; }
+    seen_tests[$test_name]=1
+    case "$test_name" in
+        text-only)
+            stages+=(text); data_paths+=("$TEXT_DATA"); splits+=("${TEXT_SPLIT:-unspecified}")
+            dataset_names+=("${TEXT_DATASET_NAME:-gsm8k}") ;;
+        visual-eval)
+            stages+=(multimodal_val); data_paths+=("$VAL_EVAL_DATA"); splits+=(validation)
+            dataset_names+=(finevision) ;;
+        visual-training)
+            stages+=(multimodal_train); data_paths+=("$TRAIN_EVAL_DATA"); splits+=(train)
+            dataset_names+=(finevision) ;;
+        *) echo "Unknown test: $test_name (choose text-only visual-eval visual-training)" >&2; exit 1 ;;
+    esac
+done
+if [[ ${seen_tests[visual-eval]+yes} && ${seen_tests[visual-training]+yes} ]]; then
+    [[ "$TRAIN_EVAL_DATA" != "$VAL_EVAL_DATA" ]] || { echo "Training and validation manifests must differ" >&2; exit 1; }
+fi
 RUN_KIND=text_vlm_compare
 AXIS="C=$CONCURRENCIES"
 if [[ "${BENCHMARK_MODE:-reference}" == static_batch ]]; then
@@ -26,28 +51,28 @@ GROUP_DIR="${RESULT_DIR:-$DLITE_WORKSPACE/runs/${RUN_KIND}_$(date +%Y%m%d_%H%M%S
 mkdir -p "$GROUP_DIR"
 GROUP_DIR="$(cd -- "$GROUP_DIR" && pwd)"
 cd "$REPO_ROOT"
-# Catch accidentally testing image prompts as text or vice versa before loading weights.
-"$PYTHON_BIN" - "$TEXT_DATA" "$TRAIN_EVAL_DATA" "$VAL_EVAL_DATA" "$EVAL_SAMPLES" <<'PY'
-import json, sys
-from itertools import islice
+# Check only selected datasets; no access to unselected paths is required.
+"$PYTHON_BIN" - "$EVAL_SAMPLES" "${stages[@]}" -- "${data_paths[@]}" <<'PY'
+import sys
 from pathlib import Path
-assert Path(sys.argv[2]).resolve() != Path(sys.argv[3]).resolve(), 'train and validation manifests must differ'
-for path, image_expected in zip(sys.argv[1:4], (False, True, True)):
-    with open(path) as stream:
-        rows = list(islice((json.loads(line) for line in stream if line.strip()), int(sys.argv[4])))
-    assert len(rows) == int(sys.argv[4]), f'not enough samples: {path}'
-    assert all(bool(row.get('image')) == image_expected for row in rows), f'wrong input modality: {path}'
+sys.path.insert(0, 'tests')
+from vlm_benchmark_data import read_eval_records
+boundary = sys.argv.index('--')
+stages, paths = sys.argv[2:boundary], sys.argv[boundary+1:]
+selected = dict(zip(stages, paths))
+if 'multimodal_train' in selected and 'multimodal_val' in selected:
+    assert Path(selected['multimodal_train']).resolve() != Path(selected['multimodal_val']).resolve(), 'train and validation manifests must differ'
+for stage, path in zip(stages, paths):
+    rows = list(read_eval_records(Path(path).expanduser(), int(sys.argv[1])))
+    assert len(rows) == int(sys.argv[1]), f'not enough samples: {path}'
+    assert all(bool(row.get('image')) == (stage != 'text') for row in rows), f'wrong input modality: {path}'
 PY
-for stage in text multimodal_train multimodal_val; do
-    case "$stage" in
-        text) data="$TEXT_DATA"; split=smoke ;;
-        multimodal_train) data="$TRAIN_EVAL_DATA"; split=train ;;
-        multimodal_val) data="$VAL_EVAL_DATA"; split=validation ;;
-    esac
-    echo "=== $stage: split=$split, data=$data, $AXIS, $EVAL_SAMPLES unique prompts per cell ==="
-    EVAL_DATA="$data" EVAL_SPLIT="$split" RESULT_DIR="$GROUP_DIR/$stage" \
+for index in "${!stages[@]}"; do
+    stage="${stages[$index]}"; data="${data_paths[$index]}"; split="${splits[$index]}"
+    echo "=== $stage: dataset=${dataset_names[$index]}, split=$split, data=$data, $AXIS, $EVAL_SAMPLES unique prompts per cell ==="
+    EVAL_DATA="$data" EVAL_SPLIT="$split" EVAL_DATASET_NAME="${dataset_names[$index]}" RESULT_DIR="$GROUP_DIR/$stage" \
         bash tests/compare_vlm_16.sh 2>&1 | tee "$GROUP_DIR/$stage.log"
 done
-"$PYTHON_BIN" tests/report_text_vlm_speedup.py --root "$GROUP_DIR"
+"$PYTHON_BIN" tests/report_text_vlm_speedup.py --root "$GROUP_DIR" --cases "${stages[@]}"
 echo "Tables: $GROUP_DIR/speedup_tables.md"
 echo "Full metrics: $GROUP_DIR/comparison.csv"

@@ -7,12 +7,38 @@ EVAL_GPU=6 BATCH_SIZES="1 8" EVAL_SAMPLES=16 EVAL_MAX_NEW_TOKENS=128 \
     bash tests/compare_static_batch_text_vlm.sh
 ```
 
-This runs three independent groups: text smoke prompts, FineVision multimodal
+This defaults to three independent groups: the user's GSM8K text file, FineVision multimodal
 `train.jsonl`, and FineVision multimodal `val.jsonl`. Checkpoint defaults match
 `compare_vlm_16.sh`: AR, DLite 6/3 epochs, DFlash 3 epochs, DSpark 3 epochs, and
 original Qwen3.5-4B-DLite. Dataset overrides are `TEXT_DATA`, `TRAIN_EVAL_DATA`,
 `VAL_EVAL_DATA`; checkpoint overrides are `DLITE_6EP`, `DLITE_3EP`, `DFLASH_3EP`,
 `DSPARK_3EP`, and `ORIGINAL_DLITE`.
+
+Select models and groups with the same options as the round-robin wrapper:
+
+```bash
+EVAL_GPU=6 BATCH_SIZES="1 8" \
+MODELS="ar dlite_original dspark_3ep" \
+TESTS="text-only visual-eval visual-training" \
+bash tests/compare_static_batch_text_vlm.sh
+```
+
+`MODELS` accepts `ar`, `dlite_original`, `dflash_3ep`, `dspark_3ep`, `dlite_3ep`,
+`dlite_6ep` (space or comma separated). AR is always included for ratios;
+`MODELS="ar"` is supported without any draft checkpoints. `TESTS` is space
+separated; choose any subset of `text-only`, `visual-eval`, `visual-training`.
+Only selected datasets and checkpoint files are required. One selected group
+produces one table; all three produce three tables. Unselected inputs are not
+read and unselected drafts are not loaded.
+
+Default `TEXT_DATA` is
+`$HOME/LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/DeepSpec-main-0708-new/eval_datasets/gsm8k.jsonl`.
+The evaluation reader accepts `{"turns": ["one complete prompt"]}` directly,
+preserving newlines and the boxed-answer instruction. No conversion or file
+rewrite occurs. Multi-turn or ambiguous question/turns records fail explicitly.
+`TEXT_DATASET_NAME` defaults to `gsm8k`; `TEXT_SPLIT` defaults to `unspecified`
+because the input file does not declare its official split. Both are recorded,
+along with the manifest path. The normal image/question schema remains supported.
 
 Every unique prompt is physically repeated along the batch dimension and all B
 rows are forwarded together. Image patches and grid metadata are repeated in

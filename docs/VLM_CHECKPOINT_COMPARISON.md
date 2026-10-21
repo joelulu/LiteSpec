@@ -96,3 +96,42 @@ CPU tests use real tiny hybrid Qwen3.5 targets to compare interleaved image/text
 requests with isolated execution, as well as fake-generator accounting and a
 complete CLI export test. Real H100 checkpoints/data and GPU concurrency timing
 must be verified on the user's server.
+
+## Text first, then multimodal diagnostics
+
+Run `EVAL_GPU=0 bash tests/diagnose_dlite_text_then_vlm.sh` from LiteSpec.
+It uses the original checkpoint at `$HOME/LMM/lmm_model/Qwen3.5-4B-DLite`.
+Override `ORIGINAL_DLITE`, `TARGET_MODEL`, `PYTHON_BIN`, `TEXT_DATA`, `EVAL_DATA`,
+`EVAL_SAMPLES` (default 16), or `EVAL_MAX_NEW_TOKENS` (default 128) if needed.
+
+The first stage compares AR with the original DLite `spec_generate` text entry.
+This uses the original recurrent-state transaction/KV crop path rather than the
+VLM reference's full hybrid-cache copies and per-stage CUDA synchronization.
+It keeps the checkpoint's architecture version and greedy decoding. This remains
+an HF single-request test, not an optimized serving-engine benchmark.
+Native AR uses the same target, prompt and output cap with a cached token loop.
+Native total wall time includes prefill and decode. Detailed stage times are
+marked unavailable, rather than adding synchronization to this timing control.
+
+The second stage runs the same text prompts through the VLM reference path.
+This isolates the effect of changing the execution path with fixed prompts.
+Only if both text paths match their respective AR tokens exactly and the native
+text path has wall-time speedup greater than one does the script start image
+evaluation. Otherwise it stops with the text results retained. Set
+`RUN_MULTIMODAL_ALWAYS=1` only to explicitly collect image diagnostics anyway.
+
+The image stage uses the existing val manifest and reports prefill, drafting,
+verification plus cache snapshot, rejected-prefix replay, and residual wall time.
+The same breakdown for text reference helps identify reference-runtime overhead.
+Text prompts are hand-authored smoke prompts in `tests/data/text_smoke_16.jsonl`;
+they are not image questions with images removed. Text and image prompt sets
+differ, so their total-time difference cannot be attributed entirely to vision.
+Each stage has independent warmup, AR correctness comparison, JSONL token
+details, and CSV/JSON summaries. Group results are written under
+`runs/dlite_text_then_vlm_*/analysis.csv` and `analysis.json` with stage logs.
+
+Sequential verification can establish tokenwise correctness but cannot measure
+speculative acceleration: it still runs the target once per verified token.
+Block-only mismatches require first-divergent-token/cache investigation before
+attributing them to numerics or claiming valid speedups. A short smoke-test
+speedup near one should be repeated with more prompts and longer outputs.

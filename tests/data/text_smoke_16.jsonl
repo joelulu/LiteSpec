@@ -1,0 +1,16 @@
+{"id":"text01","question":"Explain how binary search works, give a small example, and describe its time complexity in about 100 words."}
+{"id":"text02","question":"A shop has 240 apples. It sells one quarter in the morning and one third of the remaining apples in the afternoon. Explain how many apples remain, step by step."}
+{"id":"text03","question":"Write a Python function that checks whether a string is a palindrome, ignoring spaces and letter case. Include a few test examples."}
+{"id":"text04","question":"Explain the difference between a stack and a queue, with a practical example for each, in about 100 words."}
+{"id":"text05","question":"Write a Python function to merge two sorted lists into one sorted list without calling sorted. Explain its complexity."}
+{"id":"text06","question":"Explain why the seasons change on Earth. Discuss axial tilt and why distance from the Sun is not the main cause."}
+{"id":"text07","question":"A train travels 180 kilometers at 60 kilometers per hour and returns along the same route at 90 kilometers per hour. Find its average speed for the whole trip and explain the calculation."}
+{"id":"text08","question":"Describe how an HTTP request is processed from a browser to a web server and back, in about 100 words."}
+{"id":"text09","question":"Write a Python function that counts word frequencies in a string. Ignore capitalization and common punctuation. Include an example."}
+{"id":"text10","question":"Explain the difference between correlation and causation using two concrete examples, in about 100 words."}
+{"id":"text11","question":"用中文解释梯度下降的基本过程，说明学习率过大或过小会有什么影响，控制在200字以内。"}
+{"id":"text12","question":"一个水池有两根进水管，分别需要6小时和8小时灌满空池。两根管同时打开，几小时能灌满？请给出计算过程。"}
+{"id":"text13","question":"用中文解释数据库索引为什么可以加快查询，以及它会带来哪些额外开销，控制在200字以内。"}
+{"id":"text14","question":"Write a Python function to find the first non-repeating character in a string, preserving its original order. Include tests and explain the complexity."}
+{"id":"text15","question":"Explain how a least-recently-used cache works and give an example of cache hits, misses, and eviction, in about 100 words."}
+{"id":"text16","question":"Describe three common sources of error in scientific measurements and explain how repeated measurements can help, in about 100 words."}

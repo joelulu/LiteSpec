@@ -34,11 +34,14 @@ def main():
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--verification", choices=["block", "sequential"], default="block")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--execution", choices=["reference", "native_text"], default="reference")
     args = parser.parse_args()
     if args.max_samples < 1 or args.max_new_tokens < 1 or args.warmup < 0:
         parser.error("positive sample/output limits and nonnegative warmup required")
     if any(c < 1 or c > args.max_samples for c in args.concurrency):
         parser.error("concurrency must be between 1 and max-samples")
+    if args.execution == "native_text" and args.concurrency != [1]:
+        parser.error("native_text currently supports concurrency 1 only")
     labels = [label for label, _ in args.checkpoint]
     if len(set(labels)) != len(labels) or "ar" in labels:
         parser.error("checkpoint labels must be unique and must not be 'ar'")
@@ -50,6 +53,8 @@ def main():
             parser.error(f"missing checkpoint {label}: {path}")
     data = Path(args.data).resolve()
     records = list(read_records(data, args.max_samples))
+    if args.execution == "native_text" and any(record.get("image") for record in records):
+        parser.error("native_text requires a manifest without image fields")
     if len(records) != args.max_samples or len({r["id"] for r in records}) != len(records):
         parser.error("manifest must contain the requested number of samples with unique IDs")
     root = Path(args.output_dir).resolve()
@@ -65,20 +70,32 @@ def main():
     references, rows = {}, []
     canonical_ar = None
     any_failure = False
-    print("Single-GPU HF reference: active requests share weights, independent caches/MRoPE; no batched forwards.", flush=True)
+    print(f"Execution: {args.execution}; single GPU, no batched forwards.", flush=True)
     if args.verification == "sequential":
         print("Sequential verification is a correctness diagnostic, not a speed benchmark.", flush=True)
     for label, checkpoint in [("ar", None), *checkpoints]:
         draft = load_draft(checkpoint, attn_implementation="sdpa").to(args.device, dtype).eval() if checkpoint else None
         stored = getattr(draft.config, "vlm_config", {}).get("context_policy") if draft else None
         policy = ContextPolicy(**stored) if stored else None
+        def execute(example):
+            if args.execution == "native_text":
+                from litespec.vlm.native_text import generate_native_text
+                return generate_native_text(target, draft, example, max_new_tokens=args.max_new_tokens,
+                                            verification=args.verification)
+            return generate(target, draft, example, max_new_tokens=args.max_new_tokens,
+                            policy=policy, verification=args.verification)
         for _ in range(args.warmup):
-            generate(target, draft, examples[0], max_new_tokens=args.max_new_tokens,
-                     policy=policy, verification=args.verification)
+            execute(examples[0])
         for concurrency in sorted(set(args.concurrency)):
             if torch.device(args.device).type == "cuda":
                 torch.cuda.reset_peak_memory_stats(args.device)
             def factory(index, example):
+                if args.execution == "native_text":
+                    def one_request():
+                        if False:
+                            yield
+                        return execute(example)
+                    return one_request(), RequestPositionState(target)
                 return (generate_steps(target, draft, example, max_new_tokens=args.max_new_tokens,
                                        policy=policy, verification=args.verification), RequestPositionState(target))
             print(f"Running {label}: C={concurrency}, samples={len(examples)}", flush=True)
@@ -98,6 +115,8 @@ def main():
                 speedup = base["wall_seconds"] / elapsed
             summary = dict(model=label, checkpoint=checkpoint, concurrency=concurrency, peak_active_requests=peak,
                            verification=args.verification, **summarize(results, elapsed), matched=matched,
+                           execution=args.execution,
+                           stage_profile_available=args.execution == "reference",
                            valid_token_match=matched == len(examples) and reference_consistent,
                            ar_reference_consistent=reference_consistent, speedup_vs_ar=speedup,
                            peak_allocated_gib=torch.cuda.max_memory_allocated(args.device) / 1024**3

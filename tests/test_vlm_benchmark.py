@@ -121,3 +121,66 @@ def test_profile_and_first_mismatch():
     assert mismatch_details([1, 3], [1, 2]) == dict(position=1, ar=[2], spec=[3])
     assert mismatch_details([1], [1, 2])["position"] == 1
     assert mismatch_details([1], [1]) is None
+
+
+@pytest.mark.parametrize("verification", ["block", "sequential"])
+def test_native_text_original_entry_matches_ar_and_rejects_images(verification):
+    from litespec.vlm.native_text import generate_native_text
+    torch.set_num_threads(1)
+    torch.manual_seed(7)
+    target = tiny_qwen35().requires_grad_(False)
+    config = draft_config()
+    config.dlite_config["architecture_version"] = "dlite_v1"
+    draft = DLiteDraftModel(config).eval()
+    example = PreparedExample(dict(input_ids=torch.tensor([[1, 2, 3]])), 3,
+                              torch.zeros(3, dtype=torch.bool), "text")
+    ar = generate_native_text(target, None, example, max_new_tokens=8)
+    spec = generate_native_text(target, draft, example, max_new_tokens=8, verification=verification)
+    assert spec["token_ids"] == ar["token_ids"]
+    assert sum(spec["accept_lengths"]) == len(spec["token_ids"])
+    assert not spec["stage_profile_available"]
+    assert spec["total_seconds"] >= spec["decode_seconds"] >= 0
+    example.inputs["pixel_values"] = torch.zeros(1)
+    with pytest.raises(ValueError, match="text-only"):
+        generate_native_text(target, draft, example)
+
+
+def test_text_gate_requires_correct_native_speedup_and_reference():
+    from report_dlite_modalities import text_ready
+    rows = [dict(stage=stage, model="dlite_original", valid_token_match=True,
+                 speedup_valid=True, speedup_vs_ar=1.2)
+            for stage in ("text_native", "text_reference")]
+    assert text_ready(rows)
+    rows[0]["speedup_vs_ar"] = .9
+    assert not text_ready(rows)
+    rows[0]["speedup_vs_ar"] = 1.2
+    rows[1]["valid_token_match"] = False
+    assert not text_ready(rows)
+
+
+def test_native_text_cli_exports_original_results(monkeypatch, tmp_path):
+    import json
+    import sys
+    import benchmark_vlm_checkpoints as cli
+    class TextProcessor:
+        def apply_chat_template(self, messages, **kwargs):
+            return dict(input_ids=torch.tensor([[1, 2, 3]]))
+    torch.set_num_threads(1)
+    torch.manual_seed(7)
+    target = tiny_qwen35().requires_grad_(False)
+    config = draft_config()
+    config.dlite_config["architecture_version"] = "dlite_v1"
+    checkpoint = tmp_path / "draft"
+    DLiteDraftModel(config).save_pretrained(checkpoint)
+    data = tmp_path / "text.jsonl"
+    data.write_text(json.dumps(dict(id="text", question="explain")) + "\n")
+    monkeypatch.setattr(cli, "load_target", lambda *a, **kw: (target, TextProcessor()))
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--target-model", "tiny", "--checkpoint", "dlite_original", str(checkpoint),
+                                     "--data", str(data), "--output-dir", str(tmp_path / "results"), "--device", "cpu",
+                                     "--max-samples", "1", "--max-new-tokens", "4", "--concurrency", "1",
+                                     "--warmup", "0", "--execution", "native_text"])
+    cli.main()
+    rows = json.loads((tmp_path / "results/summary.json").read_text())
+    assert len(rows) == 2
+    assert all(row["valid_token_match"] and row["execution"] == "native_text" for row in rows)
+    assert not any(row["stage_profile_available"] for row in rows)

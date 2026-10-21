@@ -30,6 +30,10 @@ fi
     --output-dir "$MANIFEST_DIR" \
     --max-samples "$MAX_SAMPLES"
 
+budget_args=()
+if [[ "${ADAPTIVE_ANSWER_BUDGET:-1}" == 0 ]]; then
+    budget_args+=(--fixed-answer-budget)
+fi
 exec "$CLIENT_PYTHON" scripts/data/regenerate_vlm_serving.py \
     --manifest "$MANIFEST_DIR/prompts.jsonl" \
     --output-dir "$PREPARE_OUTPUT" \
@@ -42,4 +46,5 @@ exec "$CLIENT_PYTHON" scripts/data/regenerate_vlm_serving.py \
     --timeout "${REQUEST_TIMEOUT:-600}" \
     --retries "${REQUEST_RETRIES:-2}" \
     --image-max-tokens "${IMAGE_MAX_TOKENS:-0}" \
-    --min-answer-tokens "${MIN_ANSWER_TOKENS:-2}"
+    --min-answer-tokens "${MIN_ANSWER_TOKENS:-1}" \
+    "${budget_args[@]}"

@@ -85,7 +85,7 @@ def main():
     env.setdefault("MAX_LENGTH", "4096")
     env.setdefault("CONTEXT_LENGTH", env["MAX_LENGTH"])
     env.setdefault("MAX_NEW_TOKENS", "256")
-    env.setdefault("MIN_ANSWER_TOKENS", "16")
+    env.setdefault("MIN_ANSWER_TOKENS", "1")
     if int(env["MAX_SAMPLES"]) < 0 or int(env["IMAGE_MAX_TOKENS"]) < 0:
         raise ValueError("sample/image caps must be nonnegative")
     if not 0 < int(env["MAX_NEW_TOKENS"]) < int(env["MAX_LENGTH"]) <= int(env["CONTEXT_LENGTH"]):

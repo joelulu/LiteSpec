@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from litespec.vlm.serving_data import (
     LengthValidator, chat_payload, first_image_record, normalize_server,
     output_lock, prepare_manifest, read_jsonl, regenerate, request_answer, ShortAnswer,
+    answer_token_limit,
 )
 
 
@@ -244,6 +245,7 @@ class ServingTests(unittest.TestCase):
     def test_validator_prefix_and_short_answer(self):
         validator = object.__new__(LengthValidator)
         validator.max_length, validator.max_new_tokens = 100, 10
+        validator.min_answer_tokens = 2
         validator.encode = lambda record, answer=None: [1, 2, 3] if answer is None else [1, 2, 3, 4, 5]
         prefix = validator.prompt({})
         validator.answer({"answer": "good"}, prefix)
@@ -253,6 +255,46 @@ class ServingTests(unittest.TestCase):
         validator.encode = lambda *args, **kwargs: [1, 2, 3, 4]
         with self.assertRaisesRegex(ValueError, "too short"):
             validator.answer({"answer": "short"}, prefix)
+
+    def test_adaptive_answer_budget_retains_long_prompts(self):
+        self.assertEqual(answer_token_limit(1000, 4096, 256), 256)
+        self.assertEqual(answer_token_limit(4000, 4096, 256), 88)
+        with self.assertRaisesRegex(ValueError, "reserve answer"):
+            answer_token_limit(4000, 4096, 256, adaptive=False)
+        with self.assertRaisesRegex(ValueError, "minimum answer"):
+            answer_token_limit(4088, 4096, 256)
+        validator = object.__new__(LengthValidator)
+        validator.max_length, validator.max_new_tokens = 100, 32
+        validator.encode = lambda record, answer=None: list(range(80))
+        self.assertEqual(len(validator.prompt({})), 80)
+
+    def test_request_max_tokens_uses_remaining_context(self):
+        with server() as (address, state):
+            args = self.args(self.manifest(1), [address])
+            args.max_length = 40
+            result = regenerate(args, Validator())
+            self.assertEqual(result["succeeded"], 1)
+            self.assertEqual(state["requests"][0]["max_tokens"], 29)  # 40 - 3 - 8
+            self.assertEqual(result["reduced_answer_budget"], 1)
+
+    def test_fixed_budget_and_skip_reason_summary(self):
+        with server() as (address, state):
+            args = self.args(self.manifest(1), [address])
+            args.max_length, args.fixed_answer_budget = 40, True
+            result = regenerate(args, Validator())
+            self.assertEqual(result["skipped"], 1)
+            self.assertEqual(state["requests"], [])
+            self.assertEqual(result["skip_reasons"], {"input too long to reserve answer budget": 1})
+
+    def test_relaxed_default_retains_short_supervision_but_checks_actual_length(self):
+        validator = object.__new__(LengthValidator)
+        validator.max_length, validator.max_new_tokens = 100, 32
+        validator.encode = lambda record, answer=None: [1, 2, 3] if answer is None else [1, 2, 3, 4]
+        prefix = validator.prompt({})
+        validator.answer(dict(answer="4"), prefix)
+        validator.encode = lambda *a, **kw: [1, 2, 3] + [4]*100
+        with self.assertRaisesRegex(ValueError, 'exceeds max_length'):
+            validator.answer(dict(answer='too long'), prefix)
 
 
 if __name__ == "__main__":

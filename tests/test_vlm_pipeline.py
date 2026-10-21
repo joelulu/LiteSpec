@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -92,3 +93,24 @@ def test_startup_failure_cleans_all_owned_processes(monkeypatch, tmp_path):
         pipeline.main()
     assert popen.call_count == 8  # generation was never started
     assert cleanup.call_args.args[0] == [process] * 8
+
+
+@pytest.mark.parametrize('adaptive', ['0', '1'])
+def test_collection_shell_forwards_relaxed_defaults(tmp_path, adaptive):
+    root = Path(__file__).resolve().parents[1]
+    capture = tmp_path/'calls.jsonl'
+    runner = tmp_path/'python'
+    runner.write_text(f'#!{sys.executable}\nimport json,sys\nwith open({str(capture)!r}, "a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n')
+    runner.chmod(0o755)
+    env = os.environ.copy()
+    env.pop('MIN_ANSWER_TOKENS', None)
+    env.update(CLIENT_PYTHON=str(runner), ADAPTIVE_ANSWER_BUDGET=adaptive,
+               PREPARE_OUTPUT=str(tmp_path/'output'))
+    result = subprocess.run(['bash', str(root/'scripts/data/prepare_finevision_serving.sh'),
+                             'http://127.0.0.1:30000'], env=env, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert len(calls) == 2
+    args = calls[-1]
+    assert args[args.index('--min-answer-tokens')+1] == '1'
+    assert ('--fixed-answer-budget' in args) == (adaptive == '0')

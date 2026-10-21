@@ -191,15 +191,28 @@ class ShortAnswer(ValueError):
     pass
 
 
+def answer_token_limit(prefix_length, max_length, max_tokens, min_answer_tokens=1, adaptive=True):
+    """Reserve a short chat suffix; shorten requests instead of dropping prompts."""
+    if not adaptive:
+        if prefix_length + max_tokens + 32 > max_length:
+            raise ValueError("input too long to reserve answer budget")
+        return max_tokens
+    available = max_length - prefix_length - 8
+    if available < min_answer_tokens:
+        raise ValueError("input too long for minimum answer plus chat suffix")
+    return min(max_tokens, available)
+
+
 class LengthValidator:
     """CPU-only, native HF processor matching the training input contract."""
 
-    def __init__(self, target_model, max_length, max_new_tokens, min_answer_tokens=2):
+    def __init__(self, target_model, max_length, max_new_tokens, min_answer_tokens=1, adaptive_answer_budget=True):
         from transformers import AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(target_model)
         self.max_length, self.max_new_tokens = max_length, max_new_tokens
         self.min_answer_tokens = min_answer_tokens
+        self.adaptive_answer_budget = adaptive_answer_budget
 
     def encode(self, record, *, answer=None):
         from PIL import Image
@@ -217,8 +230,9 @@ class LengthValidator:
 
     def prompt(self, record):
         prefix = self.encode(record)
-        if len(prefix) + self.max_new_tokens + 32 > self.max_length:
-            raise ValueError("input too long to reserve answer budget")
+        answer_token_limit(len(prefix), self.max_length, self.max_new_tokens,
+                           getattr(self, "min_answer_tokens", 1),
+                           getattr(self, "adaptive_answer_budget", True))
         return prefix
 
     def answer(self, record, prefix):
@@ -228,7 +242,7 @@ class LengthValidator:
         prefix_length = len(prefix)
         if tokens[:prefix_length] != prefix:
             raise ValueError("chat template is not prefix-stable")
-        if len(tokens) < prefix_length + getattr(self, "min_answer_tokens", 2):
+        if len(tokens) < prefix_length + getattr(self, "min_answer_tokens", 1):
             raise ShortAnswer("answer too short for the requested supervision budget")
 
 
@@ -249,6 +263,7 @@ def request_answer(record, server, *, model, max_tokens, timeout, retries, api_k
                 raise ValueError(f"response model differs from requested model: {response.get('model')!r}")
             return {"answer": text, "generation": {
                 "backend": "sglang", "model": response["model"],
+                "max_tokens": max_tokens,
                 "server": server, "finish_reason": choice.get("finish_reason"),
                 "completion_tokens": response.get("usage", {}).get("completion_tokens"),
                 "prompt_tokens": response.get("usage", {}).get("prompt_tokens"),
@@ -267,7 +282,8 @@ def regenerate(args, validator=None):
         raise ValueError("invalid concurrency, retries or timeout")
     if args.max_tokens < 1 or args.max_length <= args.max_tokens:
         raise ValueError("invalid token/length budget")
-    min_answer_tokens = getattr(args, "min_answer_tokens", 2)
+    min_answer_tokens = getattr(args, "min_answer_tokens", 1)
+    adaptive_answer_budget = not getattr(args, "fixed_answer_budget", False)
     if not 1 <= min_answer_tokens <= args.max_tokens:
         raise ValueError("min_answer_tokens must lie between 1 and max_tokens")
     servers = list(dict.fromkeys(normalize_server(x) for x in args.server_address))
@@ -285,9 +301,9 @@ def regenerate(args, validator=None):
         settings = {"manifest_sha256": file_digest(manifest), "target_model": args.target_model,
                     "backend": "sglang", "model": args.model, "temperature": 0.0,
                     "enable_thinking": False, "max_tokens": args.max_tokens,
-                    "max_length": args.max_length, "schema_version": 1}
-        if min_answer_tokens != 2:
-            settings["min_answer_tokens"] = min_answer_tokens
+                    "max_length": args.max_length, "schema_version": 3,
+                    "min_answer_tokens": min_answer_tokens,
+                    "answer_budget_policy": "adaptive_suffix8" if adaptive_answer_budget else "fixed_suffix32"}
         image_budget = None
         if getattr(args, "image_max_tokens", 0):
             from transformers import AutoProcessor
@@ -299,7 +315,7 @@ def regenerate(args, validator=None):
                                 max_pixels=int(args.image_max_tokens) * factor * factor)
             if not native_min <= image_budget["max_pixels"] <= native_max:
                 raise ValueError("image token cap must lie within the native processor pixel range")
-            settings.update(schema_version=2, image_budget=image_budget)
+            settings.update(image_budget=image_budget)
             settings["split"] = "image_content_sha256_mod100_val5"
         meta = directory / "generation_config.json"
         if meta.exists():
@@ -323,8 +339,10 @@ def regenerate(args, validator=None):
             available = http_json(server + "/models", timeout=min(args.timeout, 30), api_key=api_key)
             if args.model not in {x["id"] for x in available.get("data", [])}:
                 raise ValueError(f"model {args.model!r} is not served at {server}")
-        validator = validator or LengthValidator(args.target_model, args.max_length, args.max_tokens, min_answer_tokens)
+        validator = validator or LengthValidator(args.target_model, args.max_length, args.max_tokens,
+                                                 min_answer_tokens, adaptive_answer_budget)
         counts = Counter(already_done=len(done))
+        skip_reasons, error_types = Counter(), Counter()
         started = time.monotonic()
         workers = args.concurrency * len(servers)
         pending = {}
@@ -350,9 +368,11 @@ def regenerate(args, validator=None):
                         validator.answer(result, prefix)
                     except ShortAnswer as exc:
                         counts["skipped"] += 1
+                        skip_reasons[str(exc)] += 1
                         append_json(skipped, {"id": record["id"], "reason": str(exc)})
                     except Exception as exc:
                         counts["failed"] += 1
+                        error_types[type(exc).__name__] += 1
                         append_json(errors, {"id": record["id"], "error_type": type(exc).__name__,
                                              "error": str(exc), "time": time.time()})
                     else:
@@ -374,23 +394,28 @@ def regenerate(args, validator=None):
                         from .image_budget import materialize_image
                         record = materialize_image(record, directory / "images", **image_budget)
                     prefix = validator.prompt(record)
+                    request_limit = answer_token_limit(len(prefix), args.max_length, args.max_tokens,
+                                                       min_answer_tokens, adaptive_answer_budget)
                 except (ValueError, OSError) as exc:
                     append_json(skipped, {"id": record["id"], "reason": str(exc)})
                     counts["skipped"] += 1
+                    skip_reasons[str(exc)] += 1
                     progress.update(1)
                     continue
                 server_index = counts["submitted"] % len(servers)
                 server = servers[server_index]
                 future = executors[server_index].submit(request_answer, record, server, model=args.model,
-                                         max_tokens=args.max_tokens, timeout=args.timeout,
+                                         max_tokens=request_limit, timeout=args.timeout,
                                          retries=args.retries, api_key=api_key)
                 pending[future] = record, prefix
                 counts["submitted"] += 1
+                counts["reduced_answer_budget"] += int(request_limit < args.max_tokens)
             while pending:
                 finished, _ = wait(pending, return_when=FIRST_COMPLETED)
                 finish(finished)
         seconds = time.monotonic() - started
         summary = {**dict(counts), "seconds": seconds,
+                   "skip_reasons": dict(skip_reasons), "error_types": dict(error_types),
                    "samples_per_second": counts["succeeded"] / seconds,
                    "completion_tokens_per_second": counts["completion_tokens"] / seconds}
         (directory / "last_summary.json").write_text(json.dumps(summary, indent=2))
@@ -422,7 +447,9 @@ def serving_main():
     parser.add_argument("--api-key-env", default="SGLANG_API_KEY")
     parser.add_argument("--image-max-tokens", type=int, default=0,
                         help="cap merged visual tokens via persistent resized PNGs; 0 keeps native images")
-    parser.add_argument("--min-answer-tokens", type=int, default=2,
+    parser.add_argument("--fixed-answer-budget", action="store_true",
+                        help="require the full requested answer budget plus 32 suffix tokens (legacy policy)")
+    parser.add_argument("--min-answer-tokens", type=int, default=1,
                         help="skip answers with fewer supervised tokens (includes chat end marker)")
     args = parser.parse_args()
     summary = regenerate(args)

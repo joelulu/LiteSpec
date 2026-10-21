@@ -81,9 +81,18 @@ or imported. To compare concurrency fairly, use separate output directories with
 the same manifest; resuming a completed run does not measure generation speed.
 
 The client sends `temperature=0`, `chat_template_kwargs.enable_thinking=false`
-and `MAX_NEW_TOKENS` (default 256). It reserves that budget plus 32 template tokens
-within `MAX_LENGTH` (default 4096), checks final training length, prefix stability
-and nonempty supervision. `finish_reason=length` answers are retained and marked
+and `MAX_NEW_TOKENS` (default 256). By default, each request uses
+`min(MAX_NEW_TOKENS, MAX_LENGTH - prefix_tokens - 8)` tokens, retaining long
+prompts that cannot fit the full answer budget. Eight tokens are reserved for
+the chat suffix; final CPU-tokenized training length is still checked against
+`MAX_LENGTH` (default 4096), along with prefix stability and nonempty supervision.
+`MIN_ANSWER_TOKENS` now defaults to 1; explicitly setting 16 retains the old short
+answer filter. `ADAPTIVE_ANSWER_BUDGET=0` restores the old full-budget + 32 rule.
+The new generation identity requires a fresh `PREPARE_OUTPUT`; old skipped rows
+are otherwise considered completed on resume. `last_summary.json` includes
+`skip_reasons`, `error_types`, and `reduced_answer_budget`; each generated row
+records its actual requested `generation.max_tokens`.
+`finish_reason=length` answers are retained and marked
 in generation metadata. The check uses the **local** native HF processor; keep
 server weights, tokenizer, template and image preprocessing matched to this
 target. A served model alias check cannot verify that two servers loaded

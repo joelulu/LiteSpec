@@ -23,7 +23,8 @@ bash generate_finevision_8gpu.sh
 | --- | --- |
 | MAX_SAMPLES | 20000 unique eligible single-image first-turn prompts; 0 means all |
 | MAX_NEW_TOKENS | 256 maximum output tokens; thinking disabled, temperature 0 |
-| MIN_ANSWER_TOKENS | 16 supervised tokens including chat end marker; shorter answers are skipped to match block-8 training eligibility |
+| MIN_ANSWER_TOKENS | 1 supervised token including chat end marker; explicitly set 16 for the old block-8 collection filter |
+| ADAPTIVE_ANSWER_BUDGET | 1: shorten output cap to remaining context minus 8 suffix tokens; 0: require full cap + 32 |
 | MAX_LENGTH | 4096 maximum total processor sequence length |
 | IMAGE_MAX_TOKENS | 1024 merged visual-token cap; 0 retains original images |
 | CONCURRENCY | 8 requests per replica, 64 total |
@@ -37,7 +38,13 @@ FineVision extraction keeps the previously confirmed `conversations[0].content`
 and first-turn-only mapping. Deduplication occurs before counting the sample cap.
 The cap counts prompts, not guaranteed successful outputs: oversized prompts and
 failed requests are reported separately. Failed HTTP/answer records are retried
-on rerun; permanently skipped prompt records are tracked. Identical settings are
+on rerun; permanently skipped prompt records are tracked. Short answers are kept
+by default during collection. This does **not** change upstream training's
+`>= 2 * block_size` label/full-anchor eligibility: a saved short answer may still
+be skipped by training. Train/val partitioning also means a 100,000-candidate run
+does not imply 100,000 training examples. Use a fresh output directory when
+changing filtering policy; resume does not revisit old skipped rows.
+Identical settings are
 required for resume. New manifest schema rejects older manifests whose limit
 semantics counted candidates before deduplication; use a new output directory.
 

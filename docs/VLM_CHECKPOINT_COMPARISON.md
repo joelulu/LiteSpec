@@ -142,3 +142,32 @@ speculative acceleration: it still runs the target once per verified token.
 Block-only mismatches require first-divergent-token/cache investigation before
 attributing them to numerics or claiming valid speedups. A short smoke-test
 speedup near one should be repeated with more prompts and longer outputs.
+
+## Locate a first token mismatch
+
+Use `tests/diagnose_vlm_mismatch.py --previous-run GROUP_DIR --output-dir NEW_DIR`
+with the group directory from `diagnose_dlite_text_then_vlm.sh`. It selects the
+first failed text request (override with `--sample-id text03`) and repeats native
+block, native sequential, and reference block generation. It reuses the recorded
+target/checkpoint paths and output cap, not a new training run.
+
+For each cached multi-token target call it clones the incoming cache, compares
+the actual chunk computation with one-token calls from that same snapshot, and
+records token predictions, logit differences, sequential top-two margins, and
+attention/conv/recurrent cache tensor differences. It restores model-level MRoPE
+state and returns the original call's output unchanged. See `diagnosis.json` and
+`*_target_audit.jsonl`. All timing from this audit is invalid for benchmarking.
+
+A local chunk-vs-token prediction disagreement establishes an execution-path
+difference with equal starting cache/input, but does not by itself prove harmless
+floating-point error or rule out a kernel bug. Small logit margins support the
+numerical-sensitivity hypothesis. Cache differences can also be numerical and
+need their magnitude and later token effects inspected. If local predictions
+agree yet output mismatches remain, investigate prefix commitment, rollback and
+stopping logic. Sequential equality on one request is diagnostic, not a proof
+for all requests.
+
+The native DLite recovery now takes the greedy next token and pivot hidden from
+the replayed prefix output, keeping them consistent with the restored cache.
+Previously those values came from the discarded full-block output. This fixes a
+state/output inconsistency but does not guarantee chunk/token bitwise equality.

@@ -1497,14 +1497,19 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                     tokens_to_remove=verify_block_size,
                 )
                 _restore_recurrent_cache_transaction(recurrent_snapshot)
-                target(
+                output = target(
                     verify_output_ids[:, :kept_verify_tokens],
                     position_ids=verify_position_ids[:, :kept_verify_tokens],
                     past_key_values=past_key_values_target,
                     use_cache=True,
                     logits_to_keep=1,
-                    output_hidden_states=False,
+                    output_hidden_states=True,
                 )
+                # Cache, pivot and next token must describe the same committed
+                # prefix. Hybrid chunk/replay kernels need not be bit-identical.
+                if not use_rejection_sampling:
+                    next_token = sample(output.logits, temperature)
+                    output_ids[:, start + kept_verify_tokens] = next_token.reshape(-1)
                 _crop_target_cache(
                     past_key_values_target,
                     current_length=start + kept_verify_tokens,

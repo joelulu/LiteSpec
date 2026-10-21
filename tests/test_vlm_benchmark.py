@@ -184,3 +184,97 @@ def test_native_text_cli_exports_original_results(monkeypatch, tmp_path):
     assert len(rows) == 2
     assert all(row["valid_token_match"] and row["execution"] == "native_text" for row in rows)
     assert not any(row["stage_profile_available"] for row in rows)
+
+
+def test_native_recovery_uses_replayed_next_token(monkeypatch):
+    from litespec.vlm.native_text import generate_native_text
+    torch.set_num_threads(1)
+    torch.manual_seed(7)
+    target = tiny_qwen35().requires_grad_(False)
+    config = draft_config()
+    config.dlite_config["architecture_version"] = "dlite_v1"
+    draft = DLiteDraftModel(config).eval()
+    forward = target.forward
+    saw_block, injected = False, False
+    def wrapped(*args, **kwargs):
+        nonlocal saw_block, injected
+        ids = kwargs.get("input_ids", args[0] if args else None)
+        cache = kwargs.get("past_key_values")
+        is_replay = (saw_block and not injected and cache is not None
+                     and cache.get_seq_length() == 3 and kwargs.get("logits_to_keep") == 1)
+        if ids.shape[1] > 1 and cache is not None and cache.get_seq_length() > 0:
+            saw_block = True
+        result = forward(*args, **kwargs)
+        if is_replay:
+            assert kwargs["output_hidden_states"]
+            result.logits.fill_(-100)
+            result.logits[..., 123] = 100
+            injected = True
+        return result
+    monkeypatch.setattr(target, "forward", wrapped)
+    example = PreparedExample(dict(input_ids=torch.tensor([[1, 2, 3]])), 3,
+                              torch.zeros(3, dtype=torch.bool), "text")
+    output = generate_native_text(target, draft, example, max_new_tokens=8)
+    assert injected
+    assert output["token_ids"][1] == 123
+
+
+def test_chunk_audit_does_not_change_generation(tmp_path):
+    from diagnose_vlm_mismatch import audit_target
+    torch.set_num_threads(1)
+    torch.manual_seed(7)
+    target = tiny_qwen35().requires_grad_(False)
+    draft = DLiteDraftModel(draft_config()).eval()
+    example = PreparedExample(dict(input_ids=torch.tensor([[1, 2, 3]])), 3,
+                              torch.zeros(3, dtype=torch.bool), "text")
+    expected = generate(target, draft, example, max_new_tokens=8)["token_ids"]
+    path = tmp_path / "audit.jsonl"
+    with path.open("w") as handle:
+        audit_target(target, handle)
+        actual = generate(target, draft, example, max_new_tokens=8)["token_ids"]
+    import json
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert actual == expected
+    assert rows and rows[0]["checked_positions"]
+    assert rows[0]["cache_length_before"] == 3
+
+
+def test_mismatch_diagnostic_replays_saved_request(monkeypatch, tmp_path):
+    import json
+    import sys
+    import diagnose_vlm_mismatch as diagnostic
+    import benchmark_vlm_checkpoints as cli
+    class Processor:
+        def apply_chat_template(self, messages, **kwargs):
+            return dict(input_ids=torch.tensor([[1, 2, 3]]))
+    torch.set_num_threads(1)
+    torch.manual_seed(7)
+    checkpoint = tmp_path / "draft"
+    config = draft_config()
+    config.dlite_config["architecture_version"] = "dlite_v1"
+    DLiteDraftModel(config).save_pretrained(checkpoint)
+    data = tmp_path / "text.jsonl"
+    data.write_text(json.dumps(dict(id="text03", question="explain")) + "\n")
+    previous = tmp_path / "old/text_native"
+    previous.mkdir(parents=True)
+    (previous / "settings.json").write_text(json.dumps(dict(data=str(data), target_model="tiny",
+        max_new_tokens=4, resolved_checkpoints=[["dlite_original", str(checkpoint)]])))
+    (previous / "dlite_original_c1.jsonl").write_text(json.dumps(dict(sample_id="text03", token_match=False,
+                                                                               first_mismatch=dict(position=1))) + "\n")
+    def load(*a, **kw):
+        torch.manual_seed(7)
+        return tiny_qwen35().requires_grad_(False), Processor()
+    monkeypatch.setattr(cli, "load_target", load)
+    main = cli.main
+    def report_mismatch_exit():
+        main()
+        # Exercise the actual benchmark's string-valued mismatch exit too.
+        raise SystemExit("Token mismatches found; performance rows are diagnostic only. Inspect per-request JSONL.")
+    monkeypatch.setattr(cli, "main", report_mismatch_exit)
+    monkeypatch.setattr(sys, "argv", ["diagnostic", "--previous-run", str(previous.parent),
+                                     "--output-dir", str(tmp_path / "audit"), "--device", "cpu"])
+    diagnostic.main()
+    summaries = json.loads((tmp_path / "audit/diagnosis.json").read_text())
+    assert len(summaries) == 3
+    assert summaries[1]["token_match"] and summaries[1]["audited_chunk_calls"] == 0
+    assert summaries[0]["audited_chunk_calls"] > 0

@@ -171,3 +171,36 @@ The native DLite recovery now takes the greedy next token and pivot hidden from
 the replayed prefix output, keeping them consistent with the restored cache.
 Previously those values came from the discarded full-block output. This fixes a
 state/output inconsistency but does not guarantee chunk/token bitwise equality.
+
+## Text/image concurrency tables ignoring match gating
+
+Run `EVAL_GPU=6 CONCURRENCIES="1 4 8" bash tests/compare_text_vlm_16.sh`.
+This independently tests text and image prompts through the same HF reference
+runtime, 16 requests per model/concurrency cell, 128 output-token cap, one warmup
+by default. It includes AR, original DLite, local DLite 6/3 epochs, DFlash 3 epochs,
+and DSpark 3 epochs, using the paths configured in `compare_vlm_16.sh`.
+Neither modality is gated by token matches or acceleration in the other modality.
+The shell preflight checks that the chosen text prompts have no image and the
+image prompts have one. Runtime/setup failures still abort.
+
+`speedup_tables.md` contains separate text and multimodal tables, with models as
+rows and concurrency levels as columns. These use **observed throughput ratio**:
+model output tok/s divided by AR output tok/s at the same concurrency/modality.
+This differs from the previous wall-time ratio when output token counts differ.
+`comparison.csv` and `comparison.json` retain both ratios, tokens, wall time,
+acceptance length, latency and token matches. This does not establish lossless
+speedup; the usual correctness flags remain unchanged.
+
+The opt-in CLI flag `--report-raw-speedup` (or `REPORT_RAW_SPEEDUP=1` for
+`compare_vlm_16.sh`) displays observed throughput ratios and does not fail on token
+mismatches. It adds `raw_wall_speedup_vs_ar` and
+`raw_throughput_speedup_vs_ar`; `speedup_vs_ar` still follows the original strict
+correctness gate. Without the flag, CLI mismatch failure behavior is unchanged.
+Raw reporting requires block verification, never sequential diagnostics.
+
+Both tables are single-GPU unbatched round-robin results. C=4/8 means several
+independent request caches are active; target forwards are serialized rather
+than continuously batched or overlapping. Do not interpret these tables as
+SGLang/vLLM high-concurrency serving performance. Loading, warmup and CPU image
+processing are excluded; GPU prefill and decode are included. Text and image
+prompts differ, so compare each model with its within-modality AR baseline.

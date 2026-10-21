@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--verification", choices=["block", "sequential"], default="block")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--execution", choices=["reference", "native_text"], default="reference")
+    parser.add_argument("--report-raw-speedup", action="store_true",
+                        help="report observed speed ratios and continue despite token mismatches")
     args = parser.parse_args()
     if args.max_samples < 1 or args.max_new_tokens < 1 or args.warmup < 0:
         parser.error("positive sample/output limits and nonnegative warmup required")
@@ -42,6 +44,8 @@ def main():
         parser.error("concurrency must be between 1 and max-samples")
     if args.execution == "native_text" and args.concurrency != [1]:
         parser.error("native_text currently supports concurrency 1 only")
+    if args.report_raw_speedup and args.verification != "block":
+        parser.error("raw performance reporting requires block verification")
     labels = [label for label, _ in args.checkpoint]
     if len(set(labels)) != len(labels) or "ar" in labels:
         parser.error("checkpoint labels must be unique and must not be 'ar'")
@@ -71,6 +75,8 @@ def main():
     canonical_ar = None
     any_failure = False
     print(f"Execution: {args.execution}; single GPU, no batched forwards.", flush=True)
+    if args.report_raw_speedup:
+        print("Reporting observed speed ratios regardless of token match; correctness flags remain recorded.", flush=True)
     if args.verification == "sequential":
         print("Sequential verification is a correctness diagnostic, not a speed benchmark.", flush=True)
     for label, checkpoint in [("ar", None), *checkpoints]:
@@ -127,6 +133,9 @@ def main():
             summary["mismatch_sample_ids"] = [example.sample_id for example, actual, ref in zip(examples, tokens, expected)
                                                if actual != ref]
             summary["speedup_valid"] = summary["valid_token_match"] and args.verification == "block"
+            summary["raw_wall_speedup_vs_ar"] = speedup
+            summary["raw_throughput_speedup_vs_ar"] = (1.0 if label == "ar" else
+                summary["output_tokens_per_second"] / base["output_tokens_per_second"])
             if not summary["speedup_valid"]:
                 summary["speedup_vs_ar"] = None
             with (root / f"{label}_c{concurrency}.jsonl").open("w") as handle:
@@ -147,14 +156,18 @@ def main():
         gc.collect()
         if torch.device(args.device).type == "cuda":
             torch.cuda.empty_cache()
-    print("\nmodel         C  match  accept_len  output_tok/s  latency_s  speedup", flush=True)
+    column = "raw_tok_speedup" if args.report_raw_speedup else "speedup"
+    print(f"\nmodel         C  match  accept_len  output_tok/s  latency_s  {column}", flush=True)
     for row in rows:
         acceptance = f"{row['mean_committed_length']:.3f}" if row["mean_committed_length"] is not None else "-"
-        speedup = f"{row['speedup_vs_ar']:.3f}x" if row["speedup_vs_ar"] is not None else "INVALID"
+        ratio = row["raw_throughput_speedup_vs_ar"] if args.report_raw_speedup else row["speedup_vs_ar"]
+        speedup = f"{ratio:.3f}x" if ratio is not None else "INVALID"
         print(f"{row['model']:<13} {row['concurrency']:>1}  {row['matched']:>2}/{row['requests']:<2}  "
               f"{acceptance:>10}  {row['output_tokens_per_second']:>12.2f}  {row['mean_latency_seconds']:>9.3f}  {speedup}")
     print(f"Results: {root}", flush=True)
-    if any_failure:
+    if any_failure and args.report_raw_speedup:
+        print("Token mismatches retained in JSONL; raw speed ratios reported as requested.", flush=True)
+    elif any_failure:
         raise SystemExit("Token mismatches found; performance rows are diagnostic only. Inspect per-request JSONL.")
 
 

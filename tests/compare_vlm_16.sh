@@ -31,10 +31,14 @@ export CUDA_VISIBLE_DEVICES="${EVAL_GPU:-0}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export PYTHONUNBUFFERED=1
 read -r -a concurrency <<< "${CONCURRENCIES:-1 4 8}"
+extra_args=()
+if [[ "${REPORT_RAW_SPEEDUP:-0}" == 1 ]]; then
+    extra_args+=(--report-raw-speedup)
+fi
 cd "$REPO_ROOT"
 exec "$PYTHON_BIN" tests/benchmark_vlm_checkpoints.py \
     --target-model "$TARGET_MODEL" --data "$EVAL_DATA" \
     "${checkpoints[@]}" \
     --max-samples "${EVAL_SAMPLES:-16}" --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-128}" \
     --concurrency "${concurrency[@]}" --warmup "${WARMUP:-1}" \
-    --verification "${VERIFICATION:-block}" --output-dir "$RESULT_DIR"
+    --verification "${VERIFICATION:-block}" --output-dir "$RESULT_DIR" "${extra_args[@]}"

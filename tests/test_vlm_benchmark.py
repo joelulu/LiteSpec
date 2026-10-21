@@ -82,7 +82,8 @@ def test_interleaved_real_image_and_text_requests_match_single_request(family):
     assert [row["result"]["token_ids"] for row in results] == expected
 
 
-def test_benchmark_cli_writes_comparable_csv_and_request_records(monkeypatch, tmp_path):
+@pytest.mark.parametrize("report_raw", [False, True])
+def test_benchmark_cli_writes_comparable_csv_and_request_records(monkeypatch, tmp_path, report_raw):
     import json
     import sys
     import benchmark_vlm_checkpoints as cli
@@ -97,17 +98,58 @@ def test_benchmark_cli_writes_comparable_csv_and_request_records(monkeypatch, tm
     manifest = tmp_path / "val.jsonl"
     manifest.write_text(''.join(json.dumps(dict(id=str(i), question="describe")) + '\n' for i in range(2)))
     monkeypatch.setattr(cli, "load_target", lambda *a, **kw: (target, Processor()))
+    if report_raw:
+        original_steps = cli.generate_steps
+        def divergent_steps(target, draft, example, **kwargs):
+            result = yield from original_steps(target, draft, example, **kwargs)
+            if draft is not None:
+                result["token_ids"][0] = (result["token_ids"][0] + 1) % 128
+            return result
+        monkeypatch.setattr(cli, "generate_steps", divergent_steps)
     monkeypatch.setattr(sys, "argv", ["benchmark", "--target-model", "tiny", "--checkpoint", "dlite", str(checkpoint),
                                      "--data", str(manifest), "--output-dir", str(tmp_path / "results"),
                                      "--device", "cpu", "--max-samples", "2", "--max-new-tokens", "3",
-                                     "--concurrency", "1", "2", "--warmup", "0"])
+                                     "--concurrency", "1", "2", "--warmup", "0"] +
+                                    (["--report-raw-speedup"] if report_raw else []))
     cli.main()
     summaries = json.loads((tmp_path / "results/summary.json").read_text())
     assert len(summaries) == 4
-    assert all(row["matched"] == row["requests"] == 2 for row in summaries)
-    assert all(row["output_tokens_per_second"] > 0 and row["speedup_valid"] for row in summaries)
+    for row in summaries:
+        assert row["requests"] == 2 and row["output_tokens_per_second"] > 0
+        assert row["raw_throughput_speedup_vs_ar"] > 0
+        if report_raw and row["model"] != "ar":
+            assert row["matched"] == 0 and not row["speedup_valid"]
+            assert row["speedup_vs_ar"] is None
+        else:
+            assert row["matched"] == 2 and row["speedup_valid"]
     assert (tmp_path / "results/summary.csv").is_file()
     assert len((tmp_path / "results/dlite_c2.jsonl").read_text().splitlines()) == 2
+
+
+def test_raw_modality_tables_use_throughput_ratio_even_with_mismatches(tmp_path):
+    import json
+    from report_text_vlm_speedup import comparison_rows, tables
+    for modality in ("text", "multimodal"):
+        root = tmp_path / modality
+        root.mkdir()
+        rows = []
+        for c in (1, 4, 8):
+            base = dict(concurrency=c, model="ar", output_tokens_per_second=10,
+                        output_tokens=100, wall_seconds=10, mean_latency_seconds=1,
+                        mean_committed_length=None, matched=16, requests=16,
+                        valid_token_match=True, scheduler="round_robin_unbatched")
+            rows += [base, dict(base, model="dspark_3ep", output_tokens_per_second=30,
+                                output_tokens=150, wall_seconds=5, matched=0,
+                                valid_token_match=False, mean_committed_length=3)]
+        (root / "summary.json").write_text(json.dumps(rows))
+    rows = comparison_rows(tmp_path)
+    assert len(rows) == 12
+    draft = next(row for row in rows if row["model"] == "dspark_3ep")
+    assert draft["throughput_speedup"] == 3 and draft["wall_time_speedup"] == 2
+    assert not draft["valid_token_match"]
+    report = tables(rows)
+    assert "### 纯文本" in report and "### 多模态" in report
+    assert "| dspark_3ep | 3.000× | 3.000× | 3.000× |" in report
 
 
 def test_profile_and_first_mismatch():

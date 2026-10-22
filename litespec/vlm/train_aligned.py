@@ -52,8 +52,10 @@ def load_config(path):
     if family == "dlite" and upstream.get("mode") != "sft":
         raise ValueError("this VLM adapter implements the upstream direct-SFT recipe")
     cfg = {**upstream["arguments"], **source}
-    if cfg.get("batch_size") != 1 or cfg.get("model_role", "student") != "student":
-        raise ValueError("VLM adapter requires one image per rank and the no-history student")
+    if not isinstance(cfg.get("batch_size"), int) or isinstance(cfg["batch_size"], bool) or cfg["batch_size"] < 1:
+        raise ValueError("batch_size must be a positive integer")
+    if cfg.get("model_role", "student") != "student":
+        raise ValueError("VLM adapter requires the no-history student")
     if cfg["num_epochs"] < 1 or cfg["accumulation_steps"] < 1 or cfg["num_anchors"] < 1:
         raise ValueError("epochs, accumulation and anchors must be positive")
     cfg["upstream_config_sha256"] = hashlib.sha256(reference.read_bytes()).hexdigest()
@@ -69,9 +71,46 @@ def load_config(path):
 
 
 def loss_mask(example):
+    if hasattr(example, "supervision_mask"):
+        return example.supervision_mask
     mask = torch.zeros_like(example.inputs["input_ids"], dtype=torch.float32)
     mask[:, example.prefill_length:] = 1
     return mask
+
+
+def collate_examples(examples, pad_token_id=0):
+    """Right-pad text; preserve per-image patch/grid order and answer boundaries."""
+    if not examples:
+        raise ValueError("cannot collate an empty VLM batch")
+    if len(examples) == 1:
+        return examples[0]
+    width = max(ex.inputs["input_ids"].shape[1] for ex in examples)
+    first = examples[0].inputs["input_ids"]
+    ids = first.new_full((len(examples), width), pad_token_id)
+    attention = torch.zeros_like(ids)
+    supervision = torch.zeros_like(ids, dtype=torch.float32)
+    token_types = torch.zeros_like(ids)
+    for index, ex in enumerate(examples):
+        size = ex.inputs["input_ids"].shape[1]
+        ids[index, :size] = ex.inputs["input_ids"][0]
+        attention[index, :size] = ex.inputs.get("attention_mask", torch.ones_like(ex.inputs["input_ids"]))[0]
+        supervision[index, :size] = loss_mask(ex)[0] * attention[index, :size]
+        if "mm_token_type_ids" in ex.inputs:
+            token_types[index, :size] = ex.inputs["mm_token_type_ids"][0]
+    inputs = dict(input_ids=ids, attention_mask=attention)
+    if any("mm_token_type_ids" in ex.inputs for ex in examples):
+        inputs["mm_token_type_ids"] = token_types
+    for key in ("pixel_values", "image_grid_thw"):
+        values = [ex.inputs[key] for ex in examples if key in ex.inputs]
+        if values:
+            inputs[key] = torch.cat(values, dim=0)
+    # Let Qwen3.5 compute batched MRoPE from the image grids and padding mask.
+    supported = {"input_ids", "attention_mask", "mm_token_type_ids", "pixel_values", "image_grid_thw"}
+    unexpected = set().union(*(ex.inputs.keys() for ex in examples)) - supported
+    if unexpected:
+        raise ValueError(f"unsupported batched processor inputs: {sorted(unexpected)}")
+    return SimpleNamespace(inputs=inputs, supervision_mask=supervision,
+                           sample_ids=[ex.sample_id for ex in examples])
 
 
 def has_anchor(example, block_size):
@@ -157,7 +196,12 @@ def prepare_forward(target, online, example):
     from .baselines import is_baseline, prepare_forward as baseline_forward
     if is_baseline(online.draft_model):
         return baseline_forward(target, online, example, mask)
-    anchors, keep = online.sample_anchor_positions(ids.size(1), mask)
+    anchor_mask = mask
+    if hasattr(example, "supervision_mask"):
+        lengths = example.inputs["attention_mask"].sum(-1)
+        positions_in_sequence = torch.arange(ids.size(1), device=ids.device)
+        anchor_mask = mask * (positions_in_sequence[None] <= lengths[:, None] - online.block_size + 1)
+    anchors, keep = online.sample_anchor_positions(ids.size(1), anchor_mask)
     offsets = torch.arange(online.block_size - 1, device=ids.device)
     positions = anchors.unsqueeze(-1) + offsets
     # Project only distinct supervised text positions, then gather the block layout.
@@ -165,7 +209,9 @@ def prepare_forward(target, online, example):
     with torch.no_grad():
         output = target(**example.inputs, use_cache=False, output_hidden_states=True,
                         logits_to_keep=unique)
-        reference = output.logits[:, inverse].reshape(*positions.shape, -1)
+        indices = inverse.reshape(ids.size(0), -1)
+        reference = output.logits.gather(1, indices.unsqueeze(-1).expand(-1, -1, output.logits.size(-1)))
+        reference = reference.reshape(*positions.shape, -1)
         batch = online.prepare_batch(ids, output.hidden_states, mask,
                                      anchor_positions=anchors, block_keep_mask=keep)
     return dict(prepared_batch=batch, seq_len=ids.size(1), target_prefill_logits=reference,
@@ -249,14 +295,21 @@ def source_batches(session, phase):
     for epoch in range(session.state.epoch, phase.epochs):
         session.sampler.set_epoch(epoch)
         start = session.state.next_batch if epoch == session.state.epoch else 0
-        for index, item in enumerate(session.sampler):
+        items = list(session.sampler)
+        batch_size = session.vlm_config["batch_size"]
+        for index in range(len(items) // batch_size):
             if index < start:
                 continue
             if session.state.phase_step >= phase.batch_count(session.steps_per_epoch):
                 return
-            yield prepare_example(session.processor, session.target.config, session.records[item],
-                                  device=session.device, training=True, max_length=session.vlm_config["max_length"],
-                                  base_dir=session.base_dir)
+            examples = [prepare_example(session.processor, session.target.config, session.records[item],
+                                        device=session.device, training=True, max_length=session.vlm_config["max_length"],
+                                        base_dir=session.base_dir)
+                        for item in items[index*batch_size:(index+1)*batch_size]]
+            pad = getattr(getattr(session.processor, "tokenizer", None), "pad_token_id", None)
+            if pad is None:
+                pad = getattr(getattr(session.target.config, "text_config", session.target.config), "pad_token_id", 0)
+            yield collate_examples(examples, pad_token_id=pad if pad is not None else 0)
 
 
 def log(session, window, grad_norm):
@@ -345,7 +398,10 @@ def run(argv=None):
                                  seed=cfg["sampler_seed"], drop_last=False)
     phase = Phase("sft", 0, cfg["num_epochs"], schedule_full_epochs=True,
                   max_batches=args.max_steps * cfg["accumulation_steps"] if args.max_steps else None)
-    total = optimizer_step_count([phase], len(sampler), cfg["accumulation_steps"])
+    batches_per_rank = len(sampler) // cfg["batch_size"]
+    if batches_per_rank < 1:
+        raise ValueError("not enough eligible samples for one full batch per rank")
+    total = optimizer_step_count([phase], batches_per_rank, cfg["accumulation_steps"])
     cfg.update(eligible_samples=len(records), samples_per_rank=len(sampler), total_optimizer_steps=total)
     saved = None
     if args.resume:
@@ -394,7 +450,7 @@ def run(argv=None):
                               parameter_specs=specs, parameter_layouts=layouts)
     session = TrainingSession(training_args, VLMAdapter(), [phase], draft=draft, draft_online=online,
                               fsdp_model=fsdp, target=target, optimizer=optimizer,
-                              steps_per_epoch=len(sampler), total_steps=total)
+                              steps_per_epoch=batches_per_rank, total_steps=total)
     session.vlm_config, session.records, session.processor = cfg, records, processor
     session.sampler, session.device, session.base_dir = sampler, device, path.parent
     session.last_exported_epoch = 0
@@ -415,7 +471,7 @@ def run(argv=None):
     if saved is not None:
         optimizer.load_state_dict(saved["optimizer"])
         session.state = RunState(**saved["cursor"])
-        session.last_exported_epoch = session.state.global_step // len(sampler)
+        session.last_exported_epoch = session.state.global_step // batches_per_rank
         restore_rng(saved["rng"])
     else:
         random.seed(cfg["seed"] + rank())
@@ -423,7 +479,7 @@ def run(argv=None):
     optimizer.zero_grad()
     if rank() == 0:
         (root / "effective_config.json").write_text(json.dumps(cfg, indent=2))
-        print(json.dumps(dict(config=cfg, global_batch=world() * cfg["accumulation_steps"],
+        print(json.dumps(dict(config=cfg, global_batch=world() * cfg["batch_size"] * cfg["accumulation_steps"],
                               full_epochs=cfg["num_epochs"], debug_cap=args.max_steps)), flush=True)
     session.progress = StepProgress(min(total, args.max_steps) if args.max_steps else total,
                                     session.state.optimizer_step)

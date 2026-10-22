@@ -24,6 +24,27 @@ and `sft_student_ddp.yaml` remain as legacy smoke-test code only.
 | CE / probability L1 / base CE | 0.1 / 1 / 0 |
 | Position decay / clipping | gamma 4 / global norm 1 |
 
+`batch_size` can be increased above 1. Images retain separate patch grids and
+MRoPE; text is right-padded and each row has its own answer supervision mask.
+Padding is excluded from the objective. Each target/draft forward processes the
+whole local batch. Full batches per epoch are `floor(samples_per_rank / batch_size)`;
+an incomplete final batch is dropped, matching the original DataLoader policy.
+The scheduler, resume cursor and ETA use that batch count.
+
+For the eight-GPU DLite/DFlash five-epoch run, copy the launcher into the parent
+workspace after pulling:
+
+```bash
+cp tests/train_dlite_dflash_5ep_mb4.sh ../train_dlite_dflash_5ep_mb4.sh
+cd ..
+bash train_dlite_dflash_5ep_mb4.sh
+```
+
+This launcher uses `finevision_qwen35_10w_img1024_relaxed/train.jsonl`, micro
+batch 4, accumulation 4, effective global batch 128, TensorBoard logging and
+inference-only checkpoint exports. Runs are sequential under
+`runs/vlm_dlite_dflash_5ep_mb4_<timestamp>_<pid>/{dlite,dflash}/last`.
+
 The new adapter uses the original `OnlineDLiteModel` for anchors, local positions,
 block isolation, teacher-forced sequential head and weighted greedy-target CE/L1;
 `runner.run_draft` and `OptimizerWindow` for cross-epoch accumulation/global weight

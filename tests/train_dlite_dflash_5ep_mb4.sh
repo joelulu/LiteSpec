@@ -12,8 +12,9 @@ cd "$DLITE_WORKSPACE/LiteSpec"
 export PYTHON_BIN="${PYTHON_BIN:-$DLITE_WORKSPACE/LiteSpec/.venv-vlm/bin/python}"
 export TARGET_MODEL="${TARGET_MODEL:-$HOME/LMM/lmm_model/Qwen3.5-4B}"
 export TRAIN_DATA="${TRAIN_DATA:-$DLITE_WORKSPACE/data/finevision_qwen35_10w_img1024_relaxed/train.jsonl}"
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export NPROC_PER_NODE=8
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+IFS=, read -r -a TRAIN_GPU_IDS <<< "$CUDA_VISIBLE_DEVICES"
+export NPROC_PER_NODE="${NPROC_PER_NODE:-${#TRAIN_GPU_IDS[@]}}"
 export REPORT_TO=tensorboard
 export SAVE_TRAINING_STATE=0
 export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
@@ -47,7 +48,7 @@ config.update(num_epochs=int(os.environ['EPOCHS']), batch_size=int(os.environ['M
               accumulation_steps=int(os.environ['ACCUMULATION_STEPS']), block_size=int(os.environ['BLOCK_SIZE']))
 Path(sys.argv[2]).write_text(yaml.safe_dump(config, sort_keys=False))
 PY
-    echo "Starting $algorithm: epochs=$EPOCHS, GPUs=8, micro batch=$MICRO_BATCH_SIZE, global batch=$((8 * MICRO_BATCH_SIZE * ACCUMULATION_STEPS)), block=$BLOCK_SIZE"
+    echo "Starting $algorithm: epochs=$EPOCHS, GPUs=$NPROC_PER_NODE, micro batch=$MICRO_BATCH_SIZE, global batch=$((NPROC_PER_NODE * MICRO_BATCH_SIZE * ACCUMULATION_STEPS)), block=$BLOCK_SIZE"
     bash scripts/dlite/run_training_vlm.sh 2>&1 | tee "$OUTPUT_DIR/train.log"
     echo "Completed $algorithm: $OUTPUT_DIR/last"
     # Both recipes use the same VLM eligibility rule; DFlash reuses DLite's set.

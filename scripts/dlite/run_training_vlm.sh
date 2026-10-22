@@ -48,6 +48,9 @@ if visible < workers:
 PY
 mkdir -p "$OUTPUT_DIR"
 limits=()
+if [[ -n "${REUSE_VALIDATION_FROM:-}" ]]; then
+    limits+=(--reuse-validation-from "$REUSE_VALIDATION_FROM")
+fi
 if [[ "${SAVE_TRAINING_STATE:-0}" == 1 ]]; then
     limits+=(--save-training-state)
 fi

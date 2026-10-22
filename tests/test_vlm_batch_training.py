@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -93,3 +94,52 @@ def test_batch_four_runner_epoch_length_accumulation_and_export(monkeypatch, tmp
     assert saved['cursor']['global_step'] == 4  # floor(10/4) batches * 2 epochs
     assert saved['cursor']['optimizer_step'] == 2
     assert (tmp_path/'out/last/model.safetensors').is_file()
+    def forbidden(*args, **kwargs):
+        raise AssertionError('a compatible completed preflight must be reused')
+    monkeypatch.setattr(aligned, 'validate_records', forbidden)
+    cfg['batch_size'] = 2
+    path.write_text(yaml.safe_dump(cfg))
+    aligned.run(['--config', str(path), '--output-dir', str(tmp_path/'reused'),
+                 '--reuse-validation-from', str(tmp_path/'out')])
+    reused = json.loads((tmp_path/'reused/effective_config.json').read_text())
+    assert reused['eligible_indices_sha256'] == effective['eligible_indices_sha256']
+    assert reused['batch_size'] == 2 and reused['total_optimizer_steps'] == 4
+
+
+def validation_fixture(tmp_path):
+    records = [dict(id=str(i)) for i in range(5)]
+    cfg = dict(data_sha256='source-hash', train_data='/data/train.jsonl', target_model='/models/qwen35',
+               max_length=4096, block_size=16, debug_max_samples=0, batch_size=4)
+    valid = [0, 2, 4]
+    previous = dict(cfg, eligible_samples=3,
+        eligible_indices_sha256=hashlib.sha256(json.dumps(valid).encode()).hexdigest())
+    (tmp_path/'effective_config.json').write_text(json.dumps(previous))
+    (tmp_path/'skipped_training.jsonl').write_text(''.join(json.dumps(dict(index=i, id=str(i), reason='short'))+'\n' for i in [1, 3]))
+    return records, cfg
+
+
+def test_reuse_validation_skips_encoding_and_allows_batch_or_algorithm_change(monkeypatch, tmp_path):
+    records, cfg = validation_fixture(tmp_path)
+    cfg.update(batch_size=2, algorithm='dflash')
+    def forbidden(*args, **kwargs):
+        raise AssertionError('reuse must not read or tokenize images')
+    monkeypatch.setattr(aligned, 'prepare_example', forbidden)
+    result = aligned.preflight(records, None, None, cfg, tmp_path, reuse_from=tmp_path)
+    assert result['valid'] == [0, 2, 4]
+    assert [row['index'] for row in result['skipped']] == [1, 3]
+
+
+@pytest.mark.parametrize('field,value', [('data_sha256', 'different'), ('block_size', 8),
+    ('max_length', 8192), ('target_model', '/another/model'), ('train_data', '/another/data'), ('debug_max_samples', 3)])
+def test_validation_reuse_rejects_incompatible_inputs(tmp_path, field, value):
+    records, cfg = validation_fixture(tmp_path)
+    cfg[field] = value
+    with pytest.raises(ValueError, match=field):
+        aligned.reuse_validation(records, cfg, tmp_path)
+
+
+def test_validation_reuse_rejects_incomplete_skip_file(tmp_path):
+    records, cfg = validation_fixture(tmp_path)
+    (tmp_path/'skipped_training.jsonl').write_text('')
+    with pytest.raises(ValueError, match='incomplete'):
+        aligned.reuse_validation(records, cfg, tmp_path)

@@ -45,6 +45,37 @@ batch 4, accumulation 4, effective global batch 128, TensorBoard logging and
 inference-only checkpoint exports. Runs are sequential under
 `runs/vlm_dlite_dflash_5ep_mb4_<timestamp>_<pid>/{dlite,dflash}/last`.
 
+### Reuse a completed input validation
+
+Set `REUSE_VALIDATION_FROM` to a previous **run output directory**, containing
+`effective_config.json` and `skipped_training.jsonl`. No model checkpoint or
+optimizer state is required; the old run may have stopped before its first
+update. Example from the parent workspace:
+
+```bash
+MICRO_BATCH_SIZE=2 BLOCK_SIZE=16 \
+REUSE_VALIDATION_FROM="$DLITE_WORKSPACE/runs/vlm_dlite_dflash_5ep_mb4_20261022_030026_3096037/dlite" \
+bash train_dlite_dflash_5ep_mb4.sh
+```
+
+This uses micro batch 2, accumulation 4, eight GPUs (effective global batch 64),
+block size 16 and five epochs. `EPOCHS`, `MICRO_BATCH_SIZE`, `ACCUMULATION_STEPS`
+and `BLOCK_SIZE` configure both the generated YAML and the launcher's messages
+and output names. Without overrides they are 5, 4, 4 and 8 respectively.
+
+Reuse verifies the manifest SHA256, manifest/model paths, sample limit, maximum
+sequence length, block size and the exact eligible-index hash. It reconstructs
+the same valid sample list from saved exclusions without reprocessing images.
+Batch size, epoch count and algorithm can differ. Only reuse when the image
+files and the processor/model files at those paths have not changed; older runs
+do not contain content fingerprints for those files.
+
+The launcher automatically reuses DLite's validation for the subsequent DFlash
+run. The direct training launcher also accepts `REUSE_VALIDATION_FROM`, or pass
+`--reuse-validation-from <directory>` to `litespec.vlm.train_aligned`.
+Missing/incompatible results fail explicitly. This skips dataset preflight,
+while normal training input encoding and first-use kernel compilation still run.
+
 The new adapter uses the original `OnlineDLiteModel` for anchors, local positions,
 block isolation, teacher-forced sequential head and weighted greedy-target CE/L1;
 `runner.run_draft` and `OptimizerWindow` for cross-epoch accumulation/global weight

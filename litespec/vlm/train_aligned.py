@@ -122,26 +122,43 @@ def has_anchor(example, block_size):
     return bool(((mask[:, :end + 1] > .5) & (mask[:, 1:end + 2] > .5)).any())
 
 
-def preflight(records, processor, config, cfg, base_dir):
+def reuse_validation(records, cfg, directory):
+    """Recover the exact eligible set from a completed old preflight, not weights."""
+    directory = Path(directory).expanduser().resolve()
+    previous = json.loads((directory / "effective_config.json").read_text())
+    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples"):
+        if previous.get(key) != cfg.get(key):
+            raise ValueError(f"validation reuse mismatch: {key}; run preflight again")
+    skipped, excluded = [], set()
+    with (directory / "skipped_training.jsonl").open() as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            index = row["index"]
+            if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(records):
+                raise ValueError("invalid index in saved validation")
+            if index in excluded or row.get("id") != records[index]["id"]:
+                raise ValueError("duplicate index or sample-id mismatch in saved validation")
+            excluded.add(index)
+            skipped.append(row)
+    valid = [index for index in range(len(records)) if index not in excluded]
+    digest = hashlib.sha256(json.dumps(valid).encode()).hexdigest()
+    if len(valid) != previous.get("eligible_samples") or digest != previous.get("eligible_indices_sha256"):
+        raise ValueError("saved validation is incomplete or its eligible-set hash differs")
+    print(f"Reusing validation from {directory}: {len(valid)} eligible, {len(skipped)} skipped; no image re-encoding", flush=True)
+    return dict(valid=valid, skipped=skipped)
+
+
+def preflight(records, processor, config, cfg, base_dir, reuse_from=None):
     """Rank zero fixes the eligible set before equal-size distributed sampling."""
     packet = None
     if rank() == 0:
         try:
-            from tqdm import tqdm
-            valid, skipped = [], []
-            for index, record in enumerate(tqdm(records, desc="VLM input validation", unit="sample")):
-                try:
-                    example = prepare_example(processor, config, record, device="cpu", training=True,
-                                              max_length=cfg["max_length"], base_dir=base_dir)
-                except ValueError as exc:
-                    skipped.append({"index": index, "id": record["id"], "reason": str(exc)})
-                    continue
-                if has_anchor(example, cfg["block_size"]):
-                    valid.append(index)
-                else:
-                    skipped.append({"index": index, "id": record["id"],
-                                    "reason": "upstream requires >=2*block_size answer labels and one full-block anchor"})
-            packet = {"valid": valid, "skipped": skipped}
+            if reuse_from is not None:
+                packet = reuse_validation(records, cfg, reuse_from)
+            else:
+                packet = validate_records(records, processor, config, cfg, base_dir)
         except Exception as exc:
             packet = {"error": repr(exc)}
     if dist.is_initialized():
@@ -151,6 +168,24 @@ def preflight(records, processor, config, cfg, base_dir):
     if "error" in packet:
         raise RuntimeError(f"VLM input validation failed: {packet['error']}")
     return packet
+
+
+def validate_records(records, processor, config, cfg, base_dir):
+    from tqdm import tqdm
+    valid, skipped = [], []
+    for index, record in enumerate(tqdm(records, desc="VLM input validation", unit="sample")):
+        try:
+            example = prepare_example(processor, config, record, device="cpu", training=True,
+                                      max_length=cfg["max_length"], base_dir=base_dir)
+        except ValueError as exc:
+            skipped.append({"index": index, "id": record["id"], "reason": str(exc)})
+            continue
+        if has_anchor(example, cfg["block_size"]):
+            valid.append(index)
+        else:
+            skipped.append({"index": index, "id": record["id"],
+                            "reason": "upstream requires >=2*block_size answer labels and one full-block anchor"})
+    return {"valid": valid, "skipped": skipped}
 
 
 class CPUReferenceDLite(OnlineDLiteModel):
@@ -344,6 +379,8 @@ def run(argv=None):
         parser.add_argument("--" + flag)
     parser.add_argument("--max-steps", type=int, help="explicit debug optimizer-update cap; unset trains all six epochs")
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--reuse-validation-from", type=Path,
+                        help="reuse effective_config.json + skipped_training.jsonl from a compatible run; images/processor must be unchanged")
     parser.add_argument("--save-training-state", action="store_true",
                         help="also save per-rank optimizer/RNG state for resume; default exports inference weights only")
     parser.add_argument("--report-to", choices=["none", "tensorboard", "wandb"],
@@ -384,7 +421,8 @@ def run(argv=None):
     path = Path(cfg["train_data"])
     records = list(read_records(path, args.max_samples or None))
     cfg["data_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    eligible = preflight(records, processor, target.config, cfg, path.parent)
+    eligible = preflight(records, processor, target.config, cfg, path.parent,
+                         reuse_from=args.reuse_validation_from)
     cfg["eligible_indices_sha256"] = hashlib.sha256(json.dumps(eligible["valid"]).encode()).hexdigest()
     records = [records[i] for i in eligible["valid"]]
     if not records:

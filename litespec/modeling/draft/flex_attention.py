@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import warnings
 import torch
 import torch._dynamo as dynamo
 from packaging.version import Version
@@ -15,6 +17,7 @@ dynamo.config.recompile_limit = 64
 FLASH_Q_TILE = 256
 FLASH_KV_TILE = 128
 TRITON_MASK_TILE = 128
+_block_mask_guard_fallback = False
 
 
 def flex_kernel_options(backend: str) -> dict:
@@ -152,20 +155,26 @@ def compile_friendly_create_block_mask(
     device,
     **kwargs,
 ):
+    global _block_mask_guard_fallback
+    if _block_mask_guard_fallback or os.environ.get("LITESPEC_EAGER_BLOCK_MASK") == "1":
+        return create_block_mask(mask_mod, B, H, Q_LEN, KV_LEN, device, **kwargs)
     create_block_mask_compiled = (
         WrappedCreateBlockMask()()
         if not is_torchdynamo_compiling()
         else create_block_mask
     )
-    return create_block_mask_compiled(
-        mask_mod,
-        B,
-        H,
-        Q_LEN,
-        KV_LEN,
-        device,
-        **kwargs,
-    )
+    try:
+        return create_block_mask_compiled(mask_mod, B, H, Q_LEN, KV_LEN, device, **kwargs)
+    except AssertionError as exc:
+        message = str(exc)
+        shape_guard_error = "not in" in message and "mask_mod" in message and "could be from" in message
+        if not shape_guard_error or is_torchdynamo_compiling():
+            raise
+        _block_mask_guard_fallback = True
+        warnings.warn("Block-mask compilation hit a Dynamo symbolic-shape guard assertion; "
+                      "using eager block-mask construction for this process. FlexAttention remains compiled.",
+                      RuntimeWarning, stacklevel=2)
+        return create_block_mask(mask_mod, B, H, Q_LEN, KV_LEN, device, **kwargs)
 
 
 def create_flex_block_mask(

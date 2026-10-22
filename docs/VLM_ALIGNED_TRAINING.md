@@ -76,6 +76,19 @@ run. The direct training launcher also accepts `REUSE_VALIDATION_FROM`, or pass
 Missing/incompatible results fail explicitly. This skips dataset preflight,
 while normal training input encoding and first-use kernel compilation still run.
 
+### PyTorch 2.9.1 block-mask shape guards
+
+Mask closures now capture independent contiguous copies of anchor/keep tensors,
+including DLite's expanded token-prefix mask. This avoids guards on a captured
+view's `_base` dimensions. A recognized Dynamo symbolic-source assertion during
+mask construction triggers a process-local fallback to eager `create_block_mask`.
+Unrelated assertions still propagate; mask visibility is unchanged.
+
+Set `LITESPEC_EAGER_BLOCK_MASK=1` to bypass compiled block-mask construction
+immediately when diagnosing this issue. FlexAttention's attention kernels remain
+compiled. This may increase mask preparation cost; it does not disable all
+`torch.compile`, change model parameters, or require repeating data validation.
+
 The new adapter uses the original `OnlineDLiteModel` for anchors, local positions,
 block isolation, teacher-forced sequential head and weighted greedy-target CE/L1;
 `runner.run_draft` and `OptimizerWindow` for cross-epoch accumulation/global weight

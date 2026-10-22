@@ -95,6 +95,11 @@ def create_dflash_flex_mask(
         raise ValueError("sliding_window must be > 0")
     bsz, num_blocks = anchor_positions.shape
 
+    # Mask closures outlive this call inside BlockMask. Do not capture views:
+    # Dynamo 2.9.1 may lose the symbolic source for a view's _base shape.
+    anchor_positions = anchor_positions.clone(memory_format=torch.contiguous_format)
+    block_keep_mask = block_keep_mask.clone(memory_format=torch.contiguous_format)
+
     def mask_mod(b, h, q_idx, kv_idx):
         qb, qo = q_idx // block_size, q_idx % block_size
         safe_block_indices = qb.clamp(max=num_blocks - 1)
@@ -148,6 +153,9 @@ def create_dlite_flex_mask(
 ):
     if not FLEX_ATTENTION_AVAILABLE:
         raise RuntimeError("flex_attention is not available")
+    anchor_positions = anchor_positions.clone(memory_format=torch.contiguous_format)
+    block_keep_mask = block_keep_mask.clone(memory_format=torch.contiguous_format)
+    token_keep_mask = token_keep_mask.clone(memory_format=torch.contiguous_format)
     batch, blocks = anchor_positions.shape
     total_chs, total_q = blocks * chs_slots, blocks * query_len
     prefix = int(seq_len) if model_role == "swa_teacher" else 0

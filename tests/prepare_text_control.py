@@ -12,39 +12,52 @@ sys.path.insert(0, str(ROOT))
 from litespec.vlm.serving_data import file_digest, output_lock, read_jsonl
 
 
-def sample_rows(source, count, seed):
+def sample_rows(source, count, seed, *, stats=None):
     if count < 1:
         raise ValueError("sample count must be positive")
-    rng, selected, scanned = random.Random(seed), [], 0
+    rng, selected, scanned, eligible = random.Random(seed), [], 0, 0
+    skipped, previews = {}, []
     for line, row in read_jsonl(source):
+        scanned += 1
         turns = row.get("conversations")
         if not isinstance(turns, list) or not turns or not isinstance(turns[0], dict):
             raise ValueError(f"line {line}: missing conversations[0]")
         question = turns[0].get("content")
         if turns[0].get("role") != "user" or not isinstance(question, str) or not question.strip():
             raise ValueError(f"line {line}: expected a nonempty first user text")
-        if row.get("images") or row.get("image") or "<image>" in question:
-            raise ValueError(f"line {line}: expected text-only data")
+        reason = ("image_field" if row.get("images") or row.get("image") else
+                  "image_placeholder" if "<image>" in question else None)
+        if reason:
+            skipped[reason] = skipped.get(reason, 0) + 1
+            if len(previews) < 5:
+                previews.append(dict(line=line, source_id=row.get("id"), reason=reason,
+                                     question_preview=question[:160]))
+            continue
         # Do not retain source answers or later turns, even in intermediate files.
         item = dict(source_line=line, source_id=row.get("id"),
                     conversations=[dict(role="user", content=question)])
-        scanned += 1
+        eligible += 1
         if len(selected) < count:
             selected.append(item)
         else:
-            index = rng.randrange(scanned)
+            index = rng.randrange(eligible)
             if index < count:
                 selected[index] = item
     if len(selected) != count:
-        raise ValueError(f"requested {count} rows but source has only {scanned}")
+        raise ValueError(f"requested {count} text rows but source has only {eligible} eligible rows "
+                         f"out of {scanned}; skipped={skipped}")
     rng.shuffle(selected)
+    if stats is not None:
+        stats.update(eligible_text_rows=eligible, skipped_rows=sum(skipped.values()),
+                     skip_reasons=skipped, skipped_first5=previews)
     return selected, scanned
 
 
 def prepare(source, directory, count=20000, seed=42):
     source, directory = Path(source).expanduser().resolve(), Path(directory).resolve()
     identity = dict(source=str(source), source_sha256=file_digest(source), samples=count,
-                    seed=seed, prompt_path="conversations.0.content", turn_mode="first")
+                    seed=seed, prompt_path="conversations.0.content", turn_mode="first",
+                    selection_policy="uniform_eligible_text_rows_v2")
     with output_lock(directory):
         metadata, manifest = directory / "selection.json", directory / "prompts.jsonl"
         if metadata.exists():
@@ -58,7 +71,10 @@ def prepare(source, directory, count=20000, seed=42):
         adapter = ROOT / "scripts/data/adapters/perfectblend_first.json"
         subprocess.run([sys.executable, str(converter), "inspect", "--input", str(source),
                         "--rows", "5"], check=True)
-        selected, scanned = sample_rows(source, count, seed)
+        selection_stats = {}
+        selected, scanned = sample_rows(source, count, seed, stats=selection_stats)
+        print(json.dumps(dict(scanned=scanned, selected=len(selected), **selection_stats),
+                         ensure_ascii=False), flush=True)
         raw = directory / "sampled_source.jsonl"
         raw.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in selected))
         def convert(output, limit=None):
@@ -84,6 +100,7 @@ def prepare(source, directory, count=20000, seed=42):
                     source_line=original["source_line"], source_id=original["source_id"],
                     data_source="perfectblend"), ensure_ascii=False) + "\n")
         result = dict(identity=identity, scanned=scanned, selected=count, split="all_train",
+                      **selection_stats,
                       manifest_sha256=file_digest(manifest))
         metadata.write_text(json.dumps(result, indent=2))
         return result

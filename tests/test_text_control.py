@@ -52,6 +52,26 @@ def test_converter_manifest_resume_identity(tmp_path):
         prepare(path, directory, 20, 43)
 
 
+def test_mixed_image_rows_are_excluded_before_uniform_sampling(tmp_path):
+    path = source_file(tmp_path, 30)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows[0]['images'] = ['image.png']
+    rows[10]['image'] = 'other.png'
+    rows[20]['conversations'][0]['content'] = '<image> Describe this'
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    stats = {}
+    selected, scanned = sample_rows(path, 27, 42, stats=stats)
+    assert scanned == 30 and len(selected) == 27
+    assert {row['source_line'] for row in selected} == set(range(1, 31)) - {1, 11, 21}
+    assert stats['eligible_text_rows'] == 27
+    assert stats['skip_reasons'] == {'image_field': 2, 'image_placeholder': 1}
+    assert stats['skipped_rows'] == 3
+    result = prepare(path, tmp_path / 'mixed', 20, 42)
+    assert result['selected'] == 20 and result['skipped_rows'] == 3
+    with pytest.raises(ValueError, match='only 27 eligible'):
+        sample_rows(path, 28, 42)
+
+
 def test_text_payload_and_native_template_contract():
     record = dict(id='text', question='Hello')
     payload = chat_payload(record, 'qwen35-vlm', 256)

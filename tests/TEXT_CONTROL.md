@@ -12,7 +12,7 @@ This executes the following stages, stopping on failure:
 
 1. Inspect five source rows. Use the confirmed `conversations.0.content` adapter,
    discard all existing answers/later turns, reservoir-sample 20,000 source rows
-   uniformly over the full file using seed 42. Convert five selected rows and
+   uniformly over eligible text rows in the full file using seed 42. Rows with image fields or `<image>` markers are excluded before sampling; counts, reasons and five skipped previews are saved in `selection.json`. Convert five selected rows and
    validate them before converting the full selection. Save source line/ID provenance.
 2. Start one single-GPU SGLang replica per DATA_GPUS entry; wait for every health/model check.
    Generate greedy Qwen3.5-4B answers with thinking disabled, max 256 output tokens,
@@ -32,7 +32,7 @@ Generation failures, overlong inputs or insufficient answer blocks may reduce
 actual eligible training rows. Inspect `last_summary.json`, `skipped.jsonl` and
 training `effective_config.json` before comparing results. There is no automatic
 refill or silent removal of malformed source records. Seeded sampling is over
-rows, not deduplicated questions. Repeated questions may be selected if duplicated
+eligible text rows, not deduplicated questions. Repeated questions may be selected if duplicated
 in the source. This does not establish independence from GSM8K evaluation data.
 
 Configuration:

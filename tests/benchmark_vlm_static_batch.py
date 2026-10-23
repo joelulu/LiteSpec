@@ -60,7 +60,12 @@ def main():
     parser.add_argument("--attention-backend", choices=["auto", "sdpa", "eager", "flash_attention_2"], default="auto")
     parser.add_argument("--verification", choices=["block"], default="block")
     parser.add_argument("--report-raw-speedup", action="store_true", help="accepted for compatibility; observed ratios are always reported")
+    parser.add_argument("--profile-decode", action="store_true", help="separate instrumented pass; keep normal speed measurements")
+    parser.add_argument("--profile-samples", type=int, default=4)
+    parser.add_argument("--profile-kernels", action="store_true", help="additional short torch.profiler trace + Python fallback probe")
     args = parser.parse_args()
+    if args.profile_samples < 1 or (args.profile_kernels and not args.profile_decode):
+        parser.error('positive profile-samples required; profile-kernels requires profile-decode')
     if min([args.max_new_tokens, *args.batch_sizes]) < 1 or args.max_samples < (0 if args.reference_input else 1) or args.warmup < 0:
         parser.error("positive sample/token/batch limits and nonnegative warmup required")
     if any(value is not None and value < 1 for value in (args.image_min_pixels, args.image_max_pixels)):
@@ -125,15 +130,16 @@ def main():
     (root/"inputs.json").write_text(json.dumps(input_metadata, indent=2))
     if args.reference_input:
         print("First processed input: " + json.dumps(input_metadata[0]), flush=True)
-    rows, references = [], {}
+    rows, references, profile_rows = [], {}, []
     print(f"True static replicated batches: {sorted(set(args.batch_sizes))}; attention={attention}", flush=True)
     print("Decode-only throughput; prefill reported separately. No continuous batching. Match does not gate ratios.", flush=True)
     for label, checkpoint in [("ar", None), *checkpoints]:
         draft = load_draft(checkpoint, attn_implementation=attention).to(args.device, dtype).eval() if checkpoint else None
         for batch_size in sorted(set(args.batch_sizes)):
-            def run(example, cap):
+            def run(example, cap, *, profile=False):
                 with RequestPositionState(target).activate():
-                    return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap)
+                    return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap,
+                                                 profile=profile)
             for _ in range(args.warmup):
                 run(examples[0], min(16, args.max_new_tokens))
             if torch.device(args.device).type == "cuda":
@@ -172,6 +178,34 @@ def main():
                 writer.writeheader()
                 writer.writerows(rows)
             print(json.dumps(summary), flush=True)
+            if args.profile_decode:
+                from report_inference_profile import summarize_profile, report
+                from litespec.vlm.inference_profile import gdn_kernel_probe, kernel_environment
+                print(f'Profiling {label}: separate diagnostic pass', flush=True)
+                count = min(args.profile_samples, len(examples))
+                profiled = [run(example, args.max_new_tokens, profile=True) for example in examples[:count]]
+                diagnostic = dict(model=label, batch_size=batch_size,
+                    **summarize_profile(profiled, results[:count]))
+                with (root/f'{label}_b{batch_size}_profile.jsonl').open('w') as handle:
+                    for example, result in zip(examples[:count], profiled):
+                        handle.write(json.dumps(dict(sample_id=example.sample_id, result=result))+'\n')
+                if args.profile_kernels:
+                    activities = [torch.profiler.ProfilerActivity.CPU]
+                    if torch.device(args.device).type == 'cuda':
+                        activities.append(torch.profiler.ProfilerActivity.CUDA)
+                    trace = root/f'{label}_b{batch_size}_kernel_trace.json'
+                    with gdn_kernel_probe() as fallback, torch.profiler.profile(activities=activities) as probe:
+                        run(examples[0], min(32, args.max_new_tokens))
+                    probe.export_chrome_trace(str(trace))
+                    cuda_names = sorted({event.name for event in probe.events()
+                                         if 'CUDA' in str(event.device_type)})
+                    diagnostic['kernel_probe'] = dict(environment=kernel_environment(),
+                        python_fallback_calls=dict(fallback), cuda_kernel_names=cuda_names,
+                        trace_file=str(trace), max_new_tokens=min(32,args.max_new_tokens),
+                        timing_valid=False)
+                profile_rows.append(diagnostic)
+                (root/'decode_profile.json').write_text(json.dumps(profile_rows, indent=2))
+                report(root)
         del draft
         gc.collect()
         if torch.device(args.device).type == "cuda":

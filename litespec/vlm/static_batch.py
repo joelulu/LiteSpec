@@ -93,7 +93,7 @@ def replicate_inputs(example, batch_size):
 
 @torch.no_grad()
 def generate_static_batch(target, draft, example, *, batch_size=1, max_new_tokens=128,
-                          verification="block"):
+                          verification="block", profile=False):
     """One true batch of identical greedy requests; no request-by-request loop."""
     from .baselines import DraftCache, is_baseline
     if max_new_tokens < 1 or verification not in {"block", "sequential"}:
@@ -124,11 +124,17 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
     history = DraftCache(draft, target, output, anchor) if baseline else None
     del output, inputs
     prefill_end = clock(device)
+    timeline = None
+    if profile:
+        from .inference_profile import DecodeTimeline
+        timeline = DecodeTimeline(device)
     blocks, lengths, emitted, replays, target_calls = [], [], 0, 0, 0
     while emitted < max_new_tokens:
         if draft is None:
+            if timeline: timeline.mark("emit")
             candidates, kept = pending, 1
         else:
+            if timeline: timeline.mark("draft")
             if baseline:
                 proposals, _ = history.propose(draft, target, pending, anchor)
             else:
@@ -139,6 +145,7 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
                     first_prev_token_ids=pending[:, 0], temperature=0.0)[0]
             candidates = torch.cat([pending, proposals], 1)[:, :max_new_tokens-emitted]
             if verification == "sequential":
+                if timeline: timeline.mark("target_verify")
                 # Correctness control only, still batched across B replicas.
                 states, predictions = [], []
                 for index in range(candidates.shape[1]):
@@ -155,38 +162,47 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
                 features = tuple(torch.cat(parts, 1) for parts in zip(*states))
                 output.hidden_states = features
             else:
+                if timeline: timeline.mark("state_snapshot")
                 snapshot = _begin_recurrent_cache_transaction(cache)
                 if snapshot is None and not cache.is_croppable:
                     raise RuntimeError("target hybrid cache has no supported recurrent-state rollback")
+                if timeline: timeline.mark("target_verify")
                 output = target(input_ids=candidates, past_key_values=cache, use_cache=True,
                                 output_hidden_states=True)
                 cache = output.past_key_values
                 target_calls += 1
+                if timeline: timeline.mark("acceptance")
                 predictions = output.logits.argmax(-1)
                 accepted = (candidates[:, 1:] == predictions[:, :-1]).cumprod(1).sum(1)
                 kept = int(accepted.min()) + 1
                 if kept < candidates.shape[1] and snapshot is not None:
+                    if timeline: timeline.mark("cache_restore")
                     _crop_target_cache(cache, current_length=anchor+candidates.shape[1],
                                        tokens_to_remove=candidates.shape[1])
                     _restore_recurrent_cache_transaction(snapshot)
+                    if timeline: timeline.mark("target_replay")
                     output = target(input_ids=candidates[:, :kept], past_key_values=cache,
                                     use_cache=True, output_hidden_states=True, logits_to_keep=1)
                     cache = output.past_key_values
                     replays += 1
                     target_calls += 1
+                    if timeline: timeline.mark("cache_commit")
                     pending = output.logits[:, -1:].argmax(-1)
                     _crop_target_cache(cache, current_length=anchor+kept, tokens_to_remove=0)
                 else:
+                    if timeline: timeline.mark("cache_commit")
                     _crop_target_cache(cache, current_length=anchor+candidates.shape[1],
                                        tokens_to_remove=candidates.shape[1]-kept)
                     pending = predictions[:, kept-1:kept]
                 del snapshot
+            if timeline: timeline.mark("hidden_features")
             pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
                                     draft.config.num_target_layers)[:, kept-1:kept].detach().clone()
             if baseline:
                 history.commit(draft, output, kept)
             del output
             anchor += kept
+            if timeline: timeline.mark("emit")
         # Replicas use the same EOS boundary; assert actual equality after timing.
         end_positions = torch.isin(candidates[0, :kept], eos_ids).nonzero()
         stop = end_positions.numel() > 0
@@ -198,16 +214,18 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
         if stop or emitted == max_new_tokens:
             break
         if draft is None:
+            if timeline: timeline.mark("ar_target_decode")
             output = target(input_ids=pending, past_key_values=cache, use_cache=True, logits_to_keep=1)
             cache = output.past_key_values
             pending = output.logits[:, -1:].argmax(-1)
             target_calls += 1
             del output
+    if timeline: timeline.mark(None)
     finished = clock(device)
     tokens = torch.cat(blocks, 1)
     if not torch.equal(tokens, tokens[:1].expand_as(tokens)):
         raise RuntimeError("greedy replicas diverged within a batch; lockstep replicated-input benchmark assumptions failed")
-    return dict(token_ids=tokens[0].tolist(), batch_size=batch_size,
+    result = dict(token_ids=tokens[0].tolist(), batch_size=batch_size,
         output_tokens=batch_size * emitted, accept_lengths=lengths,
         prefill_tokens=example.prefill_length,
         visual_tokens_with_delimiters=int(example.vision_mask.sum()),
@@ -216,3 +234,6 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
         recovery_replays=replays, replicas_identical=True,
         cache_policy="preallocated_attention_kv_recurrent_snapshot_and_prefix_replay",
         verification=verification)
+    if timeline:
+        result['profile'] = timeline.resolve(result['decode_seconds'])
+    return result

@@ -67,6 +67,10 @@ if [[ "${BENCHMARK_MODE:-reference}" == static_batch ]]; then
     fi
     [[ -z "${IMAGE_MAX_PIXELS:-}" ]] || input_args+=(--image-max-pixels "$IMAGE_MAX_PIXELS")
     [[ -z "${IMAGE_MIN_PIXELS:-}" ]] || input_args+=(--image-min-pixels "$IMAGE_MIN_PIXELS")
+    if [[ "${PROFILE_DECODE:-0}" == 1 ]]; then
+        input_args+=(--profile-decode --profile-samples "${PROFILE_SAMPLES:-4}")
+        [[ "${PROFILE_KERNELS:-0}" != 1 ]] || input_args+=(--profile-kernels)
+    fi
     exec "$PYTHON_BIN" tests/benchmark_vlm_static_batch.py \
         --target-model "$TARGET_MODEL" --data "$EVAL_DATA" --data-split "${EVAL_SPLIT:-unspecified}" \
         --dataset-name "${EVAL_DATASET_NAME:-unspecified}" \

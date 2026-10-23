@@ -118,5 +118,8 @@ for index in "${!stages[@]}"; do
         bash tests/compare_vlm_16.sh 2>&1 | tee "$GROUP_DIR/$stage.log"
 done
 "$PYTHON_BIN" tests/report_text_vlm_speedup.py --root "$GROUP_DIR" --cases "${stages[@]}"
+if [[ "${PROFILE_DECODE:-0}" == 1 ]]; then
+    "$PYTHON_BIN" tests/report_inference_profile.py --root "$GROUP_DIR"
+fi
 echo "Tables: $GROUP_DIR/speedup_tables.md"
 echo "Full metrics: $GROUP_DIR/comparison.csv"

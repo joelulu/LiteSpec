@@ -1,4 +1,4 @@
-"""Own eight SGLang process groups until generation completes, then clean up."""
+"""Own one SGLang process group per selected GPU, then clean up."""
 import json
 import os
 from pathlib import Path
@@ -68,16 +68,17 @@ def wait_ready(processes, addresses, model, timeout):
 def main():
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
-    gpus = env.get("DATA_GPUS", "0,1,2,3,4,5,6,7").split(",")
-    if len(gpus) != 8 or len(set(gpus)) != 8 or any(not x.strip() for x in gpus):
-        raise ValueError("DATA_GPUS must identify eight distinct GPUs")
+    gpus = [x.strip() for x in env.get("DATA_GPUS", "0,1,2,3,4,5,6,7").split(",")]
+    if len(set(gpus)) != len(gpus) or any(not x for x in gpus):
+        raise ValueError("DATA_GPUS must identify distinct nonempty GPUs")
+    replicas = len(gpus)
     server_python = env.get("SGLANG_PYTHON", str(Path.home() / ".conda/envs/dflash/bin/python"))
-    subprocess.run([server_python, "-c", "import sglang, torch; assert torch.cuda.device_count() == 8, 'eight GPUs must be visible to the serving environment'"],
+    subprocess.run([server_python, "-c", f"import sglang, torch; assert torch.cuda.device_count() == {replicas}, '{replicas} GPUs must be visible to the serving environment'"],
                    env={**env, "CUDA_VISIBLE_DEVICES": ",".join(gpus)}, check=True)
     base_port = int(env.get("BASE_PORT", "30000"))
-    if not 1 <= base_port <= 65528:
-        raise ValueError("BASE_PORT must permit eight consecutive TCP ports")
-    for port in range(base_port, base_port + 8):
+    if not 1 <= base_port <= 65536 - replicas:
+        raise ValueError(f"BASE_PORT must permit {replicas} consecutive TCP ports")
+    for port in range(base_port, base_port + replicas):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
     env.setdefault("MAX_SAMPLES", "20000")
@@ -104,7 +105,7 @@ def main():
     logs = output / "serving_logs"
     logs.mkdir(parents=True, exist_ok=True)
     model = env.get("SERVED_MODEL_NAME", "qwen35-vlm")
-    addresses = [f"http://127.0.0.1:{base_port+i}" for i in range(8)]
+    addresses = [f"http://127.0.0.1:{base_port+i}" for i in range(replicas)]
     processes, handles = [], []
     client = None
 
@@ -128,7 +129,7 @@ def main():
                     print(f"Starting GPU={gpu} port={base_port+i} PID={process.pid}", flush=True)
                 (logs / "owned_servers.json").write_text(json.dumps([dict(pid=p.pid, address=a) for p, a in zip(processes, addresses)], indent=2))
                 wait_ready(processes, addresses, model, int(env.get("STARTUP_TIMEOUT", "1800")))
-                print("All eight services ready; generating data", flush=True)
+                print(f"All {replicas} services ready; generating data", flush=True)
                 command = ["bash", str(repo / "scripts/data/prepare_finevision_serving.sh"), *addresses]
                 if prompt_manifest:
                     command = [env.get("CLIENT_PYTHON", env.get("PYTHON_BIN", "python")),

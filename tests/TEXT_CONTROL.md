@@ -14,7 +14,7 @@ This executes the following stages, stopping on failure:
    discard all existing answers/later turns, reservoir-sample 20,000 source rows
    uniformly over the full file using seed 42. Convert five selected rows and
    validate them before converting the full selection. Save source line/ID provenance.
-2. Start eight single-GPU SGLang replicas; wait for every health/model check.
+2. Start one single-GPU SGLang replica per DATA_GPUS entry; wait for every health/model check.
    Generate greedy Qwen3.5-4B answers with thinking disabled, max 256 output tokens,
    max 4096 total tokens. Use the same CPU template/length validation as FineVision.
    Stop only the owned services before training, including on failure/interruption.
@@ -43,7 +43,7 @@ Configuration:
 - Training: `CUDA_VISIBLE_DEVICES`, `NPROC_PER_NODE` (inferred from visible list),
   `MICRO_BATCH_SIZE=2`, `ACCUMULATION_STEPS=4`, `BLOCK_SIZE=8`, `EPOCHS=3`, `OUTPUT_DIR`.
   To match the previous six-GPU global batch, set `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5`
-  and `NPROC_PER_NODE=6` (global batch 48); rollout still uses eight GPUs.
+  and `NPROC_PER_NODE=6` (global batch 48); set DATA_GPUS to the same six GPUs to also use six rollout replicas.
 - Evaluation: `EVAL_GPU`, `BATCH_SIZES`, `EVAL_SAMPLES`, `EVAL_MAX_NEW_TOKENS`,
   `TEXT_DATA`, `IMAGE_MAX_PIXELS`, `IMAGE_MIN_PIXELS`, `DFLASH_VLM`, `RESULT_DIR`.
   `dflash_text` / `dflash_vlm` selectors also work in the standard comparison script

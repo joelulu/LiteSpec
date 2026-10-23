@@ -84,17 +84,19 @@ def test_text_rollout_uses_existing_http_and_resume(tmp_path):
     assert saved['answer'] == 'A picture.' and 'image' not in saved
 
 
-def test_manifest_pipeline_direct_command_and_cleanup(tmp_path, monkeypatch):
+@pytest.mark.parametrize('replicas', [6, 8])
+def test_manifest_pipeline_direct_command_and_cleanup(tmp_path, monkeypatch, replicas):
     from litespec.vlm import data_pipeline as pipeline
     manifest, target = tmp_path / 'prompts.jsonl', tmp_path / 'target'
     manifest.write_text('{}\n')
     target.mkdir()
     for key, value in dict(PROMPT_MANIFEST=str(manifest), IMAGE_MAX_TOKENS='0',
         CLIENT_PYTHON=sys.executable, TARGET_MODEL=str(target),
+        DATA_GPUS=','.join(str(i) for i in range(replicas)),
         PREPARE_OUTPUT=str(tmp_path / 'output')).items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(pipeline.subprocess, 'run', Mock())
-    processes = [Mock(pid=100+i) for i in range(8)]
+    processes = [Mock(pid=100+i) for i in range(replicas)]
     for process in processes:
         process.poll.return_value = None
     client = Mock(returncode=0)
@@ -110,7 +112,7 @@ def test_manifest_pipeline_direct_command_and_cleanup(tmp_path, monkeypatch):
     command = popen.call_args_list[-1].args[0]
     assert command[0] == sys.executable and command[1].endswith('regenerate_vlm_serving.py')
     assert command[command.index('--manifest')+1] == str(manifest)
-    assert len(command[command.index('--server-address')+1:]) == 8
+    assert len(command[command.index('--server-address')+1:]) == replicas
     assert cleanup.call_args.args[0] == processes
 
 

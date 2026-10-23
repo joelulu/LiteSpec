@@ -93,7 +93,23 @@ def replicate_inputs(example, batch_size):
 
 @torch.no_grad()
 def generate_static_batch(target, draft, example, *, batch_size=1, max_new_tokens=128,
-                          verification="block", profile=False):
+                          verification="block", profile=False, state_mode="full_target_replay"):
+    from .gdn_state import STATE_MODES, GDNStateTransaction
+    if state_mode not in STATE_MODES:
+        raise ValueError(f"unknown GDN state mode: {state_mode}")
+    if state_mode != "full_target_replay" and verification != "block":
+        raise ValueError("GDN state modes require block verification")
+    if state_mode != "full_target_replay" and draft is not None:
+        with GDNStateTransaction(target, state_mode) as transaction:
+            return _generate_static_batch(target, draft, example, batch_size=batch_size,
+                max_new_tokens=max_new_tokens, verification=verification, profile=profile,
+                transaction=transaction, state_mode=state_mode)
+    return _generate_static_batch(target, draft, example, batch_size=batch_size,
+        max_new_tokens=max_new_tokens, verification=verification, profile=profile, state_mode=state_mode)
+
+
+def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens,
+                           verification, profile, state_mode, transaction=None):
     """One true batch of identical greedy requests; no request-by-request loop."""
     from .baselines import DraftCache, is_baseline
     if max_new_tokens < 1 or verification not in {"block", "sequential"}:
@@ -129,6 +145,7 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
         from .inference_profile import DecodeTimeline
         timeline = DecodeTimeline(device)
     blocks, lengths, emitted, replays, target_calls = [], [], 0, 0, 0
+    peak_snapshot_bytes = 0
     while emitted < max_new_tokens:
         if draft is None:
             if timeline: timeline.mark("emit")
@@ -163,19 +180,34 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
                 output.hidden_states = features
             else:
                 if timeline: timeline.mark("state_snapshot")
-                snapshot = _begin_recurrent_cache_transaction(cache)
-                if snapshot is None and not cache.is_croppable:
+                snapshot = _begin_recurrent_cache_transaction(cache) if transaction is None else None
+                if snapshot:
+                    peak_snapshot_bytes = max(peak_snapshot_bytes, sum(t.numel()*t.element_size()
+                        for _, record in snapshot for t in record.values()))
+                if transaction is None and snapshot is None and not cache.is_croppable:
                     raise RuntimeError("target hybrid cache has no supported recurrent-state rollback")
                 if timeline: timeline.mark("target_verify")
-                output = target(input_ids=candidates, past_key_values=cache, use_cache=True,
-                                output_hidden_states=True)
+                if transaction is None:
+                    output = target(input_ids=candidates, past_key_values=cache, use_cache=True,
+                                    output_hidden_states=True)
+                else:
+                    with transaction.capture(cache):
+                        output = target(input_ids=candidates, past_key_values=cache, use_cache=True,
+                                        output_hidden_states=True)
                 cache = output.past_key_values
                 target_calls += 1
                 if timeline: timeline.mark("acceptance")
                 predictions = output.logits.argmax(-1)
                 accepted = (candidates[:, 1:] == predictions[:, :-1]).cumprod(1).sum(1)
                 kept = int(accepted.min()) + 1
-                if kept < candidates.shape[1] and snapshot is not None:
+                if transaction is not None:
+                    if timeline: timeline.mark("state_select" if state_mode == "per_token" else "gdn_state_replay")
+                    transaction.commit(cache, kept, candidates.shape[1])
+                    if timeline: timeline.mark("cache_commit")
+                    _crop_target_cache(cache, current_length=anchor+candidates.shape[1],
+                                       tokens_to_remove=candidates.shape[1]-kept)
+                    pending = predictions[:, kept-1:kept]
+                elif kept < candidates.shape[1] and snapshot is not None:
                     if timeline: timeline.mark("cache_restore")
                     _crop_target_cache(cache, current_length=anchor+candidates.shape[1],
                                        tokens_to_remove=candidates.shape[1])
@@ -233,7 +265,12 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
         total_seconds=finished-started, target_decode_calls=target_calls,
         recovery_replays=replays, replicas_identical=True,
         cache_policy="preallocated_attention_kv_recurrent_snapshot_and_prefix_replay",
-        verification=verification)
+        verification=verification, state_mode=state_mode,
+        gdn_verify_backend="native_hf" if transaction is None else
+            ("triton_fused_recurrent" if device.type == "cuda" else "cpu_reference_recurrent"),
+        peak_transaction_record_bytes=transaction.peak_record_bytes if transaction else peak_snapshot_bytes)
+    if transaction:
+        result["cache_policy"] = "preallocated_attention_kv_" + state_mode
     if timeline:
         result['profile'] = timeline.resolve(result['decode_seconds'])
     return result

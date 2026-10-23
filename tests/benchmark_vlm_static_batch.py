@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--attention-backend", choices=["auto", "sdpa", "eager", "flash_attention_2"], default="auto")
     parser.add_argument("--verification", choices=["block"], default="block")
+    parser.add_argument("--state-mode", choices=["full_target_replay", "per_token", "compact_replay"], default="full_target_replay")
     parser.add_argument("--report-raw-speedup", action="store_true", help="accepted for compatibility; observed ratios are always reported")
     parser.add_argument("--profile-decode", action="store_true", help="separate instrumented pass; keep normal speed measurements")
     parser.add_argument("--profile-samples", type=int, default=4)
@@ -136,10 +137,14 @@ def main():
     for label, checkpoint in [("ar", None), *checkpoints]:
         draft = load_draft(checkpoint, attn_implementation=attention).to(args.device, dtype).eval() if checkpoint else None
         for batch_size in sorted(set(args.batch_sizes)):
+            if draft is not None and args.state_mode != "full_target_replay":
+                from litespec.vlm.gdn_state import warmup_state_kernels
+                print(f"Precompiling GDN state kernels: {args.state_mode}, B={batch_size}", flush=True)
+                warmup_state_kernels(target, batch_size=batch_size, width=draft.block_size, mode=args.state_mode)
             def run(example, cap, *, profile=False):
                 with RequestPositionState(target).activate():
                     return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap,
-                                                 profile=profile)
+                                                 profile=profile, state_mode=args.state_mode)
             for _ in range(args.warmup):
                 run(examples[0], min(16, args.max_new_tokens))
             if torch.device(args.device).type == "cuda":
@@ -157,6 +162,8 @@ def main():
                 mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),
                 mean_image_tokens=sum(meta["image_tokens"] for meta in input_metadata)/len(input_metadata),
                 attention_backend=attention, **summarize_batches(results, batch_size))
+            summary.update(state_mode=args.state_mode, gdn_verify_backend=results[0]["gdn_verify_backend"],
+                peak_transaction_record_mib=max((r["peak_transaction_record_bytes"] or 0) for r in results)/1024**2)
             base = summary if label == "ar" else next(row for row in rows if row["model"] == "ar" and row["batch_size"] == batch_size)
             summary.update(matched=matched, valid_token_match=matched == summary["requests"],
                 raw_throughput_speedup_vs_ar=summary["output_tokens_per_second"]/base["output_tokens_per_second"],
@@ -186,6 +193,7 @@ def main():
                 profiled = [run(example, args.max_new_tokens, profile=True) for example in examples[:count]]
                 diagnostic = dict(model=label, batch_size=batch_size,
                     **summarize_profile(profiled, results[:count]))
+                diagnostic.update(state_mode=args.state_mode, gdn_verify_backend=results[0]["gdn_verify_backend"])
                 with (root/f'{label}_b{batch_size}_profile.jsonl').open('w') as handle:
                     for example, result in zip(examples[:count], profiled):
                         handle.write(json.dumps(dict(sample_id=example.sample_id, result=result))+'\n')

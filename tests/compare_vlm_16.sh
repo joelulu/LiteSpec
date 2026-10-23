@@ -72,6 +72,7 @@ if [[ "${BENCHMARK_MODE:-reference}" == static_batch ]]; then
         [[ "${PROFILE_KERNELS:-0}" != 1 ]] || input_args+=(--profile-kernels)
     fi
     exec "$PYTHON_BIN" tests/benchmark_vlm_static_batch.py \
+        --state-mode "${STATE_MODE:-full_target_replay}" \
         --target-model "$TARGET_MODEL" --data "$EVAL_DATA" --data-split "${EVAL_SPLIT:-unspecified}" \
         --dataset-name "${EVAL_DATASET_NAME:-unspecified}" \
         "${checkpoints[@]}" --batch-sizes "${batches[@]}" \

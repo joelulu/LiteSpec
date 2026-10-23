@@ -35,6 +35,8 @@ if [[ ${MODELS+x} ]]; then
             dlite_6ep) checkpoints+=(--checkpoint "$model" "$DLITE_6EP") ;;
             dlite_3ep) checkpoints+=(--checkpoint "$model" "$DLITE_3EP") ;;
             dflash_3ep) checkpoints+=(--checkpoint "$model" "$DFLASH_3EP") ;;
+            dflash_text) checkpoints+=(--checkpoint "$model" "${DFLASH_TEXT:?Set DFLASH_TEXT to the text-trained checkpoint}") ;;
+            dflash_vlm) checkpoints+=(--checkpoint "$model" "${DFLASH_VLM:?Set DFLASH_VLM to the multimodal-trained checkpoint}") ;;
             dspark_3ep) checkpoints+=(--checkpoint "$model" "$DSPARK_3EP") ;;
             *) echo "Unknown model: $model" >&2; exit 1 ;;
         esac

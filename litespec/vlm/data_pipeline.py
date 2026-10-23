@@ -92,7 +92,10 @@ def main():
         raise ValueError("require 0 < MAX_NEW_TOKENS < MAX_LENGTH <= CONTEXT_LENGTH")
     if not 1 <= int(env["MIN_ANSWER_TOKENS"]) <= int(env["MAX_NEW_TOKENS"]):
         raise ValueError("require 1 <= MIN_ANSWER_TOKENS <= MAX_NEW_TOKENS")
-    source = Path(env.get("SOURCE_DATA", str(Path.home() / "LMM/liyt/datasets/FineVision/FineVision_subset/finevision_sharegpt.jsonl")))
+    prompt_manifest = env.get("PROMPT_MANIFEST")
+    source = Path(prompt_manifest or env.get("SOURCE_DATA", str(Path.home() / "LMM/liyt/datasets/FineVision/FineVision_subset/finevision_sharegpt.jsonl")))
+    if prompt_manifest and int(env["IMAGE_MAX_TOKENS"]) != 0:
+        raise ValueError("PROMPT_MANIFEST mode requires IMAGE_MAX_TOKENS=0; prepare images separately")
     target = Path(env.get("TARGET_MODEL", str(Path.home() / "LMM/lmm_model/Qwen3.5-4B")))
     if not source.is_file() or not target.is_dir():
         raise ValueError(f"missing source manifest or local target model: {source}; {target}")
@@ -126,7 +129,17 @@ def main():
                 (logs / "owned_servers.json").write_text(json.dumps([dict(pid=p.pid, address=a) for p, a in zip(processes, addresses)], indent=2))
                 wait_ready(processes, addresses, model, int(env.get("STARTUP_TIMEOUT", "1800")))
                 print("All eight services ready; generating data", flush=True)
-                client = subprocess.Popen(["bash", str(repo / "scripts/data/prepare_finevision_serving.sh"), *addresses],
+                command = ["bash", str(repo / "scripts/data/prepare_finevision_serving.sh"), *addresses]
+                if prompt_manifest:
+                    command = [env.get("CLIENT_PYTHON", env.get("PYTHON_BIN", "python")),
+                               str(repo / "scripts/data/regenerate_vlm_serving.py"),
+                               "--manifest", str(source), "--output-dir", str(output),
+                               "--target-model", str(target), "--model", model,
+                               "--concurrency", env.get("CONCURRENCY", "8"),
+                               "--max-tokens", env["MAX_NEW_TOKENS"], "--max-length", env["MAX_LENGTH"],
+                               "--min-answer-tokens", env["MIN_ANSWER_TOKENS"],
+                               "--server-address", *addresses]
+                client = subprocess.Popen(command,
                                           env=env, start_new_session=True)
                 while client.poll() is None:
                     if any(p.poll() is not None for p in processes):

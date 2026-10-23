@@ -1,0 +1,5 @@
+{
+  "prompt": {"path": "conversations.0.content", "kind": "text"},
+  "source": {"default": "perfectblend"},
+  "category": {"path": "category"}
+}

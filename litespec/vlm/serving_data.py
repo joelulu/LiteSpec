@@ -175,15 +175,17 @@ def http_json(url, *, body=None, timeout=600, api_key=None):
 
 
 def chat_payload(record, model, max_tokens):
-    path = Path(record["image"])
-    mime = mimetypes.guess_type(path.name)[0]
-    if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
-        raise ValueError(f"unsupported image format: {path.suffix}")
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return {"model": model, "messages": [{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-        {"type": "text", "text": record["question"]},
-    ]}], "temperature": 0.0, "max_tokens": max_tokens, "stream": False,
+    content = []
+    if record.get("image"):
+        path = Path(record["image"])
+        mime = mimetypes.guess_type(path.name)[0]
+        if mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            raise ValueError(f"unsupported image format: {path.suffix}")
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}})
+    content.append({"type": "text", "text": record["question"]})
+    return {"model": model, "messages": [{"role": "user", "content": content}],
+        "temperature": 0.0, "max_tokens": max_tokens, "stream": False,
         "chat_template_kwargs": {"enable_thinking": False}}
 
 
@@ -217,10 +219,13 @@ class LengthValidator:
     def encode(self, record, *, answer=None):
         from PIL import Image
 
-        with Image.open(record["image"]) as image:
-            messages = [{"role": "user", "content": [
-                {"type": "image", "image": image.convert("RGB")},
-                {"type": "text", "text": record["question"]}]}]
+        with ExitStack() as stack:
+            content = []
+            if record.get("image"):
+                image = stack.enter_context(Image.open(record["image"]))
+                content.append({"type": "image", "image": image.convert("RGB")})
+            content.append({"type": "text", "text": record["question"]})
+            messages = [{"role": "user", "content": content}]
             if answer is not None:
                 messages.append({"role": "assistant", "content": answer})
             encoded = self.processor.apply_chat_template(

@@ -1,9 +1,11 @@
 """Offline replicated-input static batch benchmark; throughput excludes prefill."""
 import argparse
 import csv
+from dataclasses import replace
 import gc
 from importlib.util import find_spec
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -60,6 +62,8 @@ def main():
     parser.add_argument("--attention-backend", choices=["auto", "sdpa", "eager", "flash_attention_2"], default="auto")
     parser.add_argument("--verification", choices=["block"], default="block")
     parser.add_argument("--state-mode", choices=["full_target_replay", "per_token", "compact_replay"], default="full_target_replay")
+    parser.add_argument("--ar-reference", type=Path, help="reuse a completed same-GPU/same-input AR cell instead of timing AR again")
+    parser.add_argument("--cpu-inputs", action="store_true", help="retain prepared prompts on CPU; transfer only current prompt before timing")
     parser.add_argument("--report-raw-speedup", action="store_true", help="accepted for compatibility; observed ratios are always reported")
     parser.add_argument("--profile-decode", action="store_true", help="separate instrumented pass; keep normal speed measurements")
     parser.add_argument("--profile-samples", type=int, default=4)
@@ -100,6 +104,7 @@ def main():
     settings = {**vars(args), "data": str(data), "output_dir": str(root),
         "resolved_checkpoints": checkpoints, "sample_ids": [row["id"] for row in records],
         "actual_attention_backend": attention,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "benchmark_mode": "static_replicated_batch", "timing_scope": "decode_only_after_prefill",
         "data_inspection": inspection}
     (root/"settings.json").write_text(json.dumps(settings, default=str, indent=2))
@@ -111,7 +116,7 @@ def main():
     image_size = getattr(getattr(processor, "image_processor", None), "size", None)
     settings["effective_image_processor_size"] = dict(image_size) if image_size is not None else None
     (root/"settings.json").write_text(json.dumps(settings, default=str, indent=2))
-    examples = [prepare_example(processor, target.config, record, device=args.device,
+    examples = [prepare_example(processor, target.config, record, device="cpu" if args.cpu_inputs else args.device,
                                base_dir=data.parent, training=False) for record in records]
     input_metadata = []
     for record, example in zip(records, examples):
@@ -132,9 +137,26 @@ def main():
     if args.reference_input:
         print("First processed input: " + json.dumps(input_metadata[0]), flush=True)
     rows, references, profile_rows = [], {}, []
+    if args.ar_reference:
+        directory = args.ar_reference.resolve()
+        prior = json.loads((directory/"settings.json").read_text())
+        for key in ("target_model", "data", "sample_ids", "actual_attention_backend", "max_new_tokens",
+                    "batch_sizes", "effective_image_processor_size", "cuda_visible_devices", "cpu_inputs"):
+            if prior.get(key) != settings.get(key):
+                raise ValueError(f"AR reference differs in {key}; require same GPU, inputs and generation settings")
+        if json.loads((directory/"inputs.json").read_text()) != input_metadata:
+            raise ValueError("AR reference has different processed input metadata")
+        prior_rows = json.loads((directory/"summary.json").read_text())
+        for batch_size in sorted(set(args.batch_sizes)):
+            base = next(row for row in prior_rows if row["model"] == "ar" and row["batch_size"] == batch_size)
+            records = [json.loads(line) for line in (directory/f"ar_b{batch_size}.jsonl").read_text().splitlines() if line.strip()]
+            if [r["sample_id"] for r in records] != [e.sample_id for e in examples]:
+                raise ValueError("AR reference sample order differs")
+            references[batch_size] = [r["result"]["token_ids"] for r in records]
+            rows.append(base)
     print(f"True static replicated batches: {sorted(set(args.batch_sizes))}; attention={attention}", flush=True)
     print("Decode-only throughput; prefill reported separately. No continuous batching. Match does not gate ratios.", flush=True)
-    for label, checkpoint in [("ar", None), *checkpoints]:
+    for label, checkpoint in (checkpoints if args.ar_reference else [("ar", None), *checkpoints]):
         draft = load_draft(checkpoint, attn_implementation=attention).to(args.device, dtype).eval() if checkpoint else None
         for batch_size in sorted(set(args.batch_sizes)):
             if draft is not None and args.state_mode != "full_target_replay":
@@ -142,6 +164,9 @@ def main():
                 print(f"Precompiling GDN state kernels: {args.state_mode}, B={batch_size}", flush=True)
                 warmup_state_kernels(target, batch_size=batch_size, width=draft.block_size, mode=args.state_mode)
             def run(example, cap, *, profile=False):
+                if args.cpu_inputs:
+                    example = replace(example, inputs={k:v.to(args.device) if torch.is_tensor(v) else v
+                        for k,v in example.inputs.items()}, vision_mask=example.vision_mask.to(args.device))
                 with RequestPositionState(target).activate():
                     return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap,
                                                  profile=profile, state_mode=args.state_mode)

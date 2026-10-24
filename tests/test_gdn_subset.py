@@ -154,3 +154,30 @@ sys.exit(17 if os.environ['FAIL_PREP']=='1' else 0)
     args=json.loads((tmp_path/'prepare.json').read_text())
     assert args[args.index('--count')+1]=='20000'
     assert args[args.index('--workers')+1]=='4'
+
+
+def test_real_spawned_cpu_workers_forbid_cuda_and_training_imports(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from PIL import Image
+    image=tmp_path/'image.png'
+    Image.new('RGB',(4,4)).save(image)
+    worker=Path(__file__).with_name('gdn_subset_cpu_import_worker.py')
+    result=subprocess.run([sys.executable,str(worker),str(image)],
+        env=dict(os.environ,CUDA_VISIBLE_DEVICES='',OMP_NUM_THREADS='1',MKL_NUM_THREADS='1'),
+        capture_output=True,text=True,timeout=60)
+    assert result.returncode==0,result.stdout+result.stderr
+    assert 'CPU spawned workers passed' in result.stdout
+
+
+def test_failed_first_attempt_can_reuse_same_output_directory(tmp_path):
+    _,source,target=source_fixture(tmp_path)
+    directory=tmp_path/'retry'
+    def failed_worker(record):
+        raise RuntimeError('No CUDA GPUs are available')
+    with pytest.raises(RuntimeError,match='No CUDA'):
+        subset.collect(source,directory,target,count=4,workers=1,validator=failed_worker)
+    assert not (directory/'train.jsonl').exists()
+    result=subset.collect(source,directory,target,count=4,workers=1,validator=fake_validator)
+    assert result['stats']['selected']==4

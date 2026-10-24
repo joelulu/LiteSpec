@@ -35,7 +35,7 @@ def init_validator(target_model, max_length, block_size, image_max_tokens):
 def validate_record(record):
     from PIL.Image import DecompressionBombError
     from litespec.vlm.runtime import prepare_example
-    from litespec.vlm.train_aligned import has_anchor, loss_mask
+    from litespec.vlm.eligibility import has_anchor, loss_mask
     try:
         if not isinstance(record.get('image'), str) or not record['image'].strip():
             return dict(reason='missing_single_image')
@@ -100,7 +100,7 @@ def collect(source, directory, target_model, *, count=20000, seed=42, max_length
         block_size=block_size, image_max_tokens=image_max_tokens, transformers=transformers.__version__,
         selection='seeded_permutation_first_N_valid_unique_image_question_and_id',
         validation_code_sha256={p:file_digest(root/p) for p in
-            ('tests/prepare_gdn_subset.py', 'litespec/vlm/runtime.py', 'litespec/vlm/train_aligned.py')},
+            ('tests/prepare_gdn_subset.py', 'litespec/vlm/runtime.py', 'litespec/vlm/eligibility.py')},
         target_files_sha256={p.name:file_digest(p) for p in sorted(target_model.iterdir())
                              if p.suffix in {'.json', '.jinja'}})
     with output_lock(directory):

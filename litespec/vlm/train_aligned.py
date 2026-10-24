@@ -31,6 +31,7 @@ from litespec.training.runner import configure_rank_caches, run_draft
 from .runtime import load_target, prepare_example, read_records
 from .train import make_draft
 from .progress import StepProgress
+from .eligibility import has_anchor, loss_mask
 
 
 def rank():
@@ -70,14 +71,6 @@ def load_config(path):
     return cfg
 
 
-def loss_mask(example):
-    if hasattr(example, "supervision_mask"):
-        return example.supervision_mask
-    mask = torch.zeros_like(example.inputs["input_ids"], dtype=torch.float32)
-    mask[:, example.prefill_length:] = 1
-    return mask
-
-
 def collate_examples(examples, pad_token_id=0):
     """Right-pad text; preserve per-image patch/grid order and answer boundaries."""
     if not examples:
@@ -111,15 +104,6 @@ def collate_examples(examples, pad_token_id=0):
         raise ValueError(f"unsupported batched processor inputs: {sorted(unexpected)}")
     return SimpleNamespace(inputs=inputs, supervision_mask=supervision,
                            sample_ids=[ex.sample_id for ex in examples])
-
-
-def has_anchor(example, block_size):
-    # Match setup._has_valid_anchor_supervision AND the upstream sampler.
-    mask = loss_mask(example)
-    if int(mask.sum().item()) < 2 * block_size:
-        return False
-    end = max(mask.size(1) - block_size, 0)
-    return bool(((mask[:, :end + 1] > .5) & (mask[:, 1:end + 2] > .5)).any())
 
 
 def reuse_validation(records, cfg, directory):

@@ -151,13 +151,16 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
             if timeline: timeline.mark("emit")
             candidates, kept = pending, 1
         else:
+            if timeline: timeline.mark("gdn_state_prepare")
+            from .gdn_reader import cache_reader_states
+            gdn_states = cache_reader_states(draft, cache)
             if timeline: timeline.mark("draft")
             if baseline:
-                proposals, _ = history.propose(draft, target, pending, anchor)
+                proposals, _ = history.propose(draft, target, pending, anchor, gdn_states=gdn_states)
             else:
                 hidden, _ = draft_block(draft, target.get_input_embeddings(), anchor_ids=pending,
                     pivot=pivot, history=None, anchor=anchor, prefill_length=example.prefill_length,
-                    vision_mask=example.vision_mask, policy=ContextPolicy.no_history())
+                    vision_mask=example.vision_mask, policy=ContextPolicy.no_history(), gdn_states=gdn_states)
                 proposals = draft.sample_draft_tokens(draft_hidden=hidden,
                     first_prev_token_ids=pending[:, 0], temperature=0.0)[0]
             candidates = torch.cat([pending, proposals], 1)[:, :max_new_tokens-emitted]

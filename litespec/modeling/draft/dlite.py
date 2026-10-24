@@ -594,6 +594,7 @@ class Qwen3DLiteDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        gdn_states=None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
@@ -612,6 +613,8 @@ class Qwen3DLiteDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if hasattr(self, "gdn_reader"):
+            hidden_states = self.gdn_reader(hidden_states, gdn_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
@@ -765,6 +768,8 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         )
 
         self.post_init()
+        from litespec.vlm.gdn_reader import install_reader
+        install_reader(self)
 
     @property
     def chs_len_per_block(self) -> int:

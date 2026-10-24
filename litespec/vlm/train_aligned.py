@@ -126,7 +126,7 @@ def reuse_validation(records, cfg, directory):
     """Recover the exact eligible set from a completed old preflight, not weights."""
     directory = Path(directory).expanduser().resolve()
     previous = json.loads((directory / "effective_config.json").read_text())
-    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples"):
+    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples", "image_max_tokens"):
         if previous.get(key) != cfg.get(key):
             raise ValueError(f"validation reuse mismatch: {key}; run preflight again")
     skipped, excluded = [], set()
@@ -193,7 +193,7 @@ class CPUReferenceDLite(OnlineDLiteModel):
 
     Production CUDA uses the unchanged upstream FlexAttention implementation.
     """
-    def forward_backbone(self, batch, *, seq_len):
+    def forward_backbone(self, batch, *, seq_len, gdn_states=None):
         bsz, blocks = batch.anchor_positions.shape
         d = self.draft_model
         context, positions = d.build_block_position_ids(
@@ -205,7 +205,9 @@ class CPUReferenceDLite(OnlineDLiteModel):
                    target_hidden=batch.target_hidden.reshape(bsz * blocks, 1, d.chs_num_layers, -1),
                    history_hidden=query.new_empty(bsz * blocks, 1, 0, query.size(-1)),
                    position_ids=positions, rotary_position_ids=torch.cat([context, positions], -1),
-                   attention_mask=None, is_causal=False)
+                   attention_mask=None, is_causal=False,
+                   gdn_states=tuple(s.reshape(bsz * blocks, 1, *s.shape[2:]) for s in gdn_states)
+                   if gdn_states is not None else None)
         return d._prediction_hidden(output).reshape(bsz, blocks, d.proposal_length, -1)
 
 
@@ -241,7 +243,11 @@ def prepare_forward(target, online, example):
     positions = anchors.unsqueeze(-1) + offsets
     # Project only distinct supervised text positions, then gather the block layout.
     unique, inverse = positions.reshape(-1).unique(sorted=True, return_inverse=True)
-    with torch.no_grad():
+    from .gdn_capture import GDNAnchorCapture
+    from contextlib import nullcontext
+    reader = getattr(online.draft_model.config, "gdn_reader_config", None)
+    capture = GDNAnchorCapture(target, reader["layer_ids"], anchors, keep) if reader else None
+    with torch.no_grad(), capture if capture else nullcontext():
         output = target(**example.inputs, use_cache=False, output_hidden_states=True,
                         logits_to_keep=unique)
         indices = inverse.reshape(ids.size(0), -1)
@@ -249,7 +255,8 @@ def prepare_forward(target, online, example):
         reference = reference.reshape(*positions.shape, -1)
         batch = online.prepare_batch(ids, output.hidden_states, mask,
                                      anchor_positions=anchors, block_keep_mask=keep)
-    return dict(prepared_batch=batch, seq_len=ids.size(1), target_prefill_logits=reference,
+        gdn_states = capture.states if capture else None
+    return dict(gdn_states=gdn_states, prepared_batch=batch, seq_len=ids.size(1), target_prefill_logits=reference,
                 target_logits_are_gathered=True)
 
 
@@ -263,6 +270,8 @@ class VLMAdapter:
     def compute_step(self, session, example, *, microbatch_start=None, microbatch_end=None,
                      collect_detailed_metrics=True):
         inputs = prepare_forward(session.target, session.draft_online, example)
+        states = inputs.get("gdn_states") or ()
+        session.gdn_anchor_bytes = sum(s.numel() * s.element_size() for s in states)
         return session.fsdp_model(**inputs, collect_detailed_metrics=collect_detailed_metrics)
 
 
@@ -353,6 +362,9 @@ def log(session, window, grad_norm):
     scalars = {k: float(v) for k, v in metrics.items()}
     scalars.update({f"learning_rate/{k}": float(v)
                     for k, v in session.optimizer.get_learning_rates().items()})
+    scalars["memory/gdn_anchor_mib"] = getattr(session, "gdn_anchor_bytes", 0) / 2**20
+    if session.device != "cpu":
+        scalars["memory/peak_allocated_gib"] = torch.cuda.max_memory_allocated() / 2**30
     scalars.update(grad_norm=float(grad_norm),
                    epoch_progress=session.state.global_step / session.steps_per_epoch)
     scalars.update({f"progress/{k}": v for k, v in progress.items() if isinstance(v, (int, float))})
@@ -418,6 +430,8 @@ def run(argv=None):
     torch.manual_seed(cfg["seed"])
     target, processor = load_target(cfg["target_model"], device=device,
                                     dtype=torch.float32 if device == "cpu" else torch.bfloat16)
+    from .runtime import configure_image_token_budget
+    configure_image_token_budget(processor, target.config, cfg.get("image_max_tokens"))
     path = Path(cfg["train_data"])
     records = list(read_records(path, args.max_samples or None))
     cfg["data_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -466,6 +480,8 @@ def run(argv=None):
         draft.load_state_dict(loaded.state_dict())
         del loaded
     online = make_online(target, draft, cfg)
+    # Target activations already have the draft dtype. Disable FSDP root input
+    # casts below so the detached FP32 GDN snapshots retain their precision.
     # Match upstream registration names and ownership before FSDP changes shapes.
     parameters, specs = register_optimizer_parameters(draft)
     fsdp = online
@@ -473,7 +489,8 @@ def run(argv=None):
     if device != "cpu":
         fsdp = FSDP(online, ignored_modules=[target.get_output_embeddings(), target.get_input_embeddings()],
                     use_orig_params=True, sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-                    mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16),
+                    mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16,
+                                                   cast_root_forward_inputs=False),
                     device_id=torch.cuda.current_device())
         layouts = build_fsdp_layouts(fsdp, parameters, specs)
     training_args = SimpleNamespace(**cfg)

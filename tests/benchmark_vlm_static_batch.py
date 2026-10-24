@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--image-root", type=Path)
     parser.add_argument("--prompt-field", choices=["reference", "prompt", "question", "first-content"], default="reference")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--image-max-tokens", type=int)
     parser.add_argument("--image-max-pixels", type=int)
     parser.add_argument("--image-min-pixels", type=int)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -110,6 +111,11 @@ def main():
     (root/"settings.json").write_text(json.dumps(settings, default=str, indent=2))
     dtype = torch.float32 if torch.device(args.device).type == "cpu" else torch.bfloat16
     target, processor = load_target(args.target_model, device=args.device, dtype=dtype, attention=attention)
+    if args.image_max_tokens is not None:
+        from litespec.vlm.runtime import configure_image_token_budget
+        if args.image_max_pixels is not None or args.image_min_pixels is not None:
+            parser.error("choose token or pixel image limits, not both")
+        configure_image_token_budget(processor, target.config, args.image_max_tokens)
     if args.image_max_pixels is not None or args.image_min_pixels is not None:
         from reference_vlm_image_budget import configure_image_budget
         configure_image_budget(processor, args.image_min_pixels, args.image_max_pixels)

@@ -339,7 +339,7 @@ class OnlineDLiteModel(nn.Module):
         )
 
     def forward_backbone(
-        self, batch: PreparedDLiteBatch, *, seq_len: int
+        self, batch: PreparedDLiteBatch, *, seq_len: int, gdn_states=None
     ) -> torch.Tensor:
         bsz, num_blocks = batch.anchor_positions.shape
         query_len = self.draft_model.draft_query_length
@@ -402,6 +402,7 @@ class OnlineDLiteModel(nn.Module):
                 attention_mask=attention_mask,
                 rotary_position_ids=rotary,
                 kernel_options=self.flex_kernel_options,
+                gdn_states=gdn_states,
             )
         else:
             attention_mask = create_dlite_flex_mask(
@@ -428,6 +429,7 @@ class OnlineDLiteModel(nn.Module):
                 attention_mask=attention_mask,
                 rotary_position_ids=rotary,
                 kernel_options=self.flex_kernel_options,
+                gdn_states=gdn_states,
             )
         output = output.view(bsz, num_blocks, query_len, output.size(-1))
         return output[:, :, -self.draft_model.proposal_length :, :]
@@ -656,6 +658,7 @@ class OnlineDLiteModel(nn.Module):
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
         prepared_batch: Optional[PreparedDLiteBatch] = None,
+        gdn_states=None,
         seq_len: Optional[int] = None,
         return_backbone: bool = False,
         return_backbone_and_serial_logits: bool = False,
@@ -678,7 +681,8 @@ class OnlineDLiteModel(nn.Module):
             seq_len = input_ids.size(1)
         if seq_len is None:
             raise ValueError("seq_len is required with prepared_batch")
-        prediction_hidden = self.forward_backbone(prepared_batch, seq_len=seq_len)
+        reader_args = {"gdn_states": gdn_states} if gdn_states is not None else {}
+        prediction_hidden = self.forward_backbone(prepared_batch, seq_len=seq_len, **reader_args)
         if return_transition_outputs:
             if target_prefill_logits is None:
                 raise ValueError(

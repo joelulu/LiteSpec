@@ -53,6 +53,9 @@ def make_draft(target, processor, cfg):
     setattr(config, family + "_config", method)
     config.vlm_config = dict(algorithm=family, target_model=cfg["target_model"],
                              context_policy=cfg["context_policy"], training="upstream_sft_v1")
+    from .gdn_reader import reader_config
+    config.gdn_reader_config = reader_config(target.config, cfg)
+    config.vlm_gdn_experiment = bool(cfg.get("gdn_experiment", False))
     return cls(config).to(device=target.device, dtype=target.dtype)
 
 
@@ -72,11 +75,27 @@ def make_online(target, draft, cfg):
 
 
 def prepare_forward(target, online, example, mask):
-    with torch.no_grad():
+    from contextlib import nullcontext
+    from .gdn_capture import GDNAnchorCapture
+    ids = example.inputs["input_ids"]
+    anchors = keep = capture = None
+    reader = getattr(online.draft_model.config, "gdn_reader_config", None)
+    if getattr(online.draft_model.config, "vlm_gdn_experiment", False) or reader:
+        anchor_mask = mask
+        if hasattr(example, "supervision_mask"):
+            lengths = example.inputs["attention_mask"].sum(-1)
+            positions = torch.arange(ids.size(1), device=ids.device)
+            anchor_mask = mask * (positions[None] <= lengths[:, None] - online.block_size + 1)
+        anchors, keep = online._sample_anchor_positions(ids.size(1), anchor_mask, ids.device)
+        if reader:
+            capture = GDNAnchorCapture(target, reader["layer_ids"], anchors, keep)
+    with torch.no_grad(), capture if capture else nullcontext():
         output = target(**example.inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1)
         draft = online.draft_model
         hidden = selected_layers(output.hidden_states, draft.target_layer_ids, draft.config.num_target_layers).flatten(-2)
-    return dict(input_ids=example.inputs["input_ids"], hidden_states=hidden, loss_mask=mask,
+        gdn_states = capture.states if capture else None
+    extra = dict(anchor_positions=anchors, block_keep_mask=keep, gdn_states=gdn_states) if anchors is not None else {}
+    return dict(**extra, input_ids=example.inputs["input_ids"], hidden_states=hidden, loss_mask=mask,
                 target_last_hidden_states=output.hidden_states[-1])
 
 
@@ -93,13 +112,14 @@ class DraftCache:
         return selected_layers(output.hidden_states, draft.target_layer_ids,
                                draft.config.num_target_layers).flatten(-2).detach()
 
-    def propose(self, draft, target, pending, anchor):
+    def propose(self, draft, target, pending, anchor, gdn_states=None):
         ids = pending.new_full((pending.shape[0], draft.block_size), draft.mask_token_id)
         ids[:, :1] = pending
         start = self.cache.get_seq_length()
         positions = torch.arange(start, anchor + draft.block_size, device=pending.device)[None].expand(pending.shape[0], -1)
         hidden = draft(noise_embedding=target.get_input_embeddings()(ids), target_hidden=self.hidden,
-                       position_ids=positions, past_key_values=self.cache, use_cache=True, is_causal=False)
+                       position_ids=positions, past_key_values=self.cache, use_cache=True, is_causal=False,
+                       gdn_states=gdn_states)
         remove = self.cache.get_seq_length() - anchor
         if remove:
             # Negative removal counts work with both Transformers 4.x and 5.x.

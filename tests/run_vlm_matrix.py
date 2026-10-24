@@ -35,7 +35,8 @@ def message(text):
         print(text, flush=True)
 
 
-def checkpoints(workspace, selected):
+def checkpoints(workspace, selected, overrides=None):
+    overrides = overrides or {}
     old = workspace/"runs/vlm_three_3ep_20261021_045040_2983971"
     new = workspace/"runs/vlm_dlite_dflash_3ep_mb2_b8_20261022_060311_3121049"
     defaults = dict(dlite_vlm_100k=new/"dlite/last", dflash_vlm_100k=new/"dflash/last",
@@ -45,7 +46,9 @@ def checkpoints(workspace, selected):
         dlite_original="ORIGINAL_DLITE", dlite_vlm_20k="DLITE_3EP", dflash_vlm_20k="DFLASH_3EP", dspark_vlm_20k="DSPARK_3EP")
     result = {}
     for label in selected:
-        value = os.environ.get(env_names[label])
+        if label not in overrides and label not in env_names:
+            raise ValueError(f"unknown model {label}; supply --checkpoint LABEL PATH")
+        value = overrides.get(label) or os.environ.get(env_names.get(label, ""))
         if not value and label == "dflash_text_20k":
             candidates = sorted(p for p in (workspace/"runs").glob("dflash_text_20k_3ep_*/last") if (p/"config.json").is_file())
             if len(candidates) != 1:
@@ -55,7 +58,7 @@ def checkpoints(workspace, selected):
         config = json.loads((path/"config.json").read_text())
         result[label] = dict(path=str(path), config_sha256=hashlib.sha256((path/"config.json").read_bytes()).hexdigest(),
             architecture=config.get("architectures"), block_size=config.get("block_size"),
-            num_draft_layers=config.get("num_hidden_layers"),
+            num_draft_layers=config.get("num_hidden_layers"), gdn_reader_config=config.get("gdn_reader_config"),
             weight_files=[dict(name=p.name, bytes=p.stat().st_size, mtime_ns=p.stat().st_mtime_ns)
                           for p in sorted(path.iterdir()) if p.suffix in (".safetensors", ".bin")])
         effective = path.parent/"effective_config.json"
@@ -224,6 +227,7 @@ def summarize(root):
                 row = dict(dataset=case, batch_size=int(batch), gpu=gpu, model=label, state_mode=mode,
                     status=state.get("status", "pending"), accept_length=None, decode_tok_s=None, speedup=None,
                     peak_gib=None, record_mib=None, target_calls_per_round=None, profile_ms_per_round=None,
+                    valid_token_match=None, draft_ms=None, gdn_state_prepare_ms=None,
                     verify_ms=None, target_replay_ms=None, state_commit_ms=None,
                     token_exact_vs_per_token=None, accepts_equal_vs_per_token=None)
                 if state.get("status") == "success":
@@ -231,12 +235,14 @@ def summarize(root):
                     summary = next(r for r in json.loads((result/"summary.json").read_text()) if r["model"] == label)
                     row.update(accept_length=summary["mean_committed_length"], decode_tok_s=summary["decode_tokens_per_second"],
                         speedup=summary["decode_tokens_per_second"]/base["decode_tokens_per_second"],
-                        peak_gib=summary["peak_allocated_gib"], record_mib=summary["peak_transaction_record_mib"])
+                        peak_gib=summary["peak_allocated_gib"], record_mib=summary["peak_transaction_record_mib"],
+                        valid_token_match=summary.get("valid_token_match"))
                     profiles = result/"decode_profile.json"
                     if profiles.exists():
                         profile = next(r for r in json.loads(profiles.read_text()) if r["model"] == label)
                         row.update(target_calls_per_round=profile["target_calls_per_round"], profile_ms_per_round=profile["ms_per_round"])
                         stages = profile["stage_seconds"]
+                        row.update(draft_ms=1000*stages.get("draft",0), gdn_state_prepare_ms=1000*stages.get("gdn_state_prepare",0))
                         row.update(verify_ms=1000*stages.get("target_verify",0), target_replay_ms=1000*stages.get("target_replay",0),
                             state_commit_ms=1000*(stages.get("state_select",0)+stages.get("gdn_state_replay",0)))
                     reference = root/"jobs"/job/"per_token"/label/"result"/f"{label}_b{batch}.jsonl"
@@ -254,10 +260,12 @@ def summarize(root):
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader(); writer.writerows(rows)
     write_json(root/"ar_baselines.json", baselines)
-    lines = ["# Seven-draft static-batch evaluation", "",
+    lines = [f"# {len(manifest['models'])}-draft static-batch evaluation", "",
         "Each cell: speedup / mean committed length. Decode-only, against same-GPU/same-batch AR.",
         "Each prompt is replicated B times; not online continuous batching. OOM is not replaced with a smaller batch.",
-        "Native HF vs new state modes also changes the verification kernel; compact replay is not full upstream ReplaySSM.", ""]
+        "Native HF vs new state modes also changes the verification kernel; compact replay is not full upstream ReplaySSM.",
+        "A dagger (†) marks token mismatch against AR; those ratios are descriptive, not a lossless-speedup claim.",
+        "Reader compute is included in draft_ms; gdn_state_prepare_ms covers committed-cache state access only.", ""]
     for mode in manifest["state_modes"]:
         for case in manifest["datasets"]:
             batches = manifest["batch_sizes"]
@@ -269,7 +277,7 @@ def summarize(root):
                 cells = []
                 for batch in batches:
                     r = next(r for r in rows if r["dataset"] == case and r["batch_size"] == batch and r["model"] == label and r["state_mode"] == mode)
-                    cells.append(f"{r['speedup']:.3f}× / {r['accept_length']:.3f}" if r["status"] == "success" else r["status"])
+                    cells.append((f"{r['speedup']:.3f}× / {r['accept_length']:.3f}" + (" †" if r["valid_token_match"] is False else "")) if r["status"] == "success" else r["status"])
                 lines.append(f"| {label} | "+" | ".join(cells)+" |")
             lines.append("")
     (root/"matrix.md").write_text("\n".join(lines)+"\n")
@@ -281,7 +289,8 @@ def main():
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--gpus", nargs="+", default=["0,1,2,3,4,5,6,7"])
-    parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
+    parser.add_argument("--models", nargs="+")
+    parser.add_argument("--checkpoint", nargs=2, action="append", default=[], metavar=("LABEL", "PATH"))
     parser.add_argument("--tests", nargs="+", choices=["text-only", *DATASETS], default=["text-only", *DATASETS])
     parser.add_argument("--state-modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1,16,64])
@@ -296,6 +305,12 @@ def main():
     parser.add_argument("--retry-oom", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    overrides = dict(args.checkpoint)
+    if len(overrides) != len(args.checkpoint):
+        parser.error("duplicate checkpoint label")
+    if any(not label or label == "ar" or any(not (c.isalnum() or c in "-_") for c in label) for label in overrides):
+        parser.error("checkpoint labels must contain letters/digits/hyphens/underscores and cannot be ar")
+    args.models = args.models or list(overrides) or list(MODELS)
     args.gpus = [s for token in args.gpus for s in token.replace(",", " ").split()]
     for values in (args.gpus, args.models, args.tests, args.state_modes, args.batch_sizes):
         if not values or len(values) != len(set(values)):
@@ -305,8 +320,10 @@ def main():
     args.workspace, args.output_dir = args.workspace.expanduser().resolve(), args.output_dir.expanduser().resolve()
     args.target_model = str(Path(os.environ.get("TARGET_MODEL", str(Path.home()/"LMM/lmm_model/Qwen3.5-4B"))).expanduser().resolve())
     target_hash = hashlib.sha256((Path(args.target_model)/"config.json").read_bytes()).hexdigest()
-    models, data = checkpoints(args.workspace, args.models), select_data(args)
-    args.image_options = {flag:os.environ[env] for flag,env in (("--image-max-pixels","IMAGE_MAX_PIXELS"),("--image-min-pixels","IMAGE_MIN_PIXELS")) if os.environ.get(env)}
+    models, data = checkpoints(args.workspace, args.models, overrides), select_data(args)
+    args.image_options = {flag:os.environ[env] for flag,env in (("--image-max-pixels","IMAGE_MAX_PIXELS"),("--image-min-pixels","IMAGE_MIN_PIXELS"),("--image-max-tokens","IMAGE_MAX_TOKENS")) if os.environ.get(env)}
+    if "--image-max-tokens" in args.image_options and len(args.image_options) != 1:
+        parser.error("choose IMAGE_MAX_TOKENS or IMAGE_*_PIXELS, not both")
     assignments = {f"{name}_b{batch}":args.gpus[i%len(args.gpus)]
         for i,(name,batch) in enumerate((name,batch) for name in data for batch in args.batch_sizes)}
     identity = dict(version=1, target_model=args.target_model, target_config_sha256=target_hash,
@@ -317,7 +334,7 @@ def main():
         profile_decode=args.profile_decode, profile_samples=args.profile_samples)
     repo = Path(__file__).resolve().parents[1]
     identity["evaluation_code_sha256"] = {p:hashlib.sha256((repo/p).read_bytes()).hexdigest() for p in
-        ("tests/benchmark_vlm_static_batch.py", "litespec/vlm/static_batch.py", "litespec/vlm/gdn_state.py", "litespec/vlm/gdn_state_triton.py")}
+        ("tests/benchmark_vlm_static_batch.py", "litespec/vlm/static_batch.py", "litespec/vlm/gdn_state.py", "litespec/vlm/gdn_state_triton.py", "litespec/vlm/gdn_reader.py", "litespec/vlm/baselines.py", "litespec/modeling/draft/dlite.py", "litespec/modeling/draft/dflash.py")}
     if args.output_dir.exists():
         if not args.resume:
             parser.error("RESULT_DIR exists; use RESUME=1 / --resume")

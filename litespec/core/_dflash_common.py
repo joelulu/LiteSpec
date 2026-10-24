@@ -445,16 +445,19 @@ class DFlashTrainingBase(nn.Module):
         target_context_hidden: torch.Tensor,
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
+        anchor_positions=None,
+        block_keep_mask=None,
+        gdn_states=None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bsz, seq_len = input_ids.shape
         device = input_ids.device
 
-        anchor_positions, block_keep_mask = self._sample_anchor_positions(
-            seq_len,
-            loss_mask,
-            device,
-            max_valid_anchors=max_valid_anchors,
-        )
+        if anchor_positions is None:
+            anchor_positions, block_keep_mask = self._sample_anchor_positions(
+                seq_len, loss_mask, device, max_valid_anchors=max_valid_anchors,
+            )
+        elif block_keep_mask is None or anchor_positions.shape != block_keep_mask.shape:
+            raise ValueError("predetermined anchors require the matching keep mask")
 
         noise_embedding = self._create_noise_embed(
             input_ids, anchor_positions, block_keep_mask
@@ -500,6 +503,7 @@ class DFlashTrainingBase(nn.Module):
             noise_embedding=noise_embedding,
             target_hidden=target_context_hidden,
             attention_mask=dflash_attn_mask,
+            gdn_states=gdn_states,
             **draft_kwargs,
         )
         return anchor_positions, block_keep_mask, draft_hidden_states

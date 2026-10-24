@@ -25,6 +25,21 @@ def clock(device):
     return time.perf_counter()
 
 
+def configure_image_token_budget(processor, target_config, max_tokens=None):
+    if max_tokens is None:
+        return
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 1:
+        raise ValueError("image_max_tokens must be a positive integer")
+    image = getattr(processor, "image_processor", None)
+    size = getattr(image, "size", None)
+    if image is None or size is None or "longest_edge" not in size or "shortest_edge" not in size:
+        raise ValueError("image token cap requires native Qwen image processor size metadata")
+    vision = target_config.vision_config
+    unit = int(vision.patch_size) * int(vision.spatial_merge_size)
+    maximum = int(max_tokens) * unit * unit
+    image.size = dict(size, longest_edge=maximum, shortest_edge=min(size["shortest_edge"], maximum))
+
+
 def load_target(path, *, device="cuda", dtype=torch.bfloat16, attention="sdpa"):
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
@@ -118,7 +133,7 @@ def selected_layers(states, ids, depth):
 
 
 def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
-                prefill_length, vision_mask, policy):
+                prefill_length, vision_mask, policy, gdn_states=None):
     """One block, identical context selection during training and decoding."""
     student = draft.is_student
     if student and not policy.is_empty:
@@ -167,7 +182,7 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
     output = draft(
         noise_embedding=query, target_hidden=pivot, position_ids=q_pos,
         rotary_position_ids=torch.cat([context_pos, q_pos], dim=-1),
-        attention_mask=attention_mask, is_causal=False, **kwargs,
+        attention_mask=attention_mask, is_causal=False, gdn_states=gdn_states, **kwargs,
     )
     return draft._prediction_hidden(output), {"physical_history": physical, "visible_history": visible}
 
@@ -234,13 +249,15 @@ def generate_steps(target, draft, example, *, max_new_tokens=128, policy=None, v
             yield None
             continue
         t = clock(device)
+        from .gdn_reader import cache_reader_states
+        gdn_states = cache_reader_states(draft, cache)
         if baseline:
-            proposals, counts = baseline_cache.propose(draft, target, pending, anchor)
+            proposals, counts = baseline_cache.propose(draft, target, pending, anchor, gdn_states=gdn_states)
         else:
             hidden, counts = draft_block(
                 draft, target.get_input_embeddings(), anchor_ids=pending, pivot=pivot,
                 history=history, anchor=anchor, prefill_length=example.prefill_length,
-                vision_mask=example.vision_mask, policy=policy,
+                vision_mask=example.vision_mask, policy=policy, gdn_states=gdn_states,
             )
             proposals, _ = draft.sample_draft_tokens(
                 draft_hidden=hidden, first_prev_token_ids=pending[:, 0], temperature=0.0,

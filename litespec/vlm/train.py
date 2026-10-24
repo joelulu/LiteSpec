@@ -60,6 +60,8 @@ def make_draft(target, processor, cfg):
     config._attn_implementation = "sdpa"
     config.vlm_config = {"schema_version": 1, "target_model": cfg["target_model"],
                          "context_policy": cfg["context_policy"], "training": "direct_sft"}
+    from .gdn_reader import reader_config
+    config.gdn_reader_config = reader_config(target.config, cfg)
     return DLiteDraftModel(config).to(device=target.device, dtype=target.dtype)
 
 

@@ -33,6 +33,7 @@ def register_optimizer_parameters(model, parameters=None):
         "markov_head",
         "sequential_head",
         "confidence_head",
+        "gdn_reader",
     }
     for path, module in model.named_modules(remove_duplicate=False):
         for name, p in module.named_parameters(recurse=False):

@@ -634,6 +634,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        gdn_states=None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
         residual = hidden_states
@@ -653,6 +654,8 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if hasattr(self, "gdn_reader"):
+            hidden_states = self.gdn_reader(hidden_states, gdn_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
@@ -738,6 +741,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self._last_decode_stats = {}
         self._init_draft_head(config, draft_config)
         self.post_init()
+        from litespec.vlm.gdn_reader import install_reader
+        install_reader(self)
 
     def _build_decoder_layer(
         self,

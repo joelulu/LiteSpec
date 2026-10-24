@@ -21,6 +21,9 @@ class OnlineDFlashModel(DFlashTrainingBase):
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
         collect_detailed_metrics: bool = True,
+        anchor_positions=None,
+        block_keep_mask=None,
+        gdn_states=None,
     ) -> TrainingOutput:
         """Parallel block-wise training forward pass."""
         if self.attention_backend == "flex_attention" and not FLEX_ATTENTION_AVAILABLE:
@@ -36,6 +39,8 @@ class OnlineDFlashModel(DFlashTrainingBase):
                 target_context_hidden=hidden_states,
                 loss_mask=loss_mask,
                 max_valid_anchors=max_valid_anchors,
+                anchor_positions=anchor_positions, block_keep_mask=block_keep_mask,
+                gdn_states=gdn_states,
             )
         )
 

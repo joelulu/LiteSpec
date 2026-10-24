@@ -118,7 +118,8 @@ def selected_layers(states, ids, depth):
 
 
 def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
-                prefill_length, vision_mask, policy):
+                prefill_length, vision_mask, policy, prompt_memory=None, disable_memory=False,
+                timeline=None):
     """One block, identical context selection during training and decoding."""
     student = draft.is_student
     if student and not policy.is_empty:
@@ -164,10 +165,16 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
                                             device=device, dtype=torch.bool)])
         attention_mask = torch.zeros((1, 1, block_size, allow.numel()), device=device, dtype=dtype)
         attention_mask.masked_fill_(~allow.view(1, 1, 1, -1), torch.finfo(dtype).min)
+    if getattr(draft, "memory_reader", None) is not None and not disable_memory:
+        if timeline: timeline.mark("memory_read")
+        query = query + draft.memory_reader(pivot, prompt_memory)[:, 0:1, :]
+        disable_memory = True  # Already applied; never read twice.
+        if timeline: timeline.mark("draft_backbone")
     output = draft(
         noise_embedding=query, target_hidden=pivot, position_ids=q_pos,
         rotary_position_ids=torch.cat([context_pos, q_pos], dim=-1),
         attention_mask=attention_mask, is_causal=False, **kwargs,
+        prompt_memory=prompt_memory, disable_memory=disable_memory,
     )
     return draft._prediction_hidden(output), {"physical_history": physical, "visible_history": visible}
 

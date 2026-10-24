@@ -765,6 +765,18 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         )
 
         self.post_init()
+        memory_mode = dlite_config.get("memory_mode", "none")
+        if memory_mode not in {"none", "vision", "text"}:
+            raise ValueError("unknown DLite memory mode")
+        self.memory_reader = None
+        if memory_mode != "none":
+            if not self.is_student:
+                raise ValueError("prompt memory supports history-free students only")
+            from .pivot_memory import PivotMemoryReader
+            # After base initialization: identical backbone/head initialization
+            # for baseline, vision and text under the same seed.
+            with torch.random.fork_rng(devices=[]):
+                self.memory_reader = PivotMemoryReader(hidden_size, int(dlite_config.get("memory_rank", 256)))
 
     @property
     def chs_len_per_block(self) -> int:
@@ -1200,9 +1212,16 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         history_hidden: Optional[torch.Tensor] = None,
         shared_history: Optional[torch.Tensor] = None,
         rotary_position_ids: Optional[torch.LongTensor] = None,
+        prompt_memory=None,
+        disable_memory: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = noise_embedding
+        if self.memory_reader is not None and not disable_memory:
+            residual = self.memory_reader(target_hidden, prompt_memory)
+            bsz, blocks = residual.shape[:2]
+            hidden_states = (hidden_states.reshape(bsz, blocks, -1, hidden_states.size(-1))
+                             + residual.unsqueeze(-2)).reshape_as(hidden_states)
         if shared_history is not None:
             if target_hidden is None or target_hidden.ndim != 4:
                 raise ValueError(
@@ -1558,3 +1577,4 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                 ]
 
         return output_ids
+

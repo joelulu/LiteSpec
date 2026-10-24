@@ -52,6 +52,12 @@ def load_config(path):
     if family == "dlite" and upstream.get("mode") != "sft":
         raise ValueError("this VLM adapter implements the upstream direct-SFT recipe")
     cfg = {**upstream["arguments"], **source}
+    memory_mode = cfg.get("memory_mode", "none")
+    if memory_mode not in {"none", "vision", "text"} or (family != "dlite" and memory_mode != "none"):
+        raise ValueError("prompt memory requires DLite and none/vision/text mode")
+    for key in ("memory_max_tokens", "memory_rank", "image_max_tokens"):
+        if key in cfg and (not isinstance(cfg[key], int) or isinstance(cfg[key], bool) or cfg[key] < 1):
+            raise ValueError(f"{key} must be a positive integer")
     if not isinstance(cfg.get("batch_size"), int) or isinstance(cfg["batch_size"], bool) or cfg["batch_size"] < 1:
         raise ValueError("batch_size must be a positive integer")
     if cfg.get("model_role", "student") != "student":
@@ -89,12 +95,14 @@ def collate_examples(examples, pad_token_id=0):
     ids = first.new_full((len(examples), width), pad_token_id)
     attention = torch.zeros_like(ids)
     supervision = torch.zeros_like(ids, dtype=torch.float32)
+    prompt_mask = torch.zeros_like(ids, dtype=torch.bool)
     token_types = torch.zeros_like(ids)
     for index, ex in enumerate(examples):
         size = ex.inputs["input_ids"].shape[1]
         ids[index, :size] = ex.inputs["input_ids"][0]
         attention[index, :size] = ex.inputs.get("attention_mask", torch.ones_like(ex.inputs["input_ids"]))[0]
         supervision[index, :size] = loss_mask(ex)[0] * attention[index, :size]
+        prompt_mask[index, :ex.prefill_length] = True
         if "mm_token_type_ids" in ex.inputs:
             token_types[index, :size] = ex.inputs["mm_token_type_ids"][0]
     inputs = dict(input_ids=ids, attention_mask=attention)
@@ -110,6 +118,7 @@ def collate_examples(examples, pad_token_id=0):
     if unexpected:
         raise ValueError(f"unsupported batched processor inputs: {sorted(unexpected)}")
     return SimpleNamespace(inputs=inputs, supervision_mask=supervision,
+                           prompt_mask=prompt_mask & attention.bool(),
                            sample_ids=[ex.sample_id for ex in examples])
 
 
@@ -126,7 +135,7 @@ def reuse_validation(records, cfg, directory):
     """Recover the exact eligible set from a completed old preflight, not weights."""
     directory = Path(directory).expanduser().resolve()
     previous = json.loads((directory / "effective_config.json").read_text())
-    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples"):
+    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples", "image_max_tokens"):
         if previous.get(key) != cfg.get(key):
             raise ValueError(f"validation reuse mismatch: {key}; run preflight again")
     skipped, excluded = [], set()
@@ -196,6 +205,12 @@ class CPUReferenceDLite(OnlineDLiteModel):
     def forward_backbone(self, batch, *, seq_len):
         bsz, blocks = batch.anchor_positions.shape
         d = self.draft_model
+        if d.memory_reader is not None:
+            # Preserve one memory per example, not one replicated bank per anchor.
+            residual = d.memory_reader(batch.target_hidden, batch.prompt_memory)
+            from dataclasses import replace
+            query = batch.query_embeddings.reshape(bsz, blocks, d.draft_query_length, -1)
+            batch = replace(batch, query_embeddings=(query + residual.unsqueeze(-2)))
         context, positions = d.build_block_position_ids(
             batch.anchor_positions, batch.token_position_ids, batch.token_keep_mask)
         query = batch.query_embeddings.reshape(bsz * blocks, d.draft_query_length, -1)
@@ -205,7 +220,7 @@ class CPUReferenceDLite(OnlineDLiteModel):
                    target_hidden=batch.target_hidden.reshape(bsz * blocks, 1, d.chs_num_layers, -1),
                    history_hidden=query.new_empty(bsz * blocks, 1, 0, query.size(-1)),
                    position_ids=positions, rotary_position_ids=torch.cat([context, positions], -1),
-                   attention_mask=None, is_causal=False)
+                   attention_mask=None, is_causal=False, disable_memory=True)
         return d._prediction_hidden(output).reshape(bsz, blocks, d.proposal_length, -1)
 
 
@@ -249,6 +264,10 @@ def prepare_forward(target, online, example):
         reference = reference.reshape(*positions.shape, -1)
         batch = online.prepare_batch(ids, output.hidden_states, mask,
                                      anchor_positions=anchors, block_keep_mask=keep)
+        if online.draft_model.memory_reader is not None:
+            from .memory import build_prompt_memory, prompt_mask_from_example
+            batch.prompt_memory = build_prompt_memory(output.hidden_states, online.draft_model,
+                ids, prompt_mask_from_example(example), target.config)
     return dict(prepared_batch=batch, seq_len=ids.size(1), target_prefill_logits=reference,
                 target_logits_are_gathered=True)
 
@@ -263,7 +282,13 @@ class VLMAdapter:
     def compute_step(self, session, example, *, microbatch_start=None, microbatch_end=None,
                      collect_detailed_metrics=True):
         inputs = prepare_forward(session.target, session.draft_online, example)
-        return session.fsdp_model(**inputs, collect_detailed_metrics=collect_detailed_metrics)
+        result = session.fsdp_model(**inputs, collect_detailed_metrics=collect_detailed_metrics)
+        memory = getattr(inputs.get("prepared_batch"), "prompt_memory", None)
+        if memory is not None:
+            from litespec.core.outputs import RatioTerms
+            count = memory.valid.sum(-1).float()
+            result.ratio_metrics["memory/source_tokens"] = RatioTerms(count.sum(), count.new_tensor(count.numel()))
+        return result
 
 
 def rng_state():
@@ -418,6 +443,9 @@ def run(argv=None):
     torch.manual_seed(cfg["seed"])
     target, processor = load_target(cfg["target_model"], device=device,
                                     dtype=torch.float32 if device == "cpu" else torch.bfloat16)
+    if cfg.get("image_max_tokens") is not None:
+        from .memory import configure_image_tokens
+        configure_image_tokens(processor, target.config, cfg["image_max_tokens"])
     path = Path(cfg["train_data"])
     records = list(read_records(path, args.max_samples or None))
     cfg["data_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -538,3 +566,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

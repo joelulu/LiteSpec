@@ -93,7 +93,8 @@ def replicate_inputs(example, batch_size):
 
 @torch.no_grad()
 def generate_static_batch(target, draft, example, *, batch_size=1, max_new_tokens=128,
-                          verification="block", profile=False, state_mode="full_target_replay"):
+                          verification="block", profile=False, state_mode="full_target_replay",
+                          memory_example=None, disable_memory=False):
     from .gdn_state import STATE_MODES, GDNStateTransaction
     if state_mode not in STATE_MODES:
         raise ValueError(f"unknown GDN state mode: {state_mode}")
@@ -103,13 +104,16 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
         with GDNStateTransaction(target, state_mode) as transaction:
             return _generate_static_batch(target, draft, example, batch_size=batch_size,
                 max_new_tokens=max_new_tokens, verification=verification, profile=profile,
-                transaction=transaction, state_mode=state_mode)
+                transaction=transaction, state_mode=state_mode,
+                memory_example=memory_example, disable_memory=disable_memory)
     return _generate_static_batch(target, draft, example, batch_size=batch_size,
-        max_new_tokens=max_new_tokens, verification=verification, profile=profile, state_mode=state_mode)
+        max_new_tokens=max_new_tokens, verification=verification, profile=profile, state_mode=state_mode,
+        memory_example=memory_example, disable_memory=disable_memory)
 
 
 def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens,
-                           verification, profile, state_mode, transaction=None):
+                           verification, profile, state_mode, transaction=None,
+                           memory_example=None, disable_memory=False):
     """One true batch of identical greedy requests; no request-by-request loop."""
     from .baselines import DraftCache, is_baseline
     if max_new_tokens < 1 or verification not in {"block", "sequential"}:
@@ -130,6 +134,23 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     eos_ids = inputs["input_ids"].new_tensor([value for value in eos if value is not None])
     started = clock(device)  # Replication/CPU image preparation excluded.
     cache = make_hybrid_cache(target, anchor + max_new_tokens + width)
+    memory = None
+    memory_build_seconds = 0.
+    donor_prefill_seconds = 0.
+    reader = getattr(draft, "memory_reader", None)
+    if memory_example is not None:
+        if reader is None or draft.config.dlite_config.get("memory_mode") != "vision" or disable_memory:
+            raise ValueError("wrong-image memory requires an enabled vision-memory checkpoint")
+        from .memory import build_prompt_memory
+        donor_started = clock(device)
+        donor_inputs = replicate_inputs(memory_example, batch_size)
+        donor = target(**donor_inputs, use_cache=False, output_hidden_states=True, logits_to_keep=1)
+        memory_started = clock(device)
+        memory = reader.project(build_prompt_memory(donor.hidden_states, draft,
+            donor_inputs["input_ids"], torch.ones_like(donor_inputs["input_ids"], dtype=torch.bool), target.config))
+        memory_build_seconds = clock(device) - memory_started
+        donor_prefill_seconds = clock(device) - donor_started
+        del donor, donor_inputs
     output = target(**inputs, past_key_values=cache, use_cache=True, logits_to_keep=1,
                     output_hidden_states=draft is not None)
     cache = output.past_key_values
@@ -138,6 +159,13 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                              draft.config.num_target_layers)[:, -1:].detach().clone()
              if draft is not None else None)
     history = DraftCache(draft, target, output, anchor) if baseline else None
+    if reader is not None and not disable_memory and memory is None:
+        from .memory import build_prompt_memory
+        memory_started = clock(device)
+        memory = reader.project(build_prompt_memory(output.hidden_states, draft,
+            inputs["input_ids"], torch.ones_like(inputs["input_ids"], dtype=torch.bool), target.config))
+        memory_build_seconds = clock(device) - memory_started
+    memory_tokens = int(memory.valid[0].sum()) if memory is not None else 0
     del output, inputs
     prefill_end = clock(device)
     timeline = None
@@ -157,7 +185,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
             else:
                 hidden, _ = draft_block(draft, target.get_input_embeddings(), anchor_ids=pending,
                     pivot=pivot, history=None, anchor=anchor, prefill_length=example.prefill_length,
-                    vision_mask=example.vision_mask, policy=ContextPolicy.no_history())
+                    vision_mask=example.vision_mask, policy=ContextPolicy.no_history(),
+                    prompt_memory=memory, disable_memory=disable_memory, timeline=timeline)
                 proposals = draft.sample_draft_tokens(draft_hidden=hidden,
                     first_prev_token_ids=pending[:, 0], temperature=0.0)[0]
             candidates = torch.cat([pending, proposals], 1)[:, :max_new_tokens-emitted]
@@ -269,6 +298,9 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         gdn_verify_backend="native_hf" if transaction is None else
             ("triton_fused_recurrent" if device.type == "cuda" else "cpu_reference_recurrent"),
         peak_transaction_record_bytes=transaction.peak_record_bytes if transaction else peak_snapshot_bytes)
+    result.update(memory_tokens=memory_tokens, memory_build_seconds=memory_build_seconds,
+                  donor_prefill_seconds=donor_prefill_seconds,
+                  memory_condition="disabled" if disable_memory else "wrong_image" if memory_example is not None else "correct")
     if transaction:
         result["cache_policy"] = "preallocated_attention_kv_" + state_mode
     if timeline:

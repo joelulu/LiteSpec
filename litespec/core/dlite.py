@@ -125,6 +125,7 @@ class PreparedDLiteBatch:
     prev_token_ids: torch.Tensor
     raw_weight_mask: torch.Tensor
     binary_eval_mask: torch.Tensor
+    prompt_memory: object = None
 
 
 class OnlineDLiteModel(nn.Module):
@@ -425,6 +426,7 @@ class OnlineDLiteModel(nn.Module):
                 noise_embedding=query_embeddings,
                 target_hidden=batch.target_hidden,
                 history_hidden=empty_history,
+                prompt_memory=batch.prompt_memory,
                 attention_mask=attention_mask,
                 rotary_position_ids=rotary,
                 kernel_options=self.flex_kernel_options,
@@ -784,3 +786,4 @@ __all__ = [
     "prepare_history_hidden_states",
     "prepare_target_hidden",
 ]
+

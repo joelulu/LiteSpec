@@ -35,6 +35,9 @@ def summarize_batches(results, batch_size):
         speculative_rounds=len(lengths), recovery_replays=sum(row["recovery_replays"] for row in results),
         target_decode_calls=sum(row["target_decode_calls"] for row in results),
         mean_input_tokens=sum(row["prefill_tokens"] for row in results)/len(results),
+        mean_memory_tokens=sum(row.get("memory_tokens", 0) for row in results)/len(results),
+        memory_build_seconds=sum(row.get("memory_build_seconds", 0) for row in results),
+        donor_prefill_seconds=sum(row.get("donor_prefill_seconds", 0) for row in results),
         scheduler="static_replicated_batch", benchmark_mode="static_replicated_batch",
         timing_scope="decode_only_after_prefill", throughput_is_production_benchmark=False)
 
@@ -64,6 +67,7 @@ def main():
     parser.add_argument("--state-mode", choices=["full_target_replay", "per_token", "compact_replay"], default="full_target_replay")
     parser.add_argument("--ar-reference", type=Path, help="reuse a completed same-GPU/same-input AR cell instead of timing AR again")
     parser.add_argument("--cpu-inputs", action="store_true", help="retain prepared prompts on CPU; transfer only current prompt before timing")
+    parser.add_argument("--memory-condition", choices=["correct", "wrong_image", "disabled"], default="correct")
     parser.add_argument("--report-raw-speedup", action="store_true", help="accepted for compatibility; observed ratios are always reported")
     parser.add_argument("--profile-decode", action="store_true", help="separate instrumented pass; keep normal speed measurements")
     parser.add_argument("--profile-samples", type=int, default=4)
@@ -118,6 +122,22 @@ def main():
     (root/"settings.json").write_text(json.dumps(settings, default=str, indent=2))
     examples = [prepare_example(processor, target.config, record, device="cpu" if args.cpu_inputs else args.device,
                                base_dir=data.parent, training=False) for record in records]
+    donors = {}
+    if args.memory_condition == "wrong_image":
+        import random
+        rng = random.Random(args.seed)
+        mapping = {}
+        for record, example in zip(records, examples):
+            options = [r for r in records if r.get("image") and r["image"] != record.get("image")]
+            if not record.get("image") or not options:
+                raise ValueError("wrong-image diagnosis requires at least two distinct images")
+            donor = rng.choice(options)
+            mapping[example.sample_id] = dict(donor_id=donor["id"], donor_image=donor["image"])
+            donors[example.sample_id] = prepare_example(processor, target.config,
+                {**record, "image": donor["image"]}, device="cpu" if args.cpu_inputs else args.device,
+                base_dir=data.parent, training=False)
+        settings["wrong_image_mapping"] = mapping
+        (root/"settings.json").write_text(json.dumps(settings, default=str, indent=2))
     input_metadata = []
     for record, example in zip(records, examples):
         grid = example.inputs.get("image_grid_thw")
@@ -164,12 +184,17 @@ def main():
                 print(f"Precompiling GDN state kernels: {args.state_mode}, B={batch_size}", flush=True)
                 warmup_state_kernels(target, batch_size=batch_size, width=draft.block_size, mode=args.state_mode)
             def run(example, cap, *, profile=False):
+                donor = donors.get(example.sample_id) if draft is not None else None
                 if args.cpu_inputs:
                     example = replace(example, inputs={k:v.to(args.device) if torch.is_tensor(v) else v
                         for k,v in example.inputs.items()}, vision_mask=example.vision_mask.to(args.device))
+                    if donor is not None:
+                        donor = replace(donor, inputs={k:v.to(args.device) if torch.is_tensor(v) else v
+                            for k,v in donor.inputs.items()}, vision_mask=donor.vision_mask.to(args.device))
                 with RequestPositionState(target).activate():
                     return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap,
-                                                 profile=profile, state_mode=args.state_mode)
+                        profile=profile, state_mode=args.state_mode, memory_example=donor,
+                        disable_memory=args.memory_condition == "disabled")
             for _ in range(args.warmup):
                 run(examples[0], min(16, args.max_new_tokens))
             if torch.device(args.device).type == "cuda":
@@ -182,6 +207,7 @@ def main():
             expected = references[batch_size]
             matched = sum(a == b for a, b in zip(tokens, expected))*batch_size
             summary = dict(model=label, checkpoint=checkpoint, dataset_split=args.data_split,
+                memory_condition=args.memory_condition if checkpoint else "none",
                 dataset_path=str(data), dataset_name=args.dataset_name,
                 input_mode=args.input_mode if args.reference_input else "from_manifest",
                 mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),

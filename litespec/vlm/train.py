@@ -58,8 +58,15 @@ def make_draft(target, processor, cfg):
         config.dlite_config.update(swa_window_size=cfg.get("max_length", 4096),
                                    history_layer_ids=[0, depth // 2, depth - 1])
     config._attn_implementation = "sdpa"
+    if cfg.get("memory_mode", "none") != "none":
+        config.dlite_config.update(
+            memory_mode=cfg["memory_mode"], memory_max_tokens=int(cfg.get("memory_max_tokens", 1024)),
+            memory_rank=int(cfg.get("memory_rank", 256)),
+            memory_layer_ids=cfg.get("memory_layer_ids", list(dict.fromkeys([layers[0], layers[len(layers)//2], layers[-1]]))))
     config.vlm_config = {"schema_version": 1, "target_model": cfg["target_model"],
                          "context_policy": cfg["context_policy"], "training": "direct_sft"}
+    if cfg.get("image_max_tokens") is not None:
+        config.vlm_config["image_max_tokens"] = cfg["image_max_tokens"]
     return DLiteDraftModel(config).to(device=target.device, dtype=target.dtype)
 
 

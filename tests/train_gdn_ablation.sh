@@ -14,6 +14,7 @@ export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-2}"
 export ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-8}"
 export EPOCHS="${EPOCHS:-3}"
 export BLOCK_SIZE="${BLOCK_SIZE:-8}"
+export MAX_LENGTH="${MAX_LENGTH:-4096}"
 export IMAGE_MAX_TOKENS="${IMAGE_MAX_TOKENS:-1024}"
 export GDN_LAYERS="${GDN_LAYERS:-14,30}"
 export GDN_RANK="${GDN_RANK:-8}"
@@ -27,6 +28,9 @@ unset MAX_STEPS MAX_SAMPLES CONFIG OUTPUT_DIR ALGORITHM REUSE_VALIDATION_FROM
 if [[ "${SMOKE_TEST:-0}" == 1 ]]; then
     export MAX_STEPS=1 MAX_SAMPLES=32
     export EVAL_SAMPLES="${EVAL_SAMPLES:-2}" EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-32}"
+fi
+if [[ -n "${PREPARED_VALIDATION_FROM:-}" && "${SMOKE_TEST:-0}" != 1 ]]; then
+    export REUSE_VALIDATION_FROM="$PREPARED_VALIDATION_FROM"
 fi
 cd "$REPO_ROOT"
 [[ -s "$TRAIN_DATA" ]] || { echo "Missing/empty training data: $TRAIN_DATA" >&2; exit 1; }
@@ -42,8 +46,10 @@ echo "GPUs=$CUDA_VISIBLE_DEVICES, per-GPU=$MICRO_BATCH_SIZE, accumulation=$ACCUM
 # Validate the sparse CUDA capture and full native image training/reload path on
 # each participating GPU BEFORE consuming the training dataset.
 for gpu in 4 5 6 7; do
+    echo "Starting CUDA preflight on GPU $gpu: $RUN_GROUP/cuda_check_$gpu.log"
     CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" tests/check_gdn_reader_cuda.py \
         > "$RUN_GROUP/cuda_check_$gpu.log" 2>&1 || { cat "$RUN_GROUP/cuda_check_$gpu.log"; exit 1; }
+    echo "Completed CUDA preflight on GPU $gpu"
 done
 for arm in dflash dlite dflash_gdn dlite_gdn; do
     export ALGORITHM="${arm%_gdn}"
@@ -62,7 +68,7 @@ cfg = yaml.safe_load((Path('scripts/config/vlm')/base).read_text())
 cfg.update(algorithm=family, gdn_experiment=True, gdn_enabled=arm.endswith('_gdn'),
            num_epochs=int(os.environ['EPOCHS']), batch_size=int(os.environ['MICRO_BATCH_SIZE']),
            accumulation_steps=int(os.environ['ACCUMULATION_STEPS']), block_size=int(os.environ['BLOCK_SIZE']),
-           image_max_tokens=int(os.environ['IMAGE_MAX_TOKENS']), seed=42,
+           image_max_tokens=int(os.environ['IMAGE_MAX_TOKENS']), max_length=int(os.environ['MAX_LENGTH']), seed=42,
            num_draft_layers=5, num_anchors=512,
            gdn_layer_ids=[int(i) for i in os.environ['GDN_LAYERS'].split(',')],
            gdn_rank=int(os.environ['GDN_RANK']), gdn_bottleneck=int(os.environ['GDN_BOTTLENECK']),

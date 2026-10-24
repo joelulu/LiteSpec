@@ -66,6 +66,59 @@ memory. Compare image-task improvements with GSM8K before claiming visual gains.
 The training follows each family's existing direct SFT; it does not reproduce
 ReaDy's separate reader-only/LoRA training stages or use its published weights.
 
+## Quick validation: exactly 20k usable records
+
+The 20k entry point first prepares data on CPU, then launches the same four-arm
+training/evaluation chain on GPUs 4-7:
+
+```bash
+bash tests/run_gdn_20k.sh
+```
+
+It samples from the existing 100k `train.jsonl` in a deterministic seed-42 random
+order and continues until it collects **20,000 usable unique records**. It does
+not take 20k candidates and then filter them down. Every selected row must:
+
+- Contain a local decodable image and an actual encoded image payload.
+- Pass the same native Qwen chat-template/prefix-stability processing as training.
+- Use image cap 1024, total length <=4096, block size 8, and the aligned trainer's
+  >=16 supervised-answer-token plus full-block-anchor eligibility rule.
+- Have a unique sample ID and unique image/question pair. Explicit non-train
+  split records are excluded. Existing answers remain unchanged.
+
+Only processor/config/tokenizer files are loaded during selection, with four
+CPU worker processes and no visible CUDA devices. Target weights are not loaded.
+The collector stops once enough valid records are found; exhausting the source
+before 20k is an error and produces no final `train.jsonl`. `PREPARE_WORKERS`
+changes the worker count while preserving deterministic selection order.
+
+The default output is
+`data/finevision_qwen35_gdn_valid20k_img1024_b8_s42/`. It contains `train.jsonl`,
+`selection.json` (counts, source/settings hashes), `selected.jsonl` (source-line
+and token-count audit), and `rejected.jsonl` (rejection reasons). Relative image
+paths become absolute before moving records into the new directory. The
+collector never edits the 100k source or regenerates answers.
+
+A compatible eligibility packet lets even the FIRST training arm reuse the
+validated 20k without re-encoding all images during preflight. All four arms use
+the same data/hash. Each still trains 3 epochs, mb2/acc8/global64, about 938
+optimizer updates per arm at exactly 20k usable rows. Completed preparations
+are reused only when source, processor/config files, validation code, settings,
+and output hash match. Mismatches require a fresh `SUBSET_DIR`.
+
+To collect data first and leave GPU training for later:
+
+```bash
+PREPARE_ONLY=1 bash tests/run_gdn_20k.sh
+# Later: reuses the completed selection, then trains and evaluates.
+bash tests/run_gdn_20k.sh
+```
+
+`SOURCE_TRAIN_DATA` overrides the source manifest; `SUBSET_DIR` overrides the
+selection directory. Training uses a fresh `runs/vlm_gdn_valid20k_3ep_...` group.
+Stopping an older 100k process remains a separate host action; updating the
+checkout does not change the data or arguments of a running process.
+
 ## Default training and automatic evaluation
 
 Run from this branch, using the existing working VLM environment:

@@ -10,8 +10,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('entrypoint', ['train_gdn_ablation.sh', 'run_gdn_20k.sh'])
 @pytest.mark.parametrize('fail_arm', ['', 'dlite_gdn'])
-def test_four_card_training_success_gates_auto_evaluation(tmp_path, fail_arm):
+def test_four_card_training_success_gates_auto_evaluation(tmp_path, fail_arm, entrypoint):
     python = tmp_path/'python'
     python.write_text('#!'+sys.executable+'\n'+r'''
 import json, os
@@ -23,9 +24,16 @@ def record(value):
     with log.open('a') as f: f.write(json.dumps(value)+'\n')
 if args[:1] == ['-c'] or args[:1] == ['tests/check_gdn_reader_cuda.py'] or args[:2] == ['-', '4']:
     sys.exit(0)
+if args[:1] == ['tests/prepare_gdn_subset.py']:
+    output=Path(args[args.index('--output-dir')+1]); output.mkdir(parents=True)
+    count=int(args[args.index('--count')+1])
+    record(dict(prepare=count,gpus=os.environ['CUDA_VISIBLE_DEVICES']))
+    (output/'train.jsonl').write_text(''.join(json.dumps(dict(id=str(i),question='q',answer='a'))+'\n' for i in range(count)))
+    sys.exit(0)
 if args[:2] == ['-m','torch.distributed.run']:
     output=Path(args[args.index('--output-dir')+1]); arm=output.name
-    record(dict(train=arm,gpus=os.environ['CUDA_VISIBLE_DEVICES'],workers=os.environ['NPROC_PER_NODE']))
+    record(dict(train=arm,gpus=os.environ['CUDA_VISIBLE_DEVICES'],workers=os.environ['NPROC_PER_NODE'],
+        data=args[args.index('--train-data')+1], reuse=args[args.index('--reuse-validation-from')+1] if '--reuse-validation-from' in args else None))
     if arm == os.environ.get('FAIL_ARM'): sys.exit(13)
     import yaml
     cfg=yaml.safe_load(Path(args[args.index('--config')+1]).read_text())
@@ -49,10 +57,15 @@ os.execv(sys.executable,[sys.executable,*args])
              FAIL_ARM=fail_arm,CUDA_VISIBLE_DEVICES='0,1,2,3',NPROC_PER_NODE='8')
     # Inherited debug settings from an unrelated run must not cap this run.
     env.update(MAX_STEPS='7',MAX_SAMPLES='100')
-    result=subprocess.run(['bash','tests/train_gdn_ablation.sh'],cwd=ROOT,env=env,text=True,capture_output=True)
+    result=subprocess.run(['bash','tests/'+entrypoint],cwd=ROOT,env=env,text=True,capture_output=True)
     assert (tmp_path/'chain.jsonl').exists(), result.stdout+result.stderr
     rows=[json.loads(line) for line in (tmp_path/'chain.jsonl').read_text().splitlines()]
     trained=[r for r in rows if 'train' in r]
+    if entrypoint == 'run_gdn_20k.sh':
+        assert rows[0] == dict(prepare=20000,gpus='')
+        assert 'valid20k' in trained[0]['data']
+        assert trained[0]['reuse'] == str(Path(trained[0]['data']).parent)
+        assert all(r['data'] == trained[0]['data'] for r in trained)
     assert [r['train'] for r in trained] == ['dflash','dlite','dflash_gdn','dlite_gdn']
     assert all(r['gpus']=='4,5,6,7' and r['workers']=='4' for r in trained)
     if fail_arm:

@@ -95,3 +95,41 @@ CPU tests cover identical-logit controls, BF16 rounding, hook cleanup, zeroed
 reader behavior, nonzero reader gradients without parameter updates, a real
 hybrid target common-prefix walk, and the full CLI's three-condition/AR-reuse
 pipeline. Actual checkpoint measurements still require the user's GPU server.
+
+## Visual attention evidence
+
+The untimed reader hook captures the **actual projected Q, K, V and SDPA
+readout**, then reconstructs `softmax(Q @ K.T / sqrt(rank))` in FP32 with the
+same valid-memory mask. It never replaces the production SDPA call. BF16/fused
+SDPA can differ numerically; `attention_reconstruction_relative_error` compares
+the reconstructed readout to the actual one. Reader output is unchanged.
+
+`attention.md`, the console's `ATTN` lines and `paired_summary.csv` now include:
+scaled-score standard deviation; max weight; peak relative to uniform `N*max`;
+Top4/16/64 mass; entropy divided by `log(N)`; effective token count `exp(H)` and
+fraction; readout norm; weighted-value RMS norm ratio; departure from uniform
+averaging; and value-vector relative spread. Per-probe JSON additionally records
+the top eight selected-memory slot indices and their weights. These are memory
+slot indices, **not pixel coordinates or image-region boxes**.
+
+All attention mass is within visual memory and sums to one. Average weight
+`1/N` is therefore not a measure of whether the visual branch is used. Uniform
+attention gives normalized entropy/effective fraction/peak-versus-uniform near
+one. Top-K mass depends on N, and selecting K >= N always gives mass one.
+Sharp attention alone does not prove relevant evidence was selected: inspect
+actual readout, residual, logits and correct/wrong controls together. Empty
+memory is excluded; N=1 has no meaningful selectivity comparison.
+
+To inspect attention without repeating throughput or gradients:
+
+```bash
+PROBE_ONLY=1 EVAL_GPU=0 TESTS="charxiv_val textvqa" \
+EVAL_SAMPLES=16 PROBE_STRIDE=8 GRADIENT_SAMPLES=0 \
+bash tests/diagnose_memory.sh
+```
+
+This reuses original AR traces and donor mappings, probes original saved images
+and output lengths, and writes a fresh diagnosis directory. Read `attention.md`
+there. No new training is needed. Numerical unit tests cover uniform/selective
+attention, masks, identical values, cancellation, empty/singleton memory and
+unchanged actual-reader outputs in FP32/BF16 for raw and projected memory.

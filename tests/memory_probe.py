@@ -10,15 +10,32 @@ class ReaderCapture(AbstractContextManager):
         self.reader = reader
         self.handles = []
         self.gate = self.residual = self.ungated = None
+        self.attention_query = self.keys = self.values = self.valid = self.readout = None
 
     def __enter__(self):
+        def before(module, inputs):
+            bank = inputs[1]
+            self.valid = bank.valid.detach()
+            self.keys = getattr(bank, 'keys', None)
+            self.values = bank.values.detach()
+        def query(module, inputs, output):
+            self.attention_query = output.detach()
+        def key(module, inputs, output):
+            self.keys = output.detach()
+        def value(module, inputs, output):
+            self.values = output.detach()
         def gate(module, inputs, output):
             self.gate = output.detach().float().sigmoid()
         def ungated(module, inputs, output):
             self.ungated = output.detach()
+            self.readout = inputs[0].detach()
         def residual(module, inputs, output):
             self.residual = output.detach()
-        self.handles = [self.reader.gate.register_forward_hook(gate),
+        self.handles = [self.reader.register_forward_pre_hook(before),
+                        self.reader.query.register_forward_hook(query),
+                        self.reader.key.register_forward_hook(key),
+                        self.reader.value.register_forward_hook(value),
+                        self.reader.gate.register_forward_hook(gate),
                         self.reader.output.register_forward_hook(ungated),
                         self.reader.register_forward_hook(residual)]
         return self
@@ -39,13 +56,18 @@ class ReaderCapture(AbstractContextManager):
         denom = query.float().norm(dim=-1).clamp_min(1e-12)
         ratio = residual.float().norm(dim=-1) / denom
         applied = (updated.float() - query.float()).norm(dim=-1) / denom
-        return dict(gate_mean=float(gate.mean()), gate_min=float(gate.min()),
+        result = dict(gate_mean=float(gate.mean()), gate_min=float(gate.min()),
             gate_max=float(gate.max()), gate_below_001_fraction=float((gate < .01).float().mean()),
             ungated_norm=float(self.ungated.float().norm(dim=-1).mean()),
             residual_norm=float(residual.float().norm(dim=-1).mean()),
             query_norm=float(denom.mean()), residual_query_norm_ratio=float(ratio.mean()),
             applied_query_norm_ratio=float(applied.mean()),
             query_changed_fraction=float((updated != query).float().mean()))
+        if self.attention_query is not None and self.keys is not None:
+            from memory_attention import attention_summary
+            stats, details = attention_summary(self.attention_query, self.keys, self.values, self.valid, self.readout)
+            result.update(stats, attention_top_slots=details)
+        return result
 
 
 def compare_logits(reference, other):

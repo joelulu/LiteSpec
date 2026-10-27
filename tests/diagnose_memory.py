@@ -35,6 +35,7 @@ def run_logged(command, directory):
 
 
 def summarize(rows):
+    from memory_attention import ATTENTION_FIELDS
     groups = defaultdict(list)
     for row in rows:
         groups[row['dataset'], row['condition']].append(row)
@@ -43,7 +44,7 @@ def summarize(rows):
         'logits_mean_abs_delta', 'logits_max_abs_delta', 'logits_relative_rms_delta',
         'probability_l1', 'kl_correct_to_condition', 'proposal_token_agreement',
         'proposal_block_exact', 'residual_cosine_vs_correct', 'residual_difference_ratio_vs_correct',
-        'memory_tokens', 'target_next_matches_reference')
+        'memory_tokens', 'target_next_matches_reference', *ATTENTION_FIELDS)
     result = []
     for (dataset, condition), group in groups.items():
         entry = dict(dataset=dataset, condition=condition, probes=len(group),
@@ -88,12 +89,27 @@ def report(root, paired, closed):
         lines.append(f"| {r['dataset']} | {r['condition']} | {r['probes']} | {gate} | "
             f"{r['residual_query_norm_ratio']:.3e} | {r['applied_query_norm_ratio']:.3e} | "
             f"{100*r['query_changed_fraction']:.2f}% | {100*r['proposal_token_agreement']:.2f}% | {r['logits_mean_abs_delta']:.3e} |")
+    lines += ['', '## Visual-memory attention (FP32 reconstruction)', '',
+        'Attention is normalized only over visual memory: its total mass is always 1.',
+        'Uniform attention has normalized entropy 1, effective fraction 1 and peak/uniform 1.',
+        'Top-K mass depends on memory size. Sharp attention is not proof of useful evidence.', '',
+        '| Dataset | Condition | Memory N | Score std | Peak/uniform | Top16 mass | Norm entropy | Effective N | Readout/value | Δ from uniform/value |',
+        '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+    for r in summaries:
+        if r.get('attention_valid_tokens') is None:
+            continue
+        lines.append(f"| {r['dataset']} | {r['condition']} | {r['attention_valid_tokens']:.1f} | "
+            f"{r['attention_logit_std']:.4f} | {r['attention_peak_vs_uniform']:.2f} | "
+            f"{r['attention_top16_mass']:.3f} | {r['attention_entropy_normalized']:.3f} | "
+            f"{r['attention_effective_tokens']:.1f} | {r['attention_readout_value_ratio']:.3f} | "
+            f"{r['attention_readout_uniform_delta_ratio']:.3f} |")
     lines += ['', '## Gradient probe', '',
         'See gradient_probe.json: held-out-prefix teacher-forced CE, not historical training gradients.',
         'No optimizer is constructed. Weight values are never updated; gradients are cleared.',
         'Gate depends only on pivot in this checkpoint, so correct/wrong gate equality is expected.',
         'Small effect alone does not distinguish redundant visual evidence from an ineffective reader.']
     (root/'diagnostics.md').write_text('\n'.join(lines)+'\n')
+    (root/'attention.md').write_text('\n'.join(lines[lines.index('## Visual-memory attention (FP32 reconstruction)'):lines.index('## Gradient probe')])+'\n')
 
 
 def main():
@@ -219,6 +235,13 @@ def main():
         write_json(root/'gradient_probe.json', gradients)
         write_json(root/'closed_loop_summary.json', closed)
         report(root, paired, closed)
+        for r in summarize(paired):
+            if r['dataset'] == name and r.get('attention_valid_tokens') is not None:
+                print(f"ATTN {name} {r['condition']}: N={r['attention_valid_tokens']:.1f}, "
+                    f"score_std={r['attention_logit_std']:.4f}, peak/uniform={r['attention_peak_vs_uniform']:.2f}, "
+                    f"top16={r['attention_top16_mass']:.3f}, Hnorm={r['attention_entropy_normalized']:.3f}, "
+                    f"effective_N={r['attention_effective_tokens']:.1f}, "
+                    f"readout/value={r['attention_readout_value_ratio']:.3f}", flush=True)
     print(f'Report: {root / "diagnostics.md"}', flush=True)
 
 

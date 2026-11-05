@@ -4,6 +4,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PATHS = (
+    "litespec/vlm/pivot_augmentation.py",
+    "litespec/vlm/pivot_training.py",
+    "tests/train_pivot_augmentation.sh",
+    "tests/evaluate_pivot_augmentation.sh",
+    "tests/test_pivot_augmentation.py",
     "litespec/core/dlite.py",
     "litespec/modeling/draft/dlite.py",
     "litespec/vlm/runtime.py",

@@ -53,11 +53,12 @@ def report(root,rows):
         'K includes the current pivot; each time position retains all selected Target layers.',
         'B is replicated batch size, not online concurrency. Greedy, per_token, decode-only raw ratios.',
         'Inference overrides on old checkpoints are zero-shot interventions, not trained-window models.', '',
-        '| Dataset | Model | K | B | Accept | tok/s | Speedup | Prefill s | Peak GiB | Match |',
-        '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|']
+        '| Dataset | Model | K | B | Accept | First hit | tok/s | Speedup | Prefill s | Peak GiB | Match |',
+        '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for r in rows:
         tau=r['accept_length']
-        lines.append(f"| {r['dataset']} | {r['model']} | {r['window'] if r['window'] else '—'} | {r['batch_size']} | {f'{tau:.3f}' if tau is not None else '—'} | {r['tok_s']:.2f} | {r['speedup']:.3f}× | {r['prefill_seconds']:.2f} | {r['peak_gib']:.3f} | {r['matched']}/{r['requests']} |")
+        hit=r.get('first_candidate_hit_rate')
+        lines.append(f"| {r['dataset']} | {r['model']} | {r['window'] if r['window'] else '—'} | {r['batch_size']} | {f'{tau:.3f}' if tau is not None else '—'} | {f'{hit:.1%}' if hit is not None else '—'} | {r['tok_s']:.2f} | {r['speedup']:.3f}× | {r['prefill_seconds']:.2f} | {r['peak_gib']:.3f} | {r['matched']}/{r['requests']} |")
     (root/'comparison.md').write_text('\n'.join(lines)+'\n')
 
 
@@ -99,6 +100,9 @@ def main():
         selected_files[case]=root/f'{case}.jsonl'
         selected_files[case].write_text(packet['serialized'])
     settings['snapshots']={case:dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest()) for case,path in selected_files.items()}
+    settings['pivot_augmentation_off'] = os.environ.get('PIVOT_AUGMENTATION_OFF') == '1'
+    for label,path in models.items():
+        settings['checkpoints'][label]['pivot_augmentation'] = json.loads((path/'config.json').read_text()).get('dlite_config',{}).get('pivot_augmentation')
     (root/'settings.json').write_text(json.dumps(settings,default=str,indent=2))
     target_cfg=json.loads((args.target_model.expanduser()/'config.json').read_text())['vision_config']
     pixels=args.image_max_tokens*(target_cfg['patch_size']*target_cfg['spatial_merge_size'])**2
@@ -123,6 +127,7 @@ def main():
                 label=row['model']
                 rows.append(dict(dataset=case,model=label,window=0 if label=='ar' else (row.get('context_window_size') or window or 1),
                     batch_size=row['batch_size'],accept_length=row['mean_committed_length'],
+                    first_candidate_hit_rate=row.get('first_candidate_hit_rate'),
                     tok_s=row['decode_tok_s'] if video else row['output_tokens_per_second'],
                     speedup=row['raw_decode_ratio_vs_ar'] if video else row['raw_throughput_speedup_vs_ar'],
                     prefill_seconds=row['prefill_seconds'],peak_gib=row['peak_allocated_gib'],
@@ -134,3 +139,4 @@ def main():
 
 
 if __name__=='__main__':main()
+

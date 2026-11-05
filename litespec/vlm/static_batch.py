@@ -115,6 +115,9 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     if max_new_tokens < 1 or verification not in {"block", "sequential"}:
         raise ValueError("positive output cap and block/sequential verification required")
     baseline = draft is not None and is_baseline(draft)
+    augmentation = getattr(draft, "pivot_augmentation", None) if draft is not None else None
+    if augmentation is not None and verification != "block":
+        raise ValueError("pivot augmentation evaluation requires block verification")
     if draft is not None and not baseline and not draft.is_student:
         raise ValueError("static batch DLite benchmark requires a history-free student")
     if baseline:
@@ -139,6 +142,10 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
              if draft is not None and getattr(draft, "context_window_size", 1) == 1 else None)
     history = DraftCache(draft, target, output, anchor) if baseline else None
     recent = None
+    augmentation_state = None
+    if augmentation is not None and augmentation.mode in ("B", "C", "D1", "D2"):
+        from .pivot_augmentation import AugmentationState
+        augmentation_state = AugmentationState(draft, target, output.hidden_states, anchor)
     if draft is not None and not baseline and getattr(draft, "context_window_size", 1) > 1:
         from .sw_token import RecentTargetWindow
         recent = RecentTargetWindow(draft, output.hidden_states, anchor)
@@ -150,6 +157,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         timeline = DecodeTimeline(device)
     blocks, lengths, emitted, replays, target_calls = [], [], 0, 0, 0
     peak_snapshot_bytes = 0
+    first_candidate_hits = first_candidate_opportunities = 0
     while emitted < max_new_tokens:
         if draft is None:
             if timeline: timeline.mark("emit")
@@ -164,7 +172,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                     pivot, pivot_keep = recent.context()
                 hidden, _ = draft_block(draft, target.get_input_embeddings(), anchor_ids=pending,
                     pivot=pivot, history=None, anchor=anchor, prefill_length=example.prefill_length,
-                    vision_mask=example.vision_mask, policy=ContextPolicy.no_history(), pivot_keep=pivot_keep)
+                    vision_mask=example.vision_mask, policy=ContextPolicy.no_history(), pivot_keep=pivot_keep,
+                    augmentation_data=augmentation_state.data() if augmentation_state else {})
                 proposals = draft.sample_draft_tokens(draft_hidden=hidden,
                     first_prev_token_ids=pending[:, 0], temperature=0.0)[0]
             candidates = torch.cat([pending, proposals], 1)[:, :max_new_tokens-emitted]
@@ -207,6 +216,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                 predictions = output.logits.argmax(-1)
                 accepted = (candidates[:, 1:] == predictions[:, :-1]).cumprod(1).sum(1)
                 kept = int(accepted.min()) + 1
+                if augmentation_state is not None:
+                    augmentation_state.capture_feedback(output.hidden_states, candidates, kept, predictions)
                 if transaction is not None:
                     if timeline: timeline.mark("state_select" if state_mode == "per_token" else "gdn_state_replay")
                     transaction.commit(cache, kept, candidates.shape[1])
@@ -235,6 +246,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                     pending = predictions[:, kept-1:kept]
                 del snapshot
             if timeline: timeline.mark("hidden_features")
+            if augmentation_state is not None:
+                augmentation_state.commit(output.hidden_states, kept)
             if recent is not None:
                 recent.commit(output.hidden_states, kept, anchor)
             else:
@@ -249,6 +262,9 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         end_positions = torch.isin(candidates[0, :kept], eos_ids).nonzero()
         stop = end_positions.numel() > 0
         actual = int(end_positions[0, 0]) + 1 if stop else kept
+        if draft is not None and candidates.size(1) > 1 and not (stop and actual == 1):
+            first_candidate_opportunities += batch_size
+            first_candidate_hits += batch_size * int(kept >= 2)
         blocks.append(candidates[:, :actual].clone())
         emitted += actual
         if draft is not None:
@@ -274,6 +290,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         prefill_seconds=prefill_end-started, decode_seconds=finished-prefill_end,
         total_seconds=finished-started, target_decode_calls=target_calls,
         recovery_replays=replays, replicas_identical=True,
+        first_candidate_hits=first_candidate_hits,
+        first_candidate_opportunities=first_candidate_opportunities,
         cache_policy="preallocated_attention_kv_recurrent_snapshot_and_prefix_replay",
         verification=verification, state_mode=state_mode,
         gdn_verify_backend="native_hf" if transaction is None else
@@ -288,3 +306,4 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     if timeline:
         result['profile'] = timeline.resolve(result['decode_seconds'])
     return result
+

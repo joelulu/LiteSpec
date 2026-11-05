@@ -52,6 +52,9 @@ def make_draft(target, processor, cfg):
         target_layer_ids=layers, sequential_head="rnn", sequential_rank=cfg.get("sequential_rank", 64),
         mask_token_id=mask_id, context_window_size=int(cfg.get("context_window_size", 1)),
     )
+    if cfg.get("pivot_augmentation"):
+        config.dlite_config["pivot_augmentation"] = dict(cfg["pivot_augmentation"])
+        config.dlite_config["forbidden_proposal_ids"] = [getattr(target.config, k) for k in ("image_token_id", "video_token_id") if isinstance(getattr(target.config, k, None), int) and 0 <= getattr(target.config, k) < text.vocab_size]
     if role == "swa_teacher":
         # The VLM reference path explicitly selects history positions; it does
         # not invoke the legacy SWA inference/training path.

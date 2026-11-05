@@ -126,7 +126,7 @@ def reuse_validation(records, cfg, directory):
     """Recover the exact eligible set from a completed old preflight, not weights."""
     directory = Path(directory).expanduser().resolve()
     previous = json.loads((directory / "effective_config.json").read_text())
-    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples", "image_max_tokens"):
+    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples", "image_max_tokens", "pivot_two_rounds"):
         if previous.get(key) != cfg.get(key):
             raise ValueError(f"validation reuse mismatch: {key}; run preflight again")
     skipped, excluded = [], set()
@@ -180,7 +180,11 @@ def validate_records(records, processor, config, cfg, base_dir):
         except ValueError as exc:
             skipped.append({"index": index, "id": record["id"], "reason": str(exc)})
             continue
-        if has_anchor(example, cfg["block_size"]):
+        compatible = has_anchor(example, cfg["block_size"])
+        if cfg.get("pivot_two_rounds"):
+            from .pivot_training import eligible_anchors
+            compatible = bool(eligible_anchors(loss_mask(example), cfg["block_size"]).any())
+        if compatible:
             valid.append(index)
         else:
             skipped.append({"index": index, "id": record["id"],
@@ -213,13 +217,17 @@ def make_online(target, draft, cfg):
     if cfg.get("algorithm", "dlite") != "dlite":
         from .baselines import make_online as baseline_online
         return baseline_online(target, draft, cfg)
-    if getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False):
+    if cfg.get("pivot_two_rounds"):
+        from .pivot_training import OnlinePivot
+        draft.config._attn_implementation = "sdpa"
+        cls = OnlinePivot
+    elif getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False):
         from .sw_token import OnlineSWToken
         draft.config._attn_implementation = "sdpa"
         cls = OnlineSWToken
     else:
         cls = CPUReferenceDLite if draft.device.type == "cpu" else OnlineDLiteModel
-    return cls(
+    online = cls(
         draft, target.get_output_embeddings(), target.get_input_embeddings(),
         draft.mask_token_id, cfg["block_size"], attention_backend="flex_attention",
         flex_attention_backend=cfg["flex_attention_backend"], num_anchors=cfg["num_anchors"],
@@ -227,12 +235,22 @@ def make_online(target, draft, cfg):
         l1_loss_weight=cfg["l1_loss_weight"], base_lm_ce_weight=cfg["base_lm_ce_weight"],
         base_lm_ce_decay_gamma=cfg.get("base_lm_ce_decay_gamma"), use_target_greedy_ce_labels=True,
     )
+    if cfg.get("pivot_two_rounds"):
+        online.bind_target(target)
+        online.rollout_anchors = int(cfg.get("rollout_anchors", 4))
+        if online.rollout_anchors < 1:
+            raise ValueError("rollout_anchors must be positive")
+    return online
 
 
 def prepare_forward(target, online, example):
     """Original anchors/labels/positions; HF target retains its image and MRoPE inputs."""
     ids = example.inputs["input_ids"]
     mask = loss_mask(example)
+    if hasattr(online, "rollout_anchors"):
+        from .pivot_training import repeat_examples
+        return dict(rollout_inputs=repeat_examples(example.inputs, online.rollout_anchors),
+                    rollout_mask=mask.repeat(online.rollout_anchors, 1))
     from .baselines import is_baseline, prepare_forward as baseline_forward
     if is_baseline(online.draft_model):
         return baseline_forward(target, online, example, mask)
@@ -287,7 +305,10 @@ def restore_rng(value):
 def save(session, name):
     """Atomic inference export, with optional rank-local resumable state."""
     root = Path(session.args.output_dir)
-    destination = root / f"step_{session.state.optimizer_step:07d}"
+    final_only = session.vlm_config.get("final_only", False)
+    if final_only and name != session.phases[0].final_checkpoint:
+        return
+    destination = root / ("last" if final_only else f"step_{session.state.optimizer_step:07d}")
     exists = destination.exists() if rank() == 0 else None
     if dist.is_initialized():
         values = [exists]
@@ -322,9 +343,10 @@ def save(session, name):
         (staging / "checkpoint.json").write_text(json.dumps(dict(world_size=world(), cursor=asdict(session.state),
                                                                resumable=session.save_training_state)))
         os.replace(staging, destination)
-        link = root / (".last-" + uuid.uuid4().hex)
-        link.symlink_to(destination.name, target_is_directory=True)
-        os.replace(link, root / "last")
+        if not final_only:
+            link = root / (".last-" + uuid.uuid4().hex)
+            link.symlink_to(destination.name, target_is_directory=True)
+            os.replace(link, root / "last")
         print(f"Saved checkpoint: {destination}", flush=True)
     if dist.is_initialized():
         dist.barrier()
@@ -372,7 +394,7 @@ def log(session, window, grad_norm):
                               metrics={k: float(v) for k, v in metrics.items()})), flush=True)
     # Preserve upstream cross-epoch accumulation: export at the first update
     # boundary after an epoch, never discard or serialize partial gradients.
-    if completed > session.last_exported_epoch:
+    if completed > session.last_exported_epoch and not session.vlm_config.get("final_only", False):
         save(session, f"epoch_{completed}")
         session.last_exported_epoch = completed
 
@@ -393,6 +415,12 @@ def run(argv=None):
                         help="optional scalar tracking; defaults to YAML report_to")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
+    if cfg.get("pivot_two_rounds"):
+        if args.resume or args.init_checkpoint or cfg.get("init_checkpoint"):
+            raise ValueError("pivot screen runs must train from scratch")
+        if args.save_training_state:
+            raise ValueError("pivot screen saves final inference weights only")
+        cfg["final_only"] = True
     init = args.init_checkpoint or cfg.get("init_checkpoint")
     if init:
         if args.resume:
@@ -478,7 +506,7 @@ def run(argv=None):
         from .baselines import make_draft as make_baseline
         draft = make_baseline(target, processor, cfg)
     draft.config._attn_implementation = (
-        "sdpa" if device == "cpu" or getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False) else "flex_attention")
+        "sdpa" if device == "cpu" or cfg.get("pivot_two_rounds") or getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False) else "flex_attention")
     draft.config.vlm_config["training"] = "upstream_sft_v1"
     if saved is not None:
         from .baselines import load_draft
@@ -488,6 +516,9 @@ def run(argv=None):
     online = make_online(target, draft, cfg)
     # Match upstream registration names and ownership before FSDP changes shapes.
     parameters, specs = register_optimizer_parameters(draft)
+    if cfg.get("pivot_two_rounds"):
+        cfg["draft_trainable_parameters"] = sum(p.numel() for p in parameters)
+        cfg["augmentation_parameters"] = sum(p.numel() for p in draft.pivot_augmentation.parameters())
     fsdp = online
     layouts = None
     if device != "cpu":

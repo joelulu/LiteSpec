@@ -118,7 +118,7 @@ def selected_layers(states, ids, depth):
 
 
 def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
-                prefill_length, vision_mask, policy, pivot_keep=None, rotary_shift=0):
+                prefill_length, vision_mask, policy, pivot_keep=None, rotary_shift=0, augmentation_data=None):
     """One block, identical context selection during training and decoding."""
     student = draft.is_student
     if student and not policy.is_empty:
@@ -181,7 +181,7 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
     output = draft(
         noise_embedding=query, target_hidden=pivot, position_ids=q_pos,
         rotary_position_ids=torch.cat([context_pos, q_pos], dim=-1),
-        attention_mask=attention_mask, is_causal=False, **kwargs,
+        attention_mask=attention_mask, is_causal=False, augmentation_data=augmentation_data, **kwargs,
     )
     return draft._prediction_hidden(output), {"physical_history": physical, "visible_history": visible}
 
@@ -189,8 +189,8 @@ def draft_block(draft, embedding, *, anchor_ids, pivot, history, anchor,
 @torch.no_grad()
 def generate_steps(target, draft, example, *, max_new_tokens=128, policy=None, verification="block"):
     """Greedy chain verification with exact accepted-prefix cache recovery."""
-    if draft is not None and getattr(draft, "context_window_size", 1) > 1:
-        raise ValueError("multi-position windows require generate_static_batch / the video benchmark adapter")
+    if draft is not None and (getattr(draft, "context_window_size", 1) > 1 or getattr(draft, "pivot_augmentation", None) is not None):
+        raise ValueError("window/augmentation models require generate_static_batch / the video benchmark adapter")
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
     if verification not in {"block", "sequential"}:
@@ -367,3 +367,4 @@ def read_records(path, limit=None):
                 record = json.loads(line)
                 record.setdefault("id", str(index))
                 yield record
+

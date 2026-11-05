@@ -24,8 +24,10 @@ def summarize_batches(results, batch_size):
     decode = sum(row["decode_seconds"] for row in results)
     total = sum(row["total_seconds"] for row in results)
     lengths = [length for row in results for length in row["accept_lengths"]]
+    opportunities = sum(row.get("first_candidate_opportunities", 0) for row in results)
     return dict(batch_size=batch_size, concurrency=batch_size, unique_prompts=len(results),
         requests=len(results)*batch_size, output_tokens=tokens,
+        first_candidate_hit_rate=(sum(row.get("first_candidate_hits", 0) for row in results)/opportunities if opportunities else None),
         output_tokens_per_second=tokens/decode, decode_tokens_per_second=tokens/decode,
         end_to_end_tokens_per_second=tokens/total,
         prefill_seconds=prefill, decode_seconds=decode, wall_seconds=total,
@@ -263,3 +265,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

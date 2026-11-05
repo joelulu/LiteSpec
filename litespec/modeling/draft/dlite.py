@@ -145,6 +145,7 @@ class DLiteSequentialHead(nn.Module):
         hidden_states: torch.Tensor,
         first_prev_token_ids: torch.Tensor,
         temperature: float = 0.0,
+        forbidden_token_ids: tuple = (),
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Serially sample a block and return token IDs and sampling logits."""
         if hidden_states.ndim != 3:
@@ -170,6 +171,9 @@ class DLiteSequentialHead(nn.Module):
                 state=state,
             )
             step_logits = self.project_logits(latent)
+            if forbidden_token_ids:
+                step_logits = step_logits.clone()
+                step_logits[:, list(forbidden_token_ids)] = -float("inf")
             next_token_ids = _sample_sequential_tokens(step_logits, float(temperature))
             sampled_tokens.append(next_token_ids.unsqueeze(1))
             final_logits.append(step_logits.unsqueeze(1))
@@ -776,6 +780,14 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         )
 
         self.post_init()
+        self.pivot_augmentation = None
+        if dlite_config.get("pivot_augmentation"):
+            from litespec.vlm.pivot_augmentation import PivotAugmentation
+            if not self.is_student or self.context_window_size != 1:
+                raise ValueError("pivot augmentation requires a K=1 student")
+            # Common backbone initialization is identical in every experiment.
+            with torch.random.fork_rng(devices=[]):
+                self.pivot_augmentation = PivotAugmentation(config)
 
     @property
     def chs_len_per_block(self) -> int:
@@ -1220,6 +1232,10 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = noise_embedding
+        augmentation_data = kwargs.pop("augmentation_data", None)
+        raw_pivot = target_hidden
+        if self.pivot_augmentation is not None:
+            target_hidden, hidden_states = self.pivot_augmentation.inputs(target_hidden, hidden_states, augmentation_data)
         if shared_history is not None:
             if target_hidden is None or target_hidden.ndim != 4:
                 raise ValueError(
@@ -1242,7 +1258,10 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         # Qwen3RotaryEmbedding only reads x.device and x.dtype. Passing the
         # existing activation avoids allocating a dense (B, KV_LEN, H) dummy;
         position_embeddings = self.rotary_emb(hidden_states, rotary_position_ids)
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
+            if self.pivot_augmentation is not None:
+                depth = self.layer_depth_embedding.weight[self.target_layer_ids]
+                hidden_states = self.pivot_augmentation.layer_residual(layer_index, hidden_states, raw_pivot, augmentation_data, depth)
             hidden_states = layer(
                 hidden_states=hidden_states,
                 target_hidden=target_hidden,
@@ -1268,6 +1287,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
             if compiled_sampler is None:
                 sequential_head = self.sequential_head
                 fixed_temperature = float(temperature)
+                forbidden = tuple(self.config.dlite_config.get("forbidden_proposal_ids", ()))
 
                 def serial_sampler(
                     hidden_states: torch.Tensor,
@@ -1277,6 +1297,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                         hidden_states=hidden_states,
                         first_prev_token_ids=previous_ids,
                         temperature=fixed_temperature,
+                        forbidden_token_ids=forbidden,
                     )
 
                 compiled_sampler = torch.compile(
@@ -1290,6 +1311,7 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
             hidden_states=draft_hidden,
             first_prev_token_ids=first_prev_token_ids,
             temperature=temperature,
+            forbidden_token_ids=tuple(self.config.dlite_config.get("forbidden_proposal_ids", ())),
         )
 
     @torch.inference_mode()
@@ -1311,8 +1333,8 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
         stochastic_verification_mode = _validate_stochastic_verification_mode(
             stochastic_verification_mode
         )
-        if self.context_window_size > 1:
-            raise ValueError("multi-position checkpoints require the VLM static/video inference adapter")
+        if self.context_window_size > 1 or self.pivot_augmentation is not None:
+            raise ValueError("window/augmentation checkpoints require the VLM static/video inference adapter")
         self._last_decode_stats = {
             "accept_lengths": [],
             "decode_wall_time": 0.0,
@@ -1577,3 +1599,4 @@ class DLiteDraftModel(Qwen3PreTrainedModel):
                 ]
 
         return output_ids
+

@@ -21,7 +21,11 @@ def load_draft(path, **kwargs):
     name = config.architectures[0]
     if name not in classes:
         raise ValueError(f"unsupported VLM draft architecture: {name}")
-    return classes[name].from_pretrained(path, **kwargs)
+    draft = classes[name].from_pretrained(path, **kwargs)
+    import os
+    if os.environ.get("PIVOT_AUGMENTATION_OFF") == "1" and getattr(draft, "pivot_augmentation", None) is not None:
+        draft.pivot_augmentation.enabled = False
+    return draft
 
 
 def make_draft(target, processor, cfg):
@@ -109,3 +113,4 @@ class DraftCache:
 
     def commit(self, draft, output, kept):
         self.hidden = self.features(draft, output)[:, :kept]
+

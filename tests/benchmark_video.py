@@ -190,12 +190,14 @@ def main():
                 decode=sum(r['decode_seconds'] for r in results)
                 total=sum(r['total_seconds'] for r in results)
                 lengths=[n for r in results for n in r['accept_lengths']]
+                opportunities=sum(r.get('first_candidate_opportunities',0) for r in results)
                 matched=batch*sum(True if references is None else r['token_ids']==ref['token_ids']
                                   for r,ref in zip(results,references or results))
                 summary=dict(dataset=dataset,model=label,batch_size=batch,unique_videos=len(results),
                     requests=len(results)*batch,output_tokens=tokens,prefill_seconds=prefill,decode_seconds=decode,
                     total_seconds=total,decode_tok_s=tokens/decode,end_to_end_tok_s=tokens/total,
                     mean_committed_length=sum(lengths)/len(lengths) if lengths else None,
+                    first_candidate_hit_rate=(sum(r.get('first_candidate_hits',0) for r in results)/opportunities if opportunities else None),
                     mean_accepted_draft_tokens=sum(n-1 for n in lengths)/len(lengths) if lengths else None,
                     speculative_rounds=len(lengths),matched=matched,valid_token_match=matched==len(results)*batch,
                     peak_allocated_gib=torch.cuda.max_memory_allocated()/1024**3,
@@ -217,3 +219,4 @@ def main():
 
 
 if __name__=='__main__': main()
+

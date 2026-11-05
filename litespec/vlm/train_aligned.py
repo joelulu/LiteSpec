@@ -126,7 +126,7 @@ def reuse_validation(records, cfg, directory):
     """Recover the exact eligible set from a completed old preflight, not weights."""
     directory = Path(directory).expanduser().resolve()
     previous = json.loads((directory / "effective_config.json").read_text())
-    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples"):
+    for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples", "image_max_tokens"):
         if previous.get(key) != cfg.get(key):
             raise ValueError(f"validation reuse mismatch: {key}; run preflight again")
     skipped, excluded = [], set()
@@ -213,7 +213,12 @@ def make_online(target, draft, cfg):
     if cfg.get("algorithm", "dlite") != "dlite":
         from .baselines import make_online as baseline_online
         return baseline_online(target, draft, cfg)
-    cls = CPUReferenceDLite if draft.device.type == "cpu" else OnlineDLiteModel
+    if getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False):
+        from .sw_token import OnlineSWToken
+        draft.config._attn_implementation = "sdpa"
+        cls = OnlineSWToken
+    else:
+        cls = CPUReferenceDLite if draft.device.type == "cpu" else OnlineDLiteModel
     return cls(
         draft, target.get_output_embeddings(), target.get_input_embeddings(),
         draft.mask_token_id, cfg["block_size"], attention_backend="flex_attention",
@@ -377,6 +382,7 @@ def run(argv=None):
     parser.add_argument("--config", required=True)
     for flag in ("target-model", "train-data", "output-dir", "resume"):
         parser.add_argument("--" + flag)
+    parser.add_argument("--init-checkpoint", help="weights-only warm start; fresh optimizer and schedule")
     parser.add_argument("--max-steps", type=int, help="explicit debug optimizer-update cap; unset trains all six epochs")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--reuse-validation-from", type=Path,
@@ -387,6 +393,13 @@ def run(argv=None):
                         help="optional scalar tracking; defaults to YAML report_to")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
+    init = args.init_checkpoint or cfg.get("init_checkpoint")
+    if init:
+        if args.resume:
+            raise ValueError("init-checkpoint and resume are mutually exclusive")
+        from .sw_token import warm_start_config
+        init = str(Path(init).expanduser().resolve(strict=True))
+        warm_start_config(cfg, init)
     if args.report_to is not None:
         cfg["report_to"] = args.report_to
     for key in ("target_model", "train_data", "output_dir"):
@@ -418,6 +431,9 @@ def run(argv=None):
     torch.manual_seed(cfg["seed"])
     target, processor = load_target(cfg["target_model"], device=device,
                                     dtype=torch.float32 if device == "cpu" else torch.bfloat16)
+    if cfg.get("image_max_tokens") is not None:
+        from .sw_token import configure_image_tokens
+        cfg["effective_image_processor_size"] = configure_image_tokens(processor,target.config,int(cfg["image_max_tokens"]))
     path = Path(cfg["train_data"])
     records = list(read_records(path, args.max_samples or None))
     cfg["data_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -453,12 +469,16 @@ def run(argv=None):
         if saved["schema"] != "vlm_upstream_sft_v1" or saved["config"] != cfg:
             raise ValueError("resume configuration/data/world-size differs")
     torch.manual_seed(cfg["seed"])
-    if cfg.get("algorithm", "dlite") == "dlite":
+    if init:
+        from .sw_token import load_warm_start
+        draft = load_warm_start(init, target, cfg)
+    elif cfg.get("algorithm", "dlite") == "dlite":
         draft = make_draft(target, processor, cfg)
     else:
         from .baselines import make_draft as make_baseline
         draft = make_baseline(target, processor, cfg)
-    draft.config._attn_implementation = "sdpa" if device == "cpu" else "flex_attention"
+    draft.config._attn_implementation = (
+        "sdpa" if device == "cpu" or getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False) else "flex_attention")
     draft.config.vlm_config["training"] = "upstream_sft_v1"
     if saved is not None:
         from .baselines import load_draft
@@ -538,3 +558,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

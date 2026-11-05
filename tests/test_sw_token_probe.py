@@ -185,3 +185,62 @@ def test_bfloat16_masked_controls_restore_first_proposal():
         result=compare_conditions(base,current,atol=0.05,rtol=0.01)
         assert result['hidden_close'] and result['logits_close'] and result['first_proposal_equal']
         assert all(a['old_mass']==0. for a in current['attention'])
+
+
+
+@torch.no_grad()
+def test_draft_only_float32_preserves_target_and_bf16_context():
+    target,draft,_,example=fixture_model()
+    draft.eval();probe=fixed_probe(target,draft,example)
+    target.to(dtype=torch.bfloat16);draft.to(dtype=torch.bfloat16)
+    rounded=draft.layers[0].self_attn.q_proj.weight.detach().clone()
+    draft.to(dtype=torch.float32)
+    torch.testing.assert_close(draft.layers[0].self_attn.q_proj.weight,rounded.float(),rtol=0,atol=0)
+    probe['context']=probe['context'].to(dtype=torch.bfloat16)
+    context=probe['context'].clone()
+    embed=target.get_input_embeddings();weight=embed.weight.detach().clone()
+    from sw_token_probe import DraftPrecisionEmbedding
+    wrapper=DraftPrecisionEmbedding(embed,draft.dtype)
+    assert wrapper.weight is embed.weight
+    assert wrapper(probe['pending']).dtype==torch.float32
+    base=run_condition(draft,embed,probe,'k1')
+    for name in ('k2_pivot_only','k2_pivot_only_origin0'):
+        result=run_condition(draft,embed,probe,name)
+        assert result['hidden'].dtype==torch.float32
+        compared=compare_conditions(base,result,atol=1e-5,rtol=1e-4)
+        assert compared['hidden_close'] and compared['logits_close'] and compared['first_proposal_equal']
+    assert target.dtype==torch.bfloat16
+    torch.testing.assert_close(embed.weight,weight,rtol=0,atol=0)
+    torch.testing.assert_close(probe['context'],context,rtol=0,atol=0)
+
+
+def test_reused_prefixes_reject_changed_ar_tokens(tmp_path,monkeypatch):
+    import diagnose_sw_token as cli
+    target,draft,_,_=fixture_model();target.eval();target.config.text_config.eos_token_id=-1
+    parent=tmp_path/'parent';draft.save_pretrained(parent)
+    processor=Processor()
+    raw_apply=processor.apply_chat_template
+    def deterministic_apply(*args,**kwargs):
+        with torch.random.fork_rng():
+            torch.manual_seed(123)
+            return raw_apply(*args,**kwargs)
+    processor.apply_chat_template=deterministic_apply
+    processor.image_processor=type('Image',(),{'size':dict(shortest_edge=16,longest_edge=1024)})()
+    monkeypatch.setattr(cli,'load_target',lambda *a,**kw:(target,processor))
+    monkeypatch.setattr(cli,'select_data',lambda args:{'textvqa':dict(source='fixture',serialized=json.dumps(dict(id='one',question='what?'))+'\n')})
+    common=['--workspace',str(tmp_path),'--checkpoint',str(parent),'--target-model','tiny',
+        '--device','cpu','--samples','1','--max-new-tokens','9','--stride','1','--probes-per-sample','3']
+    prior=tmp_path/'prior'
+    cli.main(common+['--output-dir',str(prior)])
+    monkeypatch.setattr(cli,'select_data',lambda *a:(_ for _ in ()).throw(AssertionError('must reuse selection')))
+    out=tmp_path/'promoted'
+    cli.main(common+['--output-dir',str(out),'--draft-dtype','float32','--reuse-prefixes-from',str(prior)])
+    summary=json.loads((out/'summary.json').read_text())
+    assert summary['prefixes_verified_against_previous']
+    assert summary['draft_compute_dtype']=='torch.float32'
+    bad=json.loads((prior/'ar_sequences.jsonl').read_text())
+    bad['tokens'][0]=(bad['tokens'][0]+1)%128
+    (prior/'ar_sequences.jsonl').write_text(json.dumps(bad)+'\n')
+    with pytest.raises(ValueError,match='Target AR prefix changed'):
+        cli.main(common+['--output-dir',str(tmp_path/'bad'),'--draft-dtype','float32','--reuse-prefixes-from',str(prior)])
+    assert (tmp_path/'bad/prefix_mismatch.json').is_file()

@@ -7,6 +7,8 @@ export PYTHON_BIN="${PYTHON_BIN:-$DLITE_WORKSPACE/LiteSpec/.venv-vlm/bin/python}
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES="${EVAL_GPU:-7}"
 "$PYTHON_BIN" tests/check_sw_token_source.py
+extra=()
+if [[ -n "${REUSE_PREFIXES_FROM:-}" ]]; then extra+=(--reuse-prefixes-from "$REUSE_PREFIXES_FROM"); fi
 "$PYTHON_BIN" tests/diagnose_sw_token.py \
   --workspace "$DLITE_WORKSPACE" \
   --checkpoint "${INIT_CHECKPOINT:-$DLITE_WORKSPACE/runs/vlm_three_3ep_20261021_045040_2983971/dlite/last}" \
@@ -15,4 +17,6 @@ export CUDA_VISIBLE_DEVICES="${EVAL_GPU:-7}"
   --samples "${EVAL_SAMPLES:-16}" --seed "${SAMPLE_SEED:-42}" \
   --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-256}" \
   --image-max-tokens "${IMAGE_MAX_TOKENS:-1024}" \
-  --stride "${PROBE_STRIDE:-8}" --probes-per-sample "${PROBES_PER_SAMPLE:-16}" "$@"
+  --stride "${PROBE_STRIDE:-8}" --probes-per-sample "${PROBES_PER_SAMPLE:-16}" \
+  --draft-dtype "${DRAFT_DTYPE:-target}" "${extra[@]}" "$@"
+

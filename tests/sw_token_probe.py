@@ -11,6 +11,21 @@ from litespec.vlm.static_batch import make_hybrid_cache
 CONDITIONS = ('k1', 'k2', 'k2_pivot_only', 'k2_pivot_only_origin0')
 
 
+class DraftPrecisionEmbedding:
+    """Cast lookup outputs only; never convert shared Target embedding weights."""
+    def __init__(self, embedding, dtype):
+        self.embedding = embedding
+        self.dtype = dtype
+
+    @property
+    def weight(self):
+        # Keep OOV MASK fallback detection/mean in the original Target dtype.
+        return self.embedding.weight
+
+    def __call__(self, ids):
+        return self.embedding(ids).to(dtype=self.dtype)
+
+
 @contextmanager
 def preserve_window(draft):
     old = draft.context_window_size
@@ -135,7 +150,8 @@ def run_condition(draft, embedding, probe, condition, *, capture=True):
         k = 1 if condition == 'k1' else 2
         set_window(draft, k)
         slots = draft.chs_num_layers
-        context, keep = probe['context'], probe['keep'].clone()
+        context = probe['context'].to(dtype=draft.dtype)
+        keep = probe['keep'].clone()
         if k == 1:
             context, keep = context[:, :, -slots:], keep[:, -slots:]
         elif condition.startswith('k2_pivot_only'):
@@ -143,7 +159,7 @@ def run_condition(draft, embedding, probe, condition, *, capture=True):
         observer = AttentionMass(slots, keep)
         shift = -1 if condition == 'k2_pivot_only_origin0' else 0
         with observe_attention(draft, observer if capture else None):
-            hidden, _ = draft_block(draft, embedding, anchor_ids=probe['pending'],
+            hidden, _ = draft_block(draft, DraftPrecisionEmbedding(embedding, draft.dtype), anchor_ids=probe['pending'],
                 pivot=context, pivot_keep=keep, history=None, anchor=probe['anchor'],
                 prefill_length=probe['anchor']-probe['offset'], vision_mask=None,
                 policy=ContextPolicy.no_history(), rotary_shift=shift)
@@ -174,3 +190,4 @@ def compare_conditions(base, current, *, atol, rtol):
         logits_close=torch.allclose(base['logits'],current['logits'],atol=atol,rtol=rtol),
         first_proposal_equal=bool(base['proposals'][0,0]==current['proposals'][0,0]),
         proposal_agreement=float(base['proposals'][0,:n].eq(current['proposals'][0,:n]).float().mean()))
+

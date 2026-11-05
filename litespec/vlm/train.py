@@ -50,7 +50,7 @@ def make_draft(target, processor, cfg):
     config.dlite_config = dict(
         architecture_version="dlite_v2", model_role=role, chs_num_layers=len(layers),
         target_layer_ids=layers, sequential_head="rnn", sequential_rank=cfg.get("sequential_rank", 64),
-        mask_token_id=mask_id,
+        mask_token_id=mask_id, context_window_size=int(cfg.get("context_window_size", 1)),
     )
     if role == "swa_teacher":
         # The VLM reference path explicitly selects history positions; it does
@@ -295,3 +295,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

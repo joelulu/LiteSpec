@@ -93,6 +93,8 @@ class OnlineSWToken(OnlineDLiteModel):
 
     def forward_backbone(self,batch,*,seq_len):
         draft=self.draft_model
+        if batch.sw_source is None:
+            raise ValueError('windowed training requires prepared sw_source; use OnlineSWToken.prepare_batch')
         b,n=batch.anchor_positions.shape
         chunks=[]
         for start in range(0,n,self.chunk_blocks):
@@ -169,3 +171,4 @@ def configure_image_tokens(processor,config,tokens):
     size['shortest_edge']=min(size['shortest_edge'],size['longest_edge'])
     image.size=size
     return size
+

@@ -125,6 +125,9 @@ class PreparedDLiteBatch:
     prev_token_ids: torch.Tensor
     raw_weight_mask: torch.Tensor
     binary_eval_mask: torch.Tensor
+    # FSDP reconstructs dataclasses while moving/casting forward inputs. An
+    # ad-hoc attribute is lost there; declare the frozen window source explicitly.
+    sw_source: Optional[Dict[int, torch.Tensor]] = None
 
 
 class OnlineDLiteModel(nn.Module):
@@ -784,3 +787,4 @@ __all__ = [
     "prepare_history_hidden_states",
     "prepare_target_hidden",
 ]
+

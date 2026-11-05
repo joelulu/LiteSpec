@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PATHS = (
+    "litespec/core/dlite.py",
     "litespec/modeling/draft/dlite.py",
     "litespec/vlm/runtime.py",
     "litespec/vlm/static_batch.py",
@@ -41,3 +42,4 @@ def check_repository(root=ROOT):
 if __name__ == "__main__":
     count = check_repository()
     print(f"SW source integrity OK: {len(PATHS)} files, {count} bytes", flush=True)
+

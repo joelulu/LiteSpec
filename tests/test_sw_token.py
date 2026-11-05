@@ -166,3 +166,58 @@ def test_chunked_one_position_control_matches_original_training():
     a=original.forward_backbone(before,seq_len=17)
     b=chunked.forward_backbone(after,seq_len=17)
     torch.testing.assert_close(a,b,rtol=2e-4,atol=2e-5)
+
+
+
+@pytest.mark.parametrize('k',[1,2])
+def test_fsdp_input_traversal_preserves_window_source_and_backward(k):
+    """Exercise the real FSDP dataclass cast that dropped ad-hoc attributes."""
+    from dataclasses import fields, replace
+    from torch.distributed.utils import _cast_forward_inputs
+    from torch.distributed.utils import _apply_to_tensors
+    target,_,_,example=fixture_model()
+    draft=set_window(DLiteDraftModel(draft_config()),k)
+    cfg=aligned.load_config(CONFIG)
+    cfg.update(block_size=4,num_anchors=3,sw_chunked_training=True)
+    online=aligned.make_online(target,draft,cfg)
+    states=target(**example.inputs,use_cache=False,output_hidden_states=True).hidden_states
+    anchors=torch.tensor([[2,8,11]])
+    batch=online.prepare_batch(example.inputs['input_ids'],states,
+        torch.ones_like(example.inputs['input_ids'],dtype=torch.float32),
+        anchor_positions=anchors,block_keep_mask=torch.ones_like(anchors,dtype=torch.bool))
+    assert 'sw_source' in {f.name for f in fields(batch)}
+    assert replace(batch).sw_source is batch.sw_source
+    moved=_apply_to_tensors(lambda x:x.clone(),batch)
+    assert moved.sw_source is not None
+    assert moved.sw_source.keys()==batch.sw_source.keys()
+    for layer in moved.sw_source:
+        torch.testing.assert_close(moved.sw_source[layer],batch.sw_source[layer])
+        assert not moved.sw_source[layer].requires_grad
+    # This is the helper used by FSDP's mixed-precision forward pre-hook.
+    args,kwargs=_cast_forward_inputs(torch.bfloat16,prepared_batch=moved)
+    assert not args
+    converted=kwargs['prepared_batch']
+    assert converted.sw_source is not None
+    assert all(x.dtype==torch.bfloat16 for x in converted.sw_source.values())
+    assert converted.query_embeddings.dtype==torch.bfloat16
+    assert converted.anchor_positions.dtype==torch.long
+    # Forward/backward after a transport round trip, including chunk recomputation.
+    _,kwargs=_cast_forward_inputs(torch.float32,prepared_batch=moved)
+    online.chunk_blocks=2
+    output=online.forward_backbone(kwargs['prepared_batch'],seq_len=17)
+    output.float().square().sum().backward()
+    assert any(p.grad is not None and bool(p.grad.abs().sum()) for p in draft.parameters())
+    assert all(p.grad is None for p in target.parameters())
+
+
+def test_missing_window_source_has_actionable_error():
+    target,_,_,example=fixture_model()
+    draft=set_window(DLiteDraftModel(draft_config()),2)
+    cfg=aligned.load_config(CONFIG);cfg.update(block_size=4,num_anchors=3)
+    online=aligned.make_online(target,draft,cfg)
+    states=target(**example.inputs,use_cache=False,output_hidden_states=True).hidden_states
+    batch=online.prepare_batch(example.inputs['input_ids'],states,
+        torch.ones_like(example.inputs['input_ids'],dtype=torch.float32))
+    batch.sw_source=None
+    with pytest.raises(ValueError,match='prepared sw_source'):
+        online.forward_backbone(batch,seq_len=17)

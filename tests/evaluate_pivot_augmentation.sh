@@ -10,7 +10,13 @@ export TESTS="${TESTS:-text-only charxiv_val flickr30k textvqa hr_bench_4k hr_be
 export EVAL_SAMPLES="${EVAL_SAMPLES:-16}" EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-256}"
 export EVAL_GPU="${EVAL_GPU:-7}" BATCH_SIZES=1 WINDOW_SIZES=1
 unset SW_RUN_GROUP
-read -r -a modes <<< "${EXPERIMENTS:-A B C D1 D2 E}"
+case "${TRAIN_SET:-all}" in
+    all) defaults="A B C E D0 D1 D2" ;;
+    sft) defaults="A B C E" ;;
+    rollout) defaults="D0 D1 D2" ;;
+    *) echo "TRAIN_SET must be all, sft or rollout" >&2; exit 2 ;;
+esac
+read -r -a modes <<< "${EXPERIMENTS:-$defaults}"
 args=(--trained-window)
 for mode in "${modes[@]}"; do args+=(--checkpoint "$mode" "$RUN_GROUP/$mode/last"); done
 bash tests/evaluate_sw_token.sh "${args[@]}" "$@"

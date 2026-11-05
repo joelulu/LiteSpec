@@ -80,7 +80,7 @@ def test_common_initialization_and_optimizer_ownership():
     register_optimizer_parameters(draft_for('E'))
 
 
-@pytest.mark.parametrize('mode',['A','B','C','D1','D2','E'])
+@pytest.mark.parametrize('mode',['D0','D1','D2'])
 def test_real_two_round_image_training_backward_and_frozen_target(mode):
     torch.set_num_threads(1);torch.manual_seed(42)
     target=tiny_qwen35().requires_grad_(False)
@@ -103,7 +103,7 @@ def test_real_two_round_image_training_backward_and_frozen_target(mode):
     output.loss.backward()
     assert all(p.grad is None for p in target.parameters())
     assert d.sequential_head.output_proj.weight.grad.abs().sum()>0
-    if mode!='A':
+    if mode not in ('A','D0'):
         grads=[p.grad for p in d.pivot_augmentation.parameters()]
         assert any(g is not None and g.abs().sum()>0 for g in grads)
     assert not any(k.startswith('_frozen_target') for k in online.state_dict())
@@ -196,7 +196,8 @@ def test_eligibility_contiguous_and_replicated_image_order():
     assert y['input_ids'].size(0)==6
 
 
-def test_final_only_runner_exports_one_model(monkeypatch,tmp_path):
+@pytest.mark.parametrize('protocol_mode',['A','D0'])
+def test_final_only_runner_exports_one_model(monkeypatch,tmp_path,protocol_mode):
     torch.set_num_threads(1)
     monkeypatch.setattr(aligned,'load_target',lambda *a,**kw:(tiny_qwen35().requires_grad_(False),Processor()))
     data=tmp_path/'data.jsonl'
@@ -205,8 +206,8 @@ def test_final_only_runner_exports_one_model(monkeypatch,tmp_path):
     import yaml
     c=yaml.safe_load(CONFIG.read_text());c.update(device='cpu',num_epochs=2,batch_size=1,
         accumulation_steps=1,num_anchors=1,block_size=4,num_draft_layers=1,chs_num_layers=2,
-        sequential_rank=8,target_layer_ids=[0,3],use_muon=False,pivot_two_rounds=True,
-        pivot_augmentation=dict(mode='A',rank=8),rollout_anchors=1,final_only=True,
+        sequential_rank=8,target_layer_ids=[0,3],use_muon=False,pivot_two_rounds=protocol_mode=='D0',
+        pivot_augmentation=dict(mode=protocol_mode,rank=8),rollout_anchors=1,final_only=True,
         report_to='none',save_interval=1)
     cfg.write_text(yaml.safe_dump(c))
     root=tmp_path/'out'

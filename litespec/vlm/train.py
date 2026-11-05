@@ -54,6 +54,7 @@ def make_draft(target, processor, cfg):
     )
     if cfg.get("pivot_augmentation"):
         config.dlite_config["pivot_augmentation"] = dict(cfg["pivot_augmentation"])
+        config.dlite_config["sw_train_chunk_blocks"] = int(cfg.get("sw_train_chunk_blocks",16))
         config.dlite_config["forbidden_proposal_ids"] = [getattr(target.config, k) for k in ("image_token_id", "video_token_id") if isinstance(getattr(target.config, k, None), int) and 0 <= getattr(target.config, k) < text.vocab_size]
     if role == "swa_teacher":
         # The VLM reference path explicitly selects history positions; it does

@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-MODES = ("A", "B", "C", "D1", "D2", "E")
+MODES = ("A", "B", "C", "D0", "D1", "D2", "E")
 
 
 class Residual(nn.Module):
@@ -150,17 +150,18 @@ def prefix_data(source, anchors, draft):
     aug = draft.pivot_augmentation
     if aug is None:
         return {}
-    # This interface operates on one independent anchor per batch row.
-    if anchors.shape[1] != 1:
-        raise ValueError("augmentation prefix_data requires independent anchor rows")
+    # Flatten B,N anchors into independent block rows without replicating the
+    # full frozen source. The single-anchor inference interface is unchanged.
+    b, n = anchors.shape
     result = {}
     if aug.mode == "C":
-        result.update(previous=gather_positions(source, anchors-2, draft.target_layer_ids),
-                      previous_valid=anchors[:, 0] >= 2)
+        result.update(previous=gather_positions(source, anchors-2, draft.target_layer_ids).reshape(b*n,1,draft.chs_num_layers,-1),
+                      previous_valid=anchors.flatten() >= 2)
     if aug.mode == "B":
-        pos = anchors - 1 - aug.history_positions + torch.arange(aug.history_positions, device=anchors.device)
-        result.update(history=gather_positions(source, pos, draft.target_layer_ids),
-            history_keep=(pos >= 0).repeat_interleave(draft.chs_num_layers, -1))
+        pos = anchors[..., None] - 1 - aug.history_positions + torch.arange(aug.history_positions, device=anchors.device)
+        result.update(history=gather_positions(source, pos.flatten(1), draft.target_layer_ids)
+            .reshape(b*n,aug.history_positions,draft.chs_num_layers,-1),
+            history_keep=(pos >= 0).reshape(b*n,-1).repeat_interleave(draft.chs_num_layers, -1))
     return result
 
 

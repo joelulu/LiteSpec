@@ -53,12 +53,14 @@ def report(root,rows):
         'K includes the current pivot; each time position retains all selected Target layers.',
         'B is replicated batch size, not online concurrency. Greedy, per_token, decode-only raw ratios.',
         'Inference overrides on old checkpoints are zero-shot interventions, not trained-window models.', '',
-        '| Dataset | Model | K | B | Accept | First hit | tok/s | Speedup | Prefill s | Peak GiB | Match |',
-        '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+        'Training controls: A for shared-SFT B/C/E; D0 for two-round D1/D2. Do not pool their training protocols.', '',
+        '| Dataset | Model | Training | K | B | Accept | First hit | tok/s | Speedup | Prefill s | Peak GiB | Match |',
+        '|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for r in rows:
         tau=r['accept_length']
         hit=r.get('first_candidate_hit_rate')
-        lines.append(f"| {r['dataset']} | {r['model']} | {r['window'] if r['window'] else '—'} | {r['batch_size']} | {f'{tau:.3f}' if tau is not None else '—'} | {f'{hit:.1%}' if hit is not None else '—'} | {r['tok_s']:.2f} | {r['speedup']:.3f}× | {r['prefill_seconds']:.2f} | {r['peak_gib']:.3f} | {r['matched']}/{r['requests']} |")
+        protocol=r.get('training_protocol','—')
+        lines.append(f"| {r['dataset']} | {r['model']} | {protocol} | {r['window'] if r['window'] else '—'} | {r['batch_size']} | {f'{tau:.3f}' if tau is not None else '—'} | {f'{hit:.1%}' if hit is not None else '—'} | {r['tok_s']:.2f} | {r['speedup']:.3f}× | {r['prefill_seconds']:.2f} | {r['peak_gib']:.3f} | {r['matched']}/{r['requests']} |")
     (root/'comparison.md').write_text('\n'.join(lines)+'\n')
 
 
@@ -103,6 +105,7 @@ def main():
     settings['pivot_augmentation_off'] = os.environ.get('PIVOT_AUGMENTATION_OFF') == '1'
     for label,path in models.items():
         settings['checkpoints'][label]['pivot_augmentation'] = json.loads((path/'config.json').read_text()).get('dlite_config',{}).get('pivot_augmentation')
+        settings['checkpoints'][label]['training_protocol'] = json.loads((path/'config.json').read_text()).get('vlm_config',{}).get('training_protocol','legacy/unknown')
     (root/'settings.json').write_text(json.dumps(settings,default=str,indent=2))
     target_cfg=json.loads((args.target_model.expanduser()/'config.json').read_text())['vision_config']
     pixels=args.image_max_tokens*(target_cfg['patch_size']*target_cfg['spatial_merge_size'])**2
@@ -126,6 +129,7 @@ def main():
                 video=case in DATASETS
                 label=row['model']
                 rows.append(dict(dataset=case,model=label,window=0 if label=='ar' else (row.get('context_window_size') or window or 1),
+                    training_protocol='—' if label=='ar' else settings['checkpoints'][label]['training_protocol'],
                     batch_size=row['batch_size'],accept_length=row['mean_committed_length'],
                     first_candidate_hit_rate=row.get('first_candidate_hit_rate'),
                     tok_s=row['decode_tok_s'] if video else row['output_tokens_per_second'],

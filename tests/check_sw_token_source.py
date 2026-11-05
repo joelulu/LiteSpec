@@ -6,9 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 PATHS = (
     "litespec/vlm/pivot_augmentation.py",
     "litespec/vlm/pivot_training.py",
+    "litespec/vlm/pivot_cache.py",
+    "litespec/vlm/pivot_sft.py",
     "tests/train_pivot_augmentation.sh",
     "tests/evaluate_pivot_augmentation.sh",
     "tests/test_pivot_augmentation.py",
+    "tests/test_pivot_protocols.py",
+    "tests/pivot_screen_config.py",
     "litespec/core/dlite.py",
     "litespec/modeling/draft/dlite.py",
     "litespec/vlm/runtime.py",

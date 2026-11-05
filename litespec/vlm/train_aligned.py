@@ -52,6 +52,14 @@ def load_config(path):
     if family == "dlite" and upstream.get("mode") != "sft":
         raise ValueError("this VLM adapter implements the upstream direct-SFT recipe")
     cfg = {**upstream["arguments"], **source}
+    protocol = cfg.get("training_protocol")
+    if protocol in ("shared_sft_v2", "cached_rollout_v2"):
+        mode = cfg.get("pivot_augmentation", {}).get("mode")
+        rollout = protocol == "cached_rollout_v2"
+        if bool(cfg.get("pivot_two_rounds")) != rollout or (mode in ("D0","D1","D2")) != rollout:
+            raise ValueError("experiment mode and training protocol disagree")
+        if mode not in ("A","B","C","E","D0","D1","D2"):
+            raise ValueError("unknown pivot experiment mode")
     if not isinstance(cfg.get("batch_size"), int) or isinstance(cfg["batch_size"], bool) or cfg["batch_size"] < 1:
         raise ValueError("batch_size must be a positive integer")
     if cfg.get("model_role", "student") != "student":
@@ -127,7 +135,8 @@ def reuse_validation(records, cfg, directory):
     directory = Path(directory).expanduser().resolve()
     previous = json.loads((directory / "effective_config.json").read_text())
     for key in ("data_sha256", "train_data", "target_model", "max_length", "block_size", "debug_max_samples", "image_max_tokens", "pivot_two_rounds"):
-        if previous.get(key) != cfg.get(key):
+        default = False if key == "pivot_two_rounds" else None
+        if previous.get(key,default) != cfg.get(key,default):
             raise ValueError(f"validation reuse mismatch: {key}; run preflight again")
     skipped, excluded = [], set()
     with (directory / "skipped_training.jsonl").open() as handle:
@@ -221,6 +230,10 @@ def make_online(target, draft, cfg):
         from .pivot_training import OnlinePivot
         draft.config._attn_implementation = "sdpa"
         cls = OnlinePivot
+    elif cfg.get("pivot_augmentation"):
+        from .pivot_sft import OnlinePivotSFT
+        draft.config._attn_implementation = "sdpa"
+        cls = OnlinePivotSFT
     elif getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False):
         from .sw_token import OnlineSWToken
         draft.config._attn_implementation = "sdpa"
@@ -238,6 +251,9 @@ def make_online(target, draft, cfg):
     if cfg.get("pivot_two_rounds"):
         online.bind_target(target)
         online.rollout_anchors = int(cfg.get("rollout_anchors", 4))
+        online.rollout_backend = cfg.get("rollout_backend", "cached")
+        if online.rollout_backend not in ("cached", "full_replay"):
+            raise ValueError("rollout_backend must be cached or explicit full_replay reference")
         if online.rollout_anchors < 1:
             raise ValueError("rollout_anchors must be positive")
     return online
@@ -248,9 +264,7 @@ def prepare_forward(target, online, example):
     ids = example.inputs["input_ids"]
     mask = loss_mask(example)
     if hasattr(online, "rollout_anchors"):
-        from .pivot_training import repeat_examples
-        return dict(rollout_inputs=repeat_examples(example.inputs, online.rollout_anchors),
-                    rollout_mask=mask.repeat(online.rollout_anchors, 1))
+        return dict(rollout_inputs=example.inputs, rollout_mask=mask)
     from .baselines import is_baseline, prepare_forward as baseline_forward
     if is_baseline(online.draft_model):
         return baseline_forward(target, online, example, mask)
@@ -415,7 +429,7 @@ def run(argv=None):
                         help="optional scalar tracking; defaults to YAML report_to")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
-    if cfg.get("pivot_two_rounds"):
+    if cfg.get("pivot_augmentation") or cfg.get("pivot_two_rounds"):
         if args.resume or args.init_checkpoint or cfg.get("init_checkpoint"):
             raise ValueError("pivot screen runs must train from scratch")
         if args.save_training_state:
@@ -506,8 +520,10 @@ def run(argv=None):
         from .baselines import make_draft as make_baseline
         draft = make_baseline(target, processor, cfg)
     draft.config._attn_implementation = (
-        "sdpa" if device == "cpu" or cfg.get("pivot_two_rounds") or getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False) else "flex_attention")
+        "sdpa" if device == "cpu" or cfg.get("pivot_augmentation") or cfg.get("pivot_two_rounds") or getattr(draft, "context_window_size", 1) > 1 or cfg.get("sw_chunked_training", False) else "flex_attention")
     draft.config.vlm_config["training"] = "upstream_sft_v1"
+    if cfg.get("training_protocol"):
+        draft.config.vlm_config["training_protocol"] = cfg["training_protocol"]
     if saved is not None:
         from .baselines import load_draft
         loaded = load_draft(args.resume, attn_implementation="sdpa" if device == "cpu" else "flex_attention")
@@ -516,7 +532,7 @@ def run(argv=None):
     online = make_online(target, draft, cfg)
     # Match upstream registration names and ownership before FSDP changes shapes.
     parameters, specs = register_optimizer_parameters(draft)
-    if cfg.get("pivot_two_rounds"):
+    if cfg.get("pivot_augmentation"):
         cfg["draft_trainable_parameters"] = sum(p.numel() for p in parameters)
         cfg["augmentation_parameters"] = sum(p.numel() for p in draft.pivot_augmentation.parameters())
     fsdp = online

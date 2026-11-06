@@ -4,6 +4,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PATHS = (
+    "tests/pivot_feedback_probe.py",
+    "tests/diagnose_pivot_feedback.py",
+    "tests/diagnose_pivot_feedback.sh",
+    "tests/test_pivot_joint.py",
     "litespec/vlm/pivot_augmentation.py",
     "litespec/vlm/pivot_training.py",
     "litespec/vlm/pivot_cache.py",

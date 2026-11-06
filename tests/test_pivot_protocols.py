@@ -116,9 +116,10 @@ def test_protocol_budgets_are_separate_and_common_batch_is_64():
         c=make_config(mode,{})
         rollout=mode.startswith('D')
         assert c['pivot_two_rounds']==rollout
-        assert c['num_anchors']==(4 if rollout else 512)
+        assert c['num_anchors']==512
+        assert c['transition_policy']=='trajectory'
         assert c['batch_size']*c['accumulation_steps']*8==64
         assert c['num_epochs']==2 and c['final_only']
         assert 'init_checkpoint' not in c
     assert make_config('C',{'NUM_ANCHORS':'64'})['num_anchors']==64
-    assert make_config('D1',{'NUM_ANCHORS':'64'})['num_anchors']==4
+    assert make_config('D1',{'NUM_ANCHORS':'64'})['num_anchors']==64

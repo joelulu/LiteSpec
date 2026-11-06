@@ -13,12 +13,13 @@ export REPORT_TO="${REPORT_TO:-tensorboard}"
 export EPOCHS="${EPOCHS:-2}" MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
 export ACCUMULATION_STEPS="${ACCUMULATION_STEPS:-2}" ROLLOUT_ANCHORS="${ROLLOUT_ANCHORS:-4}"
 export NUM_ANCHORS="${NUM_ANCHORS:-512}" SFT_CHUNK_BLOCKS="${SFT_CHUNK_BLOCKS:-16}"
+export TRANSITION_POLICY="${TRANSITION_POLICY:-trajectory}" ROLLOUT_LOSS_WEIGHT="${ROLLOUT_LOSS_WEIGHT:-0.25}"
 export IMAGE_MAX_TOKENS="${IMAGE_MAX_TOKENS:-1024}"
 export MAX_SAMPLES="${MAX_SAMPLES:-20000}"
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 unset INIT_CHECKPOINT RESUME CONFIG OUTPUT_DIR SW_RUN_GROUP MAX_STEPS
 if [[ -n "${DEBUG_MAX_STEPS:-}" ]]; then export MAX_STEPS="$DEBUG_MAX_STEPS"; fi
-export RUN_GROUP="${RUN_GROUP:-$DLITE_WORKSPACE/runs/pivot_split_20k_2ep_$(date +%Y%m%d_%H%M%S)_$$}"
+export RUN_GROUP="${RUN_GROUP:-$DLITE_WORKSPACE/runs/pivot_joint_20k_2ep_$(date +%Y%m%d_%H%M%S)_$$}"
 [[ -s "$TRAIN_DATA" ]] || { echo "Missing data: $TRAIN_DATA" >&2; exit 1; }
 [[ ! -e "$RUN_GROUP" ]] || { echo "Choose fresh RUN_GROUP: $RUN_GROUP" >&2; exit 1; }
 "$PYTHON_BIN" tests/check_sw_token_source.py
@@ -58,7 +59,8 @@ PY
 fi
 echo "Output: $RUN_GROUP; FROM SCRATCH, eight GPUs, final export only"
 echo "A/B/C/E: one shared Target pass, up to $NUM_ANCHORS anchors/sample"
-echo "D0/D1/D2: cached two-round rollout, $ROLLOUT_ANCHORS independent anchors/sample"
+echo "D0/D1/D2: shared SFT ($NUM_ANCHORS anchors) + cached two-round rollout ($ROLLOUT_ANCHORS anchors)"
+echo "Transition: $TRANSITION_POLICY; rollout loss weight: $ROLLOUT_LOSS_WEIGHT"
 for mode in "${modes[@]}"; do
     export OUTPUT_DIR="$RUN_GROUP/$mode" CONFIG="$RUN_GROUP/$mode/config.yaml"
     mkdir -p "$OUTPUT_DIR"

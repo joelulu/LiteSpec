@@ -4,6 +4,7 @@ The original full-prefix implementation remains an explicit numerical reference,
 not a fallback selected silently after cache errors.
 """
 import torch
+import torch.distributed as dist
 
 from litespec.core.dlite import OnlineDLiteModel
 from litespec.core.outputs import TrainingOutput, RatioTerms
@@ -55,6 +56,53 @@ def transition(ids, anchors, candidates, predictions):
     return kept, next_anchor[:, None], bonus, corrected
 
 
+def choose_transition(ids, anchors, candidates, predictions, policy="trajectory"):
+    """Separate the training trajectory from actual verifier observations.
+
+    trajectory: follow the recorded answer, but retain actual verifier features.
+    verifier: legacy hybrid trajectory; explicitly named, never a silent fallback.
+    """
+    actual = transition(ids, anchors, candidates, predictions)
+    positions = anchors + torch.arange(candidates.size(1), device=ids.device)
+    recorded = ids.gather(1, positions)
+    guided_kept = (candidates[:, 1:] == recorded[:, 1:]).cumprod(-1).sum(-1) + 1
+    guided_anchor = anchors + guided_kept[:, None]
+    guided_bonus = ids.gather(1, guided_anchor)[:, 0]
+    row = torch.arange(ids.size(0), device=ids.device)
+    stats = {
+        "trajectory/verifier_kept_disagreement": RatioTerms((actual[0] != guided_kept).sum(), ids.new_tensor(ids.size(0))),
+        "trajectory/verifier_bonus_disagreement": RatioTerms((predictions[row, guided_kept-1] != guided_bonus).sum(), ids.new_tensor(ids.size(0))),
+        "trajectory/verifier_token_disagreement": RatioTerms((predictions[:, :-1] != recorded[:, 1:]).sum(), ids.new_tensor(recorded[:, 1:].numel())),
+    }
+    if policy == "trajectory":
+        chosen = (guided_kept, guided_anchor, guided_bonus, ids)
+    elif policy == "verifier":
+        chosen = actual
+    else:
+        raise ValueError("transition_policy must be trajectory or verifier")
+    return (*chosen, stats)
+
+
+def joint_objective(shared, rollout, weight, group=None):
+    """Balance branch means with a detached, rank-global denominator ratio.
+
+    Return additive terms for the existing accumulation/FSDP runner. Across
+    microbatches the resulting means are weighted by shared-SFT supervision.
+    """
+    den = torch.stack([shared.loss_terms.denominator.detach().float(), rollout.loss_terms.denominator.detach().float()])
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(den, group=group)
+    if (den <= 0).any():
+        raise ValueError("both joint objectives require nonempty global supervision")
+    scale = weight * den[0] / den[1]
+    numerator = shared.loss_terms.numerator + scale * rollout.loss_terms.numerator
+    denominator = shared.loss_terms.denominator + scale * rollout.loss_terms.denominator
+    ratios = {"sft/loss": shared.loss_terms.detached(), "rollout/loss": rollout.loss_terms.detached(),
+              **{f"sft/{k}": v for k, v in shared.ratio_metrics.items()}, **rollout.ratio_metrics}
+    return TrainingOutput(fsdp_global_weighted_mean(numerator, denominator, group),
+        RatioTerms(numerator, denominator), ratios, {**shared.sum_metrics, **rollout.sum_metrics})
+
+
 class OnlinePivot(OnlineDLiteModel):
     def bind_target(self, target):
         # Target is frozen and must not become an FSDP-owned child module.
@@ -90,7 +138,28 @@ class OnlinePivot(OnlineDLiteModel):
             attention_mask=None, is_causal=False, augmentation_data=data)
         return d._prediction_hidden(out)[:, None]
 
-    def forward(self, *, rollout_inputs, rollout_mask, collect_detailed_metrics=True):
+    def forward(self, *, rollout_inputs, rollout_mask, collect_detailed_metrics=True,
+                prepared_batch=None, target_prefill_logits=None, seq_len=None,
+                shared_image_features=None, target_logits_are_gathered=True):
+        shared = None
+        if getattr(self, "shared_sft_weight", 0):
+            from .pivot_sft import OnlinePivotSFT
+            if prepared_batch is None or target_prefill_logits is None:
+                raise ValueError("joint rollout requires its shared SFT batch; refusing rollout-only fallback")
+            hidden = OnlinePivotSFT.forward_backbone(self, prepared_batch, seq_len=seq_len)
+            shared = self.compute_supervised_loss(hidden, prepared_batch, target_prefill_logits,
+                collect_detailed_metrics=collect_detailed_metrics)
+            shared.sum_metrics["supervision/sft_positions"] = prepared_batch.binary_eval_mask.sum().detach()
+            shared.sum_metrics["sft/target_calls"] = prepared_batch.labels.new_tensor(1)
+            shared.sum_metrics["sft/visual_encoder_calls"] = prepared_batch.labels.new_tensor(int(shared_image_features is not None))
+        result = self.rollout_forward(rollout_inputs=rollout_inputs, rollout_mask=rollout_mask,
+            collect_detailed_metrics=collect_detailed_metrics, shared_image_features=shared_image_features)
+        if shared is not None:
+            result = joint_objective(shared, result, self.rollout_loss_weight, self.process_group)
+        return result
+
+    def rollout_forward(self, *, rollout_inputs, rollout_mask, collect_detailed_metrics=True,
+                        shared_image_features=None):
         copies = self.rollout_anchors
         repeat_inputs = rollout_inputs if self.rollout_backend == "full_replay" else {
             k:v for k,v in rollout_inputs.items() if k != "pixel_values"}
@@ -104,15 +173,18 @@ class OnlinePivot(OnlineDLiteModel):
             return self.forward_full_replay(rollout_inputs=repeated,rollout_mask=mask,
                 anchors=anchors,collect_detailed_metrics=collect_detailed_metrics)
         return self.forward_cached(rollout_inputs,repeated,mask,anchors,copies,
+                                   shared_image_features=shared_image_features,
                                    collect_detailed_metrics=collect_detailed_metrics)
 
-    def forward_cached(self, original, repeated, mask, anchors, copies, *, collect_detailed_metrics):
+    def forward_cached(self, original, repeated, mask, anchors, copies, *, collect_detailed_metrics,
+                       shared_image_features=None):
         from .pivot_cache import CachedRolloutPrefix
         d = self.draft_model
         if d.pivot_augmentation.mode not in ("A","D0","D1","D2"):
             raise ValueError("cached two-round training is only for D0/D1/D2; A/B/C/E use shared SFT")
         ids = repeated["input_ids"]
-        prefix = CachedRolloutPrefix(self._frozen_target,d,original,repeated,anchors,copies)
+        prefix = CachedRolloutPrefix(self._frozen_target,d,original,repeated,anchors,copies,
+                                    image_features=shared_image_features)
         offsets = torch.arange(self.block_size-1,device=ids.device)
         # Clean round-one labels require only the short teacher-forced block.
         teacher = prefix.run(ids.gather(1,anchors+offsets),hidden=False)
@@ -128,7 +200,8 @@ class OnlinePivot(OnlineDLiteModel):
             candidates = torch.cat([ids.gather(1,anchors),proposals],1)
             verified = prefix.run(candidates)
             predictions = verified.logits.argmax(-1)
-            kept,next_anchor,bonus,corrected = transition(ids,anchors,candidates,predictions)
+            kept,next_anchor,bonus,corrected,trajectory_stats = choose_transition(ids,anchors,candidates,predictions,
+                getattr(self,"transition_policy","verifier"))
             has_feedback = kept < self.block_size
             reject = torch.where(has_feedback,kept,torch.zeros_like(kept))[:,None]
             raw = gather_positions(source_layers(verified.hidden_states,d),reject,d.target_layer_ids).clone()
@@ -153,6 +226,10 @@ class OnlinePivot(OnlineDLiteModel):
         second = self.compute_supervised_loss(second_hidden,second_batch,second_reference,
             collect_detailed_metrics=collect_detailed_metrics)
         result = self.combine(first,second,has_feedback)
+        result.ratio_metrics.update(trajectory_stats)
+        result.ratio_metrics["trajectory/anchor_root_disagreement"] = RatioTerms(
+            (prefix.root_predictions != ids.gather(1,anchors)[:,0]).sum(), ids.new_tensor(ids.size(0)))
+        self.add_second_diagnostics(result, second_batch, second_reference, feedback)
         result.sum_metrics.update({
             "rollout/target_prefix_calls":ids.new_tensor(1),
             "rollout/target_branch_calls":ids.new_tensor(prefix.branch_calls),
@@ -161,6 +238,15 @@ class OnlinePivot(OnlineDLiteModel):
             "rollout/target_branch_tokens":ids.new_tensor(prefix.branch_tokens),
         })
         return result
+
+    def add_second_diagnostics(self, result, batch, reference, feedback):
+        active = batch.binary_eval_mask & (batch.raw_weight_mask > 0)
+        expected_prev = reference.argmax(-1)[..., :-1]
+        result.ratio_metrics["trajectory/round2_prev_greedy_disagreement"] = RatioTerms(
+            ((batch.prev_token_ids[..., 1:] != expected_prev) & active[..., 1:]).sum(), active[..., 1:].sum())
+        result.sum_metrics["supervision/rollout_round2_positions"] = active.sum().detach()
+        result.ratio_metrics["rollout/effective_feedback_available"] = RatioTerms(
+            feedback["feedback_valid"].sum(), active.new_tensor(active.size(0), dtype=torch.float))
 
     def mask_stopped(self,batch,candidates,kept,bonus,feedback):
         eos = getattr(self._frozen_target.config,"text_config",self._frozen_target.config).eos_token_id
@@ -186,6 +272,8 @@ class OnlinePivot(OnlineDLiteModel):
                     value = RatioTerms(value.numerator*0,value.denominator*0)
                 metrics[f"{label}/{key}"] = value
         metrics["rollout/feedback_available"] = RatioTerms(has_feedback.sum().detach(),has_feedback.new_tensor(has_feedback.numel(),dtype=torch.float))
+        metrics["round1/loss"] = first.loss_terms.detached()
+        metrics["round2/loss"] = second.loss_terms.detached()
         return TrainingOutput(fsdp_global_weighted_mean(numerator,denominator,self.process_group),
                               RatioTerms(numerator,denominator),metrics)
 
@@ -209,7 +297,8 @@ class OnlinePivot(OnlineDLiteModel):
             wrong_inputs["input_ids"] = wrong_ids
             wrong_source, verify_logits = self.target_pass(wrong_inputs, anchors, verify=True)
             predictions = verify_logits[:, 0].argmax(-1)
-            kept, next_anchor, bonus, corrected = transition(ids, anchors, candidates, predictions)
+            kept, next_anchor, bonus, corrected, trajectory_stats = choose_transition(ids, anchors, candidates, predictions,
+                getattr(self,"transition_policy","verifier"))
             has_feedback = kept < self.block_size
             reject = torch.where(has_feedback[:, None], next_anchor, anchors)
             wrong = candidates.gather(1, kept.clamp(max=self.block_size-1)[:, None])[:, 0]
@@ -227,4 +316,7 @@ class OnlinePivot(OnlineDLiteModel):
         second_hidden = self.backbone(second_batch, second_source, feedback)
         second = self.compute_supervised_loss(second_hidden, second_batch, second_reference,
             collect_detailed_metrics=collect_detailed_metrics)
-        return self.combine(first,second,has_feedback)
+        result = self.combine(first,second,has_feedback)
+        result.ratio_metrics.update(trajectory_stats)
+        self.add_second_diagnostics(result,second_batch,second_reference,feedback)
+        return result

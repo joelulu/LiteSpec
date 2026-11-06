@@ -52,7 +52,7 @@ def shared_visual_features(target, inputs, copies):
 
 
 class CachedRolloutPrefix:
-    def __init__(self, target, draft, original_inputs, repeated_inputs, anchors, copies):
+    def __init__(self, target, draft, original_inputs, repeated_inputs, anchors, copies, image_features=None):
         self.target = target
         text = target.config.text_config
         pad = text.pad_token_id if text.pad_token_id is not None else 0
@@ -62,9 +62,10 @@ class CachedRolloutPrefix:
         self.target_tokens = int(self.mask.numel())
         self.branch_tokens = 0
         self.branch_calls = 0
-        self.vision_encodes = int(original_inputs.get("pixel_values") is not None)
+        self.vision_encodes = int(image_features is None and original_inputs.get("pixel_values") is not None)
         with torch.no_grad():
-            image = shared_visual_features(target,original_inputs,copies)
+            image = ({"image":BaseModelOutputWithPooling(pooler_output=tuple(image_features)*copies)}
+                     if image_features is not None else shared_visual_features(target,original_inputs,copies))
             inputs.pop("pixel_values",None)
             if image is not None:
                 inputs["mm_encoder_outputs"] = image
@@ -89,6 +90,7 @@ class CachedRolloutPrefix:
             source = source_layers(output.hidden_states,draft)
             self.pivot = gather_positions(source,anchors.new_full(anchors.shape,self.length-1),
                 draft.target_layer_ids).detach().clone()
+            self.root_predictions = output.logits[:, -1].argmax(-1).detach()
 
     @torch.no_grad()
     def run(self, tokens, *, rollback=True, hidden=True):

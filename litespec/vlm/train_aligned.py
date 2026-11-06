@@ -53,13 +53,18 @@ def load_config(path):
         raise ValueError("this VLM adapter implements the upstream direct-SFT recipe")
     cfg = {**upstream["arguments"], **source}
     protocol = cfg.get("training_protocol")
-    if protocol in ("shared_sft_v2", "cached_rollout_v2"):
+    if protocol in ("shared_sft_v2", "cached_rollout_v2", "joint_sft_rollout_v3"):
         mode = cfg.get("pivot_augmentation", {}).get("mode")
-        rollout = protocol == "cached_rollout_v2"
+        rollout = protocol != "shared_sft_v2"
         if bool(cfg.get("pivot_two_rounds")) != rollout or (mode in ("D0","D1","D2")) != rollout:
             raise ValueError("experiment mode and training protocol disagree")
         if mode not in ("A","B","C","E","D0","D1","D2"):
             raise ValueError("unknown pivot experiment mode")
+    if cfg.get("transition_policy", "verifier") not in ("trajectory", "verifier"):
+        raise ValueError("transition_policy must be trajectory or verifier")
+    if protocol == "joint_sft_rollout_v3" and (
+            not np.isfinite(cfg.get("rollout_loss_weight", .25)) or cfg.get("rollout_loss_weight", .25) <= 0):
+        raise ValueError("positive finite rollout_loss_weight required")
     if not isinstance(cfg.get("batch_size"), int) or isinstance(cfg["batch_size"], bool) or cfg["batch_size"] < 1:
         raise ValueError("batch_size must be a positive integer")
     if cfg.get("model_role", "student") != "student":
@@ -252,6 +257,10 @@ def make_online(target, draft, cfg):
         online.bind_target(target)
         online.rollout_anchors = int(cfg.get("rollout_anchors", 4))
         online.rollout_backend = cfg.get("rollout_backend", "cached")
+        online.transition_policy = cfg.get("transition_policy", "verifier")
+        online.shared_sft_weight = int(cfg.get("training_protocol") == "joint_sft_rollout_v3")
+        online.rollout_loss_weight = float(cfg.get("rollout_loss_weight", .25))
+        online.chunk_blocks = int(cfg.get("sw_train_chunk_blocks",16))
         if online.rollout_backend not in ("cached", "full_replay"):
             raise ValueError("rollout_backend must be cached or explicit full_replay reference")
         if online.rollout_anchors < 1:
@@ -264,10 +273,31 @@ def prepare_forward(target, online, example):
     ids = example.inputs["input_ids"]
     mask = loss_mask(example)
     if hasattr(online, "rollout_anchors"):
-        return dict(rollout_inputs=example.inputs, rollout_mask=mask)
+        kwargs = dict(rollout_inputs=example.inputs, rollout_mask=mask)
+        if not online.shared_sft_weight:
+            return kwargs
+        shared_inputs = example.inputs
+        if shared_inputs.get("pixel_values") is not None:
+            # Reuse this one encoding in both full-sequence SFT and prefix branches.
+            from transformers.modeling_outputs import BaseModelOutputWithPooling
+            with torch.no_grad():
+                image = target.get_image_features(shared_inputs["pixel_values"],shared_inputs["image_grid_thw"],return_dict=True)
+            features = image.pooler_output
+            if not isinstance(features,(tuple,list)):
+                raise ValueError("joint training requires per-image pooled features")
+            kwargs["shared_image_features"] = tuple(x.detach() for x in features)
+            shared_inputs = {k:v for k,v in shared_inputs.items() if k != "pixel_values"}
+            shared_inputs["mm_encoder_outputs"] = {"image":BaseModelOutputWithPooling(pooler_output=features)}
+        kwargs.update(prepare_shared_forward(target,online,example,shared_inputs))
+        return kwargs
     from .baselines import is_baseline, prepare_forward as baseline_forward
     if is_baseline(online.draft_model):
         return baseline_forward(target, online, example, mask)
+    return prepare_shared_forward(target,online,example,example.inputs)
+
+
+def prepare_shared_forward(target, online, example, inputs):
+    ids, mask = example.inputs["input_ids"], loss_mask(example)
     anchor_mask = mask
     if hasattr(example, "supervision_mask"):
         lengths = example.inputs["attention_mask"].sum(-1)
@@ -279,13 +309,17 @@ def prepare_forward(target, online, example):
     # Project only distinct supervised text positions, then gather the block layout.
     unique, inverse = positions.reshape(-1).unique(sorted=True, return_inverse=True)
     with torch.no_grad():
-        output = target(**example.inputs, use_cache=False, output_hidden_states=True,
+        output = target(**inputs, use_cache=False, output_hidden_states=True,
                         logits_to_keep=unique)
         indices = inverse.reshape(ids.size(0), -1)
         reference = output.logits.gather(1, indices.unsqueeze(-1).expand(-1, -1, output.logits.size(-1)))
         reference = reference.reshape(*positions.shape, -1)
         batch = online.prepare_batch(ids, output.hidden_states, mask,
                                      anchor_positions=anchors, block_keep_mask=keep)
+        if batch.sw_source is None and getattr(online,"shared_sft_weight",0):
+            # D0/D1/D2's clean SFT path reads only gathered pivot slots. Do not
+            # retain all full-sequence source layers across rollout/backward.
+            batch.sw_source = {}
     return dict(prepared_batch=batch, seq_len=ids.size(1), target_prefill_logits=reference,
                 target_logits_are_gathered=True)
 
@@ -524,6 +558,8 @@ def run(argv=None):
     draft.config.vlm_config["training"] = "upstream_sft_v1"
     if cfg.get("training_protocol"):
         draft.config.vlm_config["training_protocol"] = cfg["training_protocol"]
+        draft.config.vlm_config["training_recipe"] = {k:cfg.get(k) for k in (
+            "num_anchors","rollout_anchors","transition_policy","rollout_loss_weight")}
     if saved is not None:
         from .baselines import load_draft
         loaded = load_draft(args.resume, attn_implementation="sdpa" if device == "cpu" else "flex_attention")

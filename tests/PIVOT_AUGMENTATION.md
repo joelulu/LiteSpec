@@ -110,3 +110,108 @@ use a fresh RESULT_DIR. Different round boundaries are not paired causal probes.
 
 CPU tests do not establish eight-GPU FSDP/CUDA throughput or memory. Keep the
 working torch 2.9.1 environment; real speed improvements need host measurement.
+
+## v3: shared supervision + trajectory-aligned feedback
+
+New D0/D1/D2 runs use `joint_sft_rollout_v3`, not `cached_rollout_v2`.
+A/B/C/E and all existing checkpoints retain their original behavior. From-scratch
+initialization, final-only export, eight GPUs, 20k candidates and two epochs stay
+unchanged. Never merge old/new result rows under the same training-protocol label.
+
+All three D models now receive the SAME ordinary SFT supervision as A (up to
+NUM_ANCHORS=512 per sample), PLUS ROLLOUT_ANCHORS=4 two-round starting points.
+The original image microbatch is encoded once; detached pooled image features
+are reused by full-sequence SFT and independent cached prefixes. Language prefix
+prefills remain independent per rollout anchor. This is not a full-sequence hidden
+cache reuse across different speculative prefixes.
+
+The joint objective is `(SFT_mean + w * two_round_mean)/(1+w)`, with default
+ROLLOUT_LOSS_WEIGHT=0.25. A detached rank-global denominator ratio balances the
+branches so 512 SFT anchors cannot silently drown out four rollout anchors.
+The existing runner still accumulates additive numerator/denominator terms;
+across microbatches it weights the branch means by shared-SFT supervision mass.
+Both first and second rollout rounds remain supervised. D0 is the no-feedback
+control under this SAME joint objective; compare D1/D2 with D0.
+
+TRANSITION_POLICY=trajectory (default) determines the accepted boundary by
+matching actual proposals against the recorded Target answer and takes the bonus
+from that answer. The teacher-forced continuation therefore stays on one recorded
+trajectory. Feedback is still taken from an actual verifier pass on the proposed,
+possibly wrong block. This follows DFlow's trajectory-guided transition idea,
+NOT a full DFlow reproduction: we still reuse one rejected position, two total
+rounds, and the existing DLite RNN head/loss. `verifier` explicitly restores the
+old hybrid-trajectory intervention for comparison; there is no silent fallback.
+Do not change inference verification to follow a dataset trajectory.
+
+TensorBoard/logs add:
+- `sft/loss`, `rollout/loss`, per-round loss and acceptance metrics.
+- `supervision/sft_positions`, `supervision/rollout_round2_positions` (counts,
+  not distinct answer tokens).
+- `trajectory/anchor_root_disagreement`: cached Target root vs recorded anchor.
+- `trajectory/verifier_token_disagreement`: actual candidate-conditioned verifier
+  predictions vs recorded next tokens, INCLUDING speculative wrong-context effects.
+- `trajectory/verifier_kept_disagreement`, `trajectory/verifier_bonus_disagreement`.
+- `trajectory/round2_prev_greedy_disagreement`: RNN teacher-forced previous token
+  vs Target greedy prediction at the preceding second-round position.
+These are observations, not all implementation errors. In particular, a wrong
+proposal can legitimately change later verifier predictions.
+
+### Train the three v3 models
+
+```bash
+export RUN_GROUP="$DLITE_WORKSPACE/runs/pivot_feedback_v3_$(date +%Y%m%d_%H%M%S)_$$"
+TRAIN_SET=rollout EXPERIMENTS="D0 D1 D2" \
+NUM_ANCHORS=512 ROLLOUT_ANCHORS=4 ROLLOUT_LOSS_WEIGHT=0.25 \
+TRANSITION_POLICY=trajectory EPOCHS=2 MICRO_BATCH_SIZE=4 ACCUMULATION_STEPS=2 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 SAVE_TRAINING_STATE=0 \
+bash tests/train_pivot_augmentation.sh
+```
+
+ROLLOUT_REUSE_VALIDATION_FROM may point at a compatible old D0/D1/D2 run; the
+eligibility rule did not change. SFT validation remains separate. Validation
+reuse never loads model weights. Old from-scratch A can be added explicitly as
+an evaluation reference; do not train it again merely to run feedback probes.
+
+### Paired feedback probe (works with OLD or NEW D checkpoints)
+
+```bash
+unset PIVOT_AUGMENTATION_OFF CUDA_LAUNCH_BLOCKING TORCH_SHOW_CPP_STACKTRACES
+export RESULT_DIR="$RUN_GROUP/feedback_probe_$(date +%Y%m%d_%H%M%S)_$$"
+EVAL_GPU=7 EXPERIMENTS="D0 D1 D2" TESTS="charxiv_val textvqa text-only" \
+EVAL_SAMPLES=16 EVAL_MAX_NEW_TOKENS=128 PROBES_PER_SAMPLE=8 \
+bash tests/diagnose_pivot_feedback.sh
+cat "$RESULT_DIR/diagnostics.md"
+```
+
+No optimizer or parameter updates. Per checkpoint, construct a real draft/verifier
+feedback record, then compare on/off/shuffled at the IDENTICAL second-round AR
+prefix, pivot, anchor and reference. The prefix follows Target AR, never the
+intervention's candidate. A deterministic cyclic DIFFERENT-SAMPLE donor changes
+verifier hidden only; the correct/wrong boundary embeddings stay fixed. This
+isolates hidden information from boundary identity. Different models can have
+different eligible probe locations; pair conditions WITHIN each model, not their
+raw probe means across models. Fixed-prefix accept is an AR-reference diagnostic,
+not the candidate-conditioned closed-loop accept metric.
+
+Reports: `diagnostics.md`, `summary.json`, `probes.jsonl`, input manifests,
+AR sequences, checkpoint identities, image budget and settings. Logit changes,
+proposal changes, first-token repair/break, CE, gate mean, actual model-dtype
+residual ratio and changed-element fraction are recorded. Residuals are measured
+AFTER BF16 rounding. D0 must have zero intervention effect and is a negative
+control. Missing cross-sample donors/empty eligible probes fail explicitly.
+These passes are UNTIMED and must not be used as speed benchmarks.
+
+### Closed-loop test after training
+
+Use a FRESH RESULT_DIR. The normal evaluator remains greedy B=1, per_token,
+16 samples/seed42, image budget1024 and max-new-tokens256. For example:
+
+```bash
+export RESULT_DIR="$RUN_GROUP/eval_16_$(date +%Y%m%d_%H%M%S)_$$"
+TRAIN_SET=rollout EXPERIMENTS="D0 D1 D2" EVAL_GPU=7 EVAL_SAMPLES=16 \
+EVAL_MAX_NEW_TOKENS=256 TESTS="text-only charxiv_val textvqa" \
+bash tests/evaluate_pivot_augmentation.sh
+```
+
+CPU tests establish tiny-model math/gradient/entrypoint consistency only, not
+H100 memory headroom, fast-kernel equivalence, eight-GPU FSDP runtime or throughput.

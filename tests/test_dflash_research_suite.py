@@ -106,7 +106,7 @@ touch "$RESULT_DIR/comparison.md"
                 self.assertEqual(evaluations,[])
                 return
             self.assertEqual(result.returncode,0,result.stderr+result.stdout)
-            modes=['full','recent128','pivot1','pivot5','pivot12'] if preset==1 else ['pivot5_B','pivot5_C']
+            modes=['full','recent128','pivot1','pivot5','pivot12'] if preset==1 else ['pivot5','pivot5_B','pivot5_C']
             self.assertEqual([r['args'][0] for r in trains],modes)
             for row in trains:
                 e=row['env']
@@ -129,7 +129,7 @@ touch "$RESULT_DIR/comparison.md"
             self.assertEqual(len(checks),0 if preset==1 else 1)
 
     def test_long_preset(self): self.exercise(1)
-    def test_adapter_preset_skips_baselines_and_uses_10w_five_epochs(self): self.exercise(2)
+    def test_adapter_preset_includes_pivot5_control_and_uses_10w_five_epochs(self): self.exercise(2)
     def test_smaller_micro_preserves_global_batch(self): self.exercise(1,micro='2')
     def test_failure_stops_before_other_training_and_eval(self): self.exercise(2,fail=True)
 

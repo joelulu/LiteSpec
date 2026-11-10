@@ -7,10 +7,10 @@ and schedule start fresh; the frozen Qwen3.5-4B Target loads normally.
 | Suite | Models | Data | Epochs | GPUs per model | Micro | Accumulation | Global batch |
 |---|---|---|---:|---:|---:|---:|---:|
 | `bash tests/train_dflash_exp1.sh` | Full, Recent128, Pivot1, Pivot5, Pivot12 | existing 10w candidates | 5 | 8 | 4 | 8 | 256 |
-| `bash tests/train_dflash_exp2.sh` | Pivot5-B, Pivot5-C | existing 10w candidates | 5 | 4 | 4 | 16 | 256 |
+| `bash tests/train_dflash_exp2.sh` | Pivot5, Pivot5-B, Pivot5-C | existing 10w candidates | 5 | 4 | 4 | 16 | 256 |
 
-The second suite trains only the two Pivot5 adapters. Full, Recent128, Pivot1,
-Pivot5 and Pivot12 are already covered by experiment 1 and are not retrained.
+The second suite trains Pivot5 as a matched four-GPU control alongside its B/C
+adapters. Full, Recent128, Pivot1 and Pivot12 remain covered by experiment 1.
 
 Both keep block size 8, 512 training anchors, 5 draft layers, image budget 1024,
 seed 42 and loss-decay gamma 4. Epoch exports are `epoch_1` through `epoch_N`,
@@ -91,6 +91,6 @@ still runs the remaining datasets. Interrupts terminate only owned child jobs.
 
 To repeat only evaluation after training, set `RUN_GROUP` to its output path and
 pass the suite's explicit `--checkpoint LABEL PATH` entries (five for experiment
-1, two for experiment 2) to
+1, three for experiment 2) to
 `tests/evaluate_dflash_all.sh`; choose a fresh `RESULT_DIR` and set
 `VIDEO_SAMPLES=32 EVAL_SAMPLES=32 EVAL_BATCH_SIZE=1`.

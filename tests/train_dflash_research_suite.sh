@@ -16,8 +16,8 @@ case "${1:-}" in
         export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS:-0,1,2,3,4,5,6,7}"
         ;;
     adapters)
-        suite=exp2_BC_10w_5ep; export EPOCHS=5 NPROC_PER_NODE=4 MAX_SAMPLES=0
-        modes=(pivot5_B pivot5_C)
+        suite=exp2_pivot5_BC_10w_5ep; export EPOCHS=5 NPROC_PER_NODE=4 MAX_SAMPLES=0
+        modes=(pivot5 pivot5_B pivot5_C)
         export TRAIN_DATA="$DLITE_WORKSPACE/data/finevision_qwen35_10w_img1024_relaxed/train.jsonl"
         export REUSE_VALIDATION_FROM="$DLITE_WORKSPACE/runs/preflight_10w_img1024_parallel_20261110_092423_ccec48bb"
         export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS:-0,1,2,3}"

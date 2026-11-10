@@ -360,6 +360,15 @@ def restore_rng(value):
         torch.cuda.set_rng_state(value["cuda_local"])
 
 
+def checkpoint_epoch_link(root, name, destination):
+    """Expose an epoch export without duplicating weights at the same update."""
+    if not name.startswith("epoch_") or not name[6:].isdigit():
+        return
+    link = root / ("." + name + "-" + uuid.uuid4().hex)
+    link.symlink_to(destination.name, target_is_directory=True)
+    os.replace(link, root / name)
+
+
 def save(session, name):
     """Atomic inference export, with optional rank-local resumable state."""
     root = Path(session.args.output_dir)
@@ -373,6 +382,8 @@ def save(session, name):
         dist.broadcast_object_list(values, src=0)
         exists = values[0]
     if exists:
+        if not final_only and session.vlm_config.get("save_every_epoch") and rank() == 0:
+            checkpoint_epoch_link(root, name, destination)
         return  # A boundary/final save can share the same optimizer step.
     staging = str(root / (".checkpoint-" + uuid.uuid4().hex)) if rank() == 0 else None
     if dist.is_initialized():
@@ -405,6 +416,8 @@ def save(session, name):
             link = root / (".last-" + uuid.uuid4().hex)
             link.symlink_to(destination.name, target_is_directory=True)
             os.replace(link, root / "last")
+            if session.vlm_config.get("save_every_epoch"):
+                checkpoint_epoch_link(root, name, destination)
         print(f"Saved checkpoint: {destination}", flush=True)
     if dist.is_initialized():
         dist.barrier()
@@ -453,7 +466,9 @@ def log(session, window, grad_norm):
     # Preserve upstream cross-epoch accumulation: export at the first update
     # boundary after an epoch, never discard or serialize partial gradients.
     if completed > session.last_exported_epoch and not session.vlm_config.get("final_only", False):
-        save(session, f"epoch_{completed}")
+        epochs = range(session.last_exported_epoch + 1, completed + 1) if session.vlm_config.get("save_every_epoch") else [completed]
+        for epoch in epochs:
+            save(session, f"epoch_{epoch}")
         session.last_exported_epoch = completed
 
 
@@ -484,7 +499,9 @@ def run(argv=None):
             raise ValueError("DFlash context runs use a fresh optimizer; use init-checkpoint for weights-only adaptation")
         if args.save_training_state:
             raise ValueError("DFlash context runs save final inference weights only")
-        cfg["final_only"] = True
+        if not isinstance(cfg.get("save_every_epoch", False), bool):
+            raise ValueError("save_every_epoch must be a boolean")
+        cfg["final_only"] = not cfg.get("save_every_epoch", False)
     init = args.init_checkpoint or cfg.get("init_checkpoint")
     if init:
         if args.resume:

@@ -68,3 +68,21 @@ validation cache must not be substituted for it. Override `INIT_CHECKPOINT` or
 The pair launcher writes a new output directory with the real epoch/batch
 settings in its name, and prints the exact `tail -f` command and final checkpoint
 paths. Stop older training jobs using the same GPUs before launching a new pair.
+
+## From scratch on 10w, saving each epoch
+
+```bash
+SAVE_EVERY_EPOCH=1 bash tests/train_dflash_context_10w_pair.sh
+```
+
+This is the recorded 10w pair (two epochs, four GPUs per mode, micro batch 4,
+accumulation 16) with no draft initialization checkpoint. The frozen Target
+still loads its normal Qwen3.5-4B weights. Each mode exports `epoch_1`, `epoch_2`
+and `last`. Epoch directories and `last` are atomic symlinks to complete
+`step_XXXXXXX` weight exports, so an epoch/final boundary does not duplicate the
+same model. Optimizer/RNG training-state files remain disabled.
+
+As in the existing runner, an epoch export occurs at the first completed
+optimizer update at or after its boundary; accumulation carries across epochs.
+Partial gradients are neither discarded nor applied early just to save a model.
+The default `SAVE_EVERY_EPOCH=0` retains final-only behavior for older commands.

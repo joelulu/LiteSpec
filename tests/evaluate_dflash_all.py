@@ -1,0 +1,292 @@
+"""Eight GPU-affine datasets: AR/Full/Pivot1, frozen inputs and combined reports."""
+from __future__ import annotations
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import csv
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+HERE = Path(__file__).resolve().parent
+PLAN = (
+    ("gsm8k", "text"), ("charxiv_val", "image"), ("textvqa", "image"),
+    ("flickr30k", "image"), ("hr_bench_4k", "image"), ("hr_bench_8k", "image"),
+    ("VideoDetailCaption", "video"), ("Video-MME", "video"),
+)
+FIELDS = ("dataset", "kind", "gpu", "model", "samples", "batch_size", "committed_length",
+          "first_hit_rate", "tok_s", "speedup", "matched", "requests", "peak_gib")
+
+
+def write_json(path, value):
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n")
+    temporary.replace(path)
+
+
+def fingerprint(path):
+    path = Path(path).expanduser().resolve(strict=True)
+    config = path / "config.json"
+    weights = sorted([*path.glob("*.safetensors"), *path.glob("*.bin")])
+    if not config.is_file() or not weights:
+        raise FileNotFoundError(f"Incomplete checkpoint (config/weights required): {path}")
+    return dict(path=str(path), config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+                weights=[dict(name=p.name, bytes=p.stat().st_size, mtime_ns=p.stat().st_mtime_ns) for p in weights])
+
+
+def prepare(args):
+    from run_vlm_matrix import select_data as select_images
+    from video_benchmark_data import select_data as select_videos
+
+    root = args.output_dir.expanduser().resolve()
+    if root.exists():
+        raise FileExistsError(f"Choose a fresh evaluation output directory: {root}")
+    group = args.run_group.expanduser().resolve(strict=True)
+    models = {name: fingerprint(group / name / "last") for name in ("full", "pivot1")}
+    target = fingerprint(args.target_model)
+    for label, item in models.items():
+        config = json.loads((Path(item["path"]) / "config.json").read_text())
+        if config.get("architectures") != ["DFlashDraftModel"] or config.get("vlm_config", {}).get("draft_context", "full") != label:
+            raise ValueError(f"Checkpoint {label} has the wrong architecture/context: {item['path']}")
+
+    # Explicitly override inherited PROMPT_FIELD=question. Existing reference
+    # policy reads prompt, otherwise the first conversation content.
+    os.environ["PROMPT_FIELD"] = args.prompt_field
+    os.environ["DATA_DIR"] = str(args.data_dir.expanduser())
+    os.environ["IMAGE_ROOT"] = str((args.image_root or args.data_dir / "imgs").expanduser())
+    if args.text_data is not None:
+        os.environ["TEXT_DATA"] = str(args.text_data.expanduser())
+    packets, failures = {}, []
+    for name, kind in PLAN:
+        try:
+            if kind == "video":
+                packets[name] = select_videos(args.video_data_root, [name], args.video_samples, args.seed)[name]
+            else:
+                selected = select_images(argparse.Namespace(
+                    tests=["text-only" if name == "gsm8k" else name], samples=args.samples, seed=args.seed,
+                ))
+                packets[name] = selected[name]
+        except Exception as exc:
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+    if failures:
+        raise ValueError("Dataset preparation failed before loading models:\n" + "\n".join(failures))
+
+    vision = json.loads((Path(target["path"]) / "config.json").read_text())["vision_config"]
+    image_pixels = args.image_max_tokens * (vision["patch_size"] * vision["spatial_merge_size"]) ** 2
+    (root / "inputs").mkdir(parents=True)
+    (root / "logs").mkdir()
+    (root / "results").mkdir()
+    jobs = []
+    for (name, kind), gpu in zip(PLAN, args.gpus):
+        sample_count = args.video_samples if kind == "video" else args.samples
+        if kind == "video":
+            snapshot = root / "inputs" / (name + ".json")
+            write_json(snapshot, {name: packets[name]})
+        else:
+            snapshot = root / "inputs" / (name + ".jsonl")
+            snapshot.write_text(packets[name]["serialized"])
+        job = dict(dataset=name, kind=kind, gpu=gpu, samples=sample_count,
+                   snapshot=str(snapshot), output=str(root / "results" / name), log=str(root / "logs" / (name + ".log")))
+        job["input_sha256"] = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+        if kind != "video":
+            job["source"] = packets[name]["source"]
+        job["command"] = command(args, job, models, target["path"], image_pixels)
+        jobs.append(job)
+    manifest = dict(run_group=str(group), target=target, checkpoints=models,
+                    settings=vars(args), image_max_pixels=image_pixels, jobs=jobs)
+    write_json(root / "manifest.json", manifest)
+    return root, jobs
+
+
+def command(args, job, models, target, image_pixels):
+    video = job["kind"] == "video"
+    cmd = [sys.executable, str(HERE / ("benchmark_video.py" if video else "benchmark_vlm_static_batch.py")),
+           "--target-model", str(target), "--output-dir", job["output"],
+           "--batch-sizes", str(args.batch_size), "--max-new-tokens", str(args.max_new_tokens),
+           "--seed", str(args.seed), "--warmup", str(args.warmup)]
+    for label, item in models.items():
+        cmd += ["--checkpoint", label, item["path"]]
+    if video:
+        cmd += ["--workspace", str(args.workspace), "--data-root", str(args.video_data_root),
+                "--datasets", job["dataset"], "--selection-file", job["snapshot"],
+                "--samples", str(job["samples"]), "--frames", str(args.frames),
+                "--max-pixels-per-frame", str(args.max_pixels_per_frame)]
+    else:
+        cmd += ["--data", job["snapshot"], "--dataset-name", job["dataset"],
+                "--max-samples", str(job["samples"]), "--image-max-pixels", str(image_pixels),
+                "--cpu-inputs", "--attention-backend", "sdpa", "--state-mode", "per_token",
+                "--visual-condition", "correct"]
+    return cmd
+
+
+def normalized(job, row):
+    video = job["kind"] == "video"
+    return dict(dataset=job["dataset"], kind=job["kind"], gpu=job["gpu"], model=row["model"],
+                samples=job["samples"], batch_size=row["batch_size"],
+                committed_length=row["mean_committed_length"], first_hit_rate=row.get("first_candidate_hit_rate"),
+                tok_s=row["decode_tok_s" if video else "output_tokens_per_second"],
+                speedup=row["raw_decode_ratio_vs_ar" if video else "raw_throughput_speedup_vs_ar"],
+                matched=row["matched"], requests=row["requests"], peak_gib=row["peak_allocated_gib"])
+
+
+def read_summary(job, batch_size):
+    rows = json.loads((Path(job["output"]) / "summary.json").read_text())
+    labels = [row["model"] for row in rows]
+    if len(labels) != 3 or set(labels) != {"ar", "full", "pivot1"}:
+        raise ValueError(f"Expected completed AR/Full/Pivot1 rows, got {labels}")
+    if any(row["batch_size"] != batch_size or row["requests"] != job["samples"] * batch_size for row in rows):
+        raise ValueError("Summary batch/sample counts differ from the requested job")
+    # Token mismatches remain visible but do not hide measured throughput.
+    return [normalized(job, row) for row in rows]
+
+
+def report(root, jobs, statuses):
+    rows = []
+    for job in jobs:
+        if statuses.get(job["dataset"], {}).get("status") == "success":
+            data = json.loads((Path(job["output"]) / "summary.json").read_text())
+            rows.extend(normalized(job, row) for row in data)
+    write_json(root / "status.json", statuses)
+    write_json(root / "comparison.json", rows)
+    with (root / "comparison.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    lines = ["# DFlash evaluation", "",
+             "B is static batch size. Ratios use same-GPU AR; timing is decode-only.",
+             "Video-MME uses the existing video-description protocol, not official QA accuracy.", "",
+             "| Dataset | GPU | Model | B | Committed | First hit | tok/s | Speedup | AR match | Peak GiB |",
+             "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|"]
+    for row in rows:
+        length = "—" if row["committed_length"] is None else f"{row['committed_length']:.3f}"
+        hit = "—" if row["first_hit_rate"] is None else f"{row['first_hit_rate']:.1%}"
+        lines.append(f"| {row['dataset']} | {row['gpu']} | {row['model']} | {row['batch_size']} | {length} | {hit} | "
+                     f"{row['tok_s']:.2f} | {row['speedup']:.3f}x | {row['matched']}/{row['requests']} | {row['peak_gib']:.3f} |")
+    for name, status in statuses.items():
+        if status["status"] != "success":
+            lines += ["", f"{name}: {status['status']}; see logs/{name}.log"]
+    (root / "comparison.md").write_text("\n".join(lines) + "\n")
+
+
+def execute(root, jobs, batch_size):
+    processes, lock, stop = set(), threading.Lock(), threading.Event()
+    statuses = {}
+
+    def run(job):
+        started = time.monotonic()
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(job["gpu"]),
+                   OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", TOKENIZERS_PARALLELISM="false", PYTHONUNBUFFERED="1")
+        with Path(job["log"]).open("w") as log:
+            with lock:
+                if stop.is_set():
+                    return dict(status="cancelled", returncode=130)
+                process = subprocess.Popen(job["command"], stdout=log, stderr=subprocess.STDOUT,
+                                           env=env, cwd=HERE.parent, start_new_session=True)
+                processes.add(process)
+            try:
+                code = process.wait()
+            finally:
+                with lock:
+                    processes.discard(process)
+        result = dict(status="success" if code == 0 else "failed", returncode=code,
+                      elapsed_s=time.monotonic() - started, log=job["log"])
+        if code == 0:
+            try:
+                read_summary(job, batch_size)
+            except Exception as exc:
+                result.update(status="invalid_summary", returncode=1, error=str(exc))
+        return result
+
+    pool = ThreadPoolExecutor(max_workers=len(jobs))
+    pending = {}
+    try:
+        for job in jobs:
+            pending[pool.submit(run, job)] = job
+        for future in as_completed(pending):
+            job = pending[future]
+            try:
+                status = future.result()
+            except Exception as exc:
+                status = dict(status="failed", returncode=1, error=str(exc), log=job["log"])
+            statuses[job["dataset"]] = status
+            print(f"{job['dataset']} GPU {job['gpu']}: {status['status']}; {job['log']}", flush=True)
+            report(root, jobs, statuses)
+    except KeyboardInterrupt:
+        stop.set()
+        with lock:
+            active = list(processes)
+        for process in active:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for process in active:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        for future in pending:
+            future.cancel()
+        for job in jobs:
+            statuses.setdefault(job["dataset"], dict(status="interrupted", returncode=130, log=job["log"]))
+        report(root, jobs, statuses)
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return 0 if all(value["status"] == "success" for value in statuses.values()) else 1
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-group", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--workspace", type=Path, default=HERE.parent.parent)
+    parser.add_argument("--target-model", type=Path, default=Path.home() / "LMM/lmm_model/Qwen3.5-4B")
+    parser.add_argument("--data-dir", type=Path, default=Path.home() / "LMM/liyt/datasets/jsonl_datas")
+    parser.add_argument("--image-root", type=Path)
+    parser.add_argument("--text-data", type=Path)
+    parser.add_argument("--video-data-root", type=Path, default=Path.home() / "LMM/liyt/datasets/eval_bench")
+    parser.add_argument("--gpus", nargs="+", default=list(map(str, range(8))))
+    parser.add_argument("--samples", type=int, default=32)
+    parser.add_argument("--video-samples", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--image-max-tokens", type=int, default=1024)
+    parser.add_argument("--frames", type=int, default=16)
+    parser.add_argument("--max-pixels-per-frame", type=int, default=200704)
+    parser.add_argument("--prompt-field", choices=["reference", "prompt", "question", "first-content"], default="reference")
+    parser.add_argument("--dry-run", action="store_true", help="freeze inputs/commands without starting model processes")
+    args = parser.parse_args(argv)
+    if len(args.gpus) != 8 or len(set(args.gpus)) != 8:
+        parser.error("exactly eight distinct GPU selectors required")
+    if min(args.samples, args.video_samples, args.batch_size, args.max_new_tokens,
+           args.warmup, args.image_max_tokens, args.max_pixels_per_frame) < 1 or args.frames < 2 or args.frames % 2:
+        parser.error("positive budgets, warmup >=1 and an even frame count >=2 required")
+    root, jobs = prepare(args)
+    for job in jobs:
+        print(f"GPU {job['gpu']}: {job['dataset']}, {job['samples']} samples; AR/Full/Pivot1", flush=True)
+        print(shlex.join(job["command"]), flush=True)
+    print(f"Results: {root}\nMonitor: tail -f {root}/logs/*.log", flush=True)
+    if args.dry_run:
+        return 0
+    result = execute(root, jobs, args.batch_size)
+    print((root / "comparison.md").read_text(), flush=True)
+    print(f"Results: {root}", flush=True)
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

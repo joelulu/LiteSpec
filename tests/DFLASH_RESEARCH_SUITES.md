@@ -1,16 +1,16 @@
 # DFlash context and layer-adapter suites
 
-Run the two launchers separately. Each trains its five models sequentially,
+Run the two launchers separately. Each trains its models sequentially,
 using all GPUs assigned to that suite for each model. Draft weights, optimizer
 and schedule start fresh; the frozen Qwen3.5-4B Target loads normally.
 
 | Suite | Models | Data | Epochs | GPUs per model | Micro | Accumulation | Global batch |
 |---|---|---|---:|---:|---:|---:|---:|
 | `bash tests/train_dflash_exp1.sh` | Full, Recent128, Pivot1, Pivot5, Pivot12 | existing 10w candidates | 5 | 8 | 4 | 8 | 256 |
-| `bash tests/train_dflash_exp2.sh` | Pivot1, Pivot5, Pivot12, Pivot5-B, Pivot5-C | existing valid20k | 1 | 4 | 4 | 16 | 256 |
+| `bash tests/train_dflash_exp2.sh` | Pivot5-B, Pivot5-C | existing 10w candidates | 5 | 4 | 4 | 16 | 256 |
 
-The second list has **five** models, as confirmed. B/C are modifications of
-Pivot5, not a Cartesian product with the three baseline pivots.
+The second suite trains only the two Pivot5 adapters. Full, Recent128, Pivot1,
+Pivot5 and Pivot12 are already covered by experiment 1 and are not retrained.
 
 Both keep block size 8, 512 training anchors, 5 draft layers, image budget 1024,
 seed 42 and loss-decay gamma 4. Epoch exports are `epoch_1` through `epoch_N`,
@@ -46,7 +46,7 @@ the equivalent additive bias. Unsupported attention backends fail explicitly.
 The prior uses AdamW ownership; per-layer linear matrices keep normal optimizer
 ownership. Saved `dflash_config` flags reconstruct the modules during loading.
 
-Quick-suite startup runs `tests/check_dflash_layer_adapters.py --device cuda
+Adapter-suite startup runs `tests/check_dflash_layer_adapters.py --device cuda
 --flex` before training. It checks shared/per-layer equivalence, zero-prior
 equivalence, nonzero-prior block indexing and train/inference parity, optimizer
 classification, real gradient updates, checkpoint reload, and dense/Flex
@@ -54,20 +54,17 @@ forward and gradient agreement. It loads no Target model or evaluation dataset.
 
 ## Preflight reuse
 
-The long suite reuses
+Both suites use `data/finevision_qwen35_10w_img1024_relaxed/train.jsonl`,
+with `MAX_SAMPLES=0`, and reuse
 `runs/preflight_10w_img1024_parallel_20261110_092423_ccec48bb`.
 This filters 95,420 candidates to **56,712 eligible records**. Five epochs use
 these eligible records; the rejected 38,708 are not forced back into training.
 
-The quick suite uses the existing
-`data/finevision_qwen35_gdn_valid20k_img1024_b8_s42/train.jsonl`, with
-`MAX_SAMPLES=20000` and cache
-`runs/dflash_context_20k_1ep_20261110_041837_1299222/full`.
 Compatibility checks remain enabled; matching caches avoid image re-encoding.
 
 ## Automatic final evaluation
 
-After all five successful training jobs, evaluate their `last` checkpoints
+After all training jobs in the suite succeed, evaluate their `last` checkpoints
 against same-GPU Target-only AR with frozen selections, **B=1 only**, 32 samples
 per dataset (including both videos), seed 42, warmup 1 and max new tokens 256:
 
@@ -75,7 +72,7 @@ per dataset (including both videos), seed 42, warmup 1 and max new tokens 256:
 * CharXiv, TextVQA, Flickr30k, HR-Bench 4K and 8K
 * VideoDetailCaption and Video-MME (16 frames/video, 200704 pixels/frame)
 
-Long-suite evaluation assigns the eight datasets to eight GPUs. Quick-suite
+Long-suite evaluation assigns the eight datasets to eight GPUs. Adapter-suite
 evaluation uses four independent GPU queues, one active dataset per GPU.
 All checkpoints use the same frozen samples within a dataset. Video-MME retains
 the existing video-description protocol, not official multiple-choice accuracy.
@@ -93,6 +90,7 @@ training job or evaluation. Evaluation records individual dataset failures and
 still runs the remaining datasets. Interrupts terminate only owned child jobs.
 
 To repeat only evaluation after training, set `RUN_GROUP` to its output path and
-pass all five explicit `--checkpoint LABEL PATH` entries to
+pass the suite's explicit `--checkpoint LABEL PATH` entries (five for experiment
+1, two for experiment 2) to
 `tests/evaluate_dflash_all.sh`; choose a fresh `RESULT_DIR` and set
 `VIDEO_SAMPLES=32 EVAL_SAMPLES=32 EVAL_BATCH_SIZE=1`.

@@ -15,14 +15,14 @@ case "${1:-}" in
         export REUSE_VALIDATION_FROM="$DLITE_WORKSPACE/runs/preflight_10w_img1024_parallel_20261110_092423_ccec48bb"
         export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS:-0,1,2,3,4,5,6,7}"
         ;;
-    quick)
-        suite=exp2_20k_1ep; export EPOCHS=1 NPROC_PER_NODE=4 MAX_SAMPLES=20000
-        modes=(pivot1 pivot5 pivot12 pivot5_B pivot5_C)
-        export TRAIN_DATA="$DLITE_WORKSPACE/data/finevision_qwen35_gdn_valid20k_img1024_b8_s42/train.jsonl"
-        export REUSE_VALIDATION_FROM="$DLITE_WORKSPACE/runs/dflash_context_20k_1ep_20261110_041837_1299222/full"
+    adapters)
+        suite=exp2_BC_10w_5ep; export EPOCHS=5 NPROC_PER_NODE=4 MAX_SAMPLES=0
+        modes=(pivot5_B pivot5_C)
+        export TRAIN_DATA="$DLITE_WORKSPACE/data/finevision_qwen35_10w_img1024_relaxed/train.jsonl"
+        export REUSE_VALIDATION_FROM="$DLITE_WORKSPACE/runs/preflight_10w_img1024_parallel_20261110_092423_ccec48bb"
         export CUDA_VISIBLE_DEVICES="${TRAIN_GPUS:-0,1,2,3}"
         ;;
-    *) echo "Usage: bash tests/train_dflash_research_suite.sh long|quick" >&2; exit 2 ;;
+    *) echo "Usage: bash tests/train_dflash_research_suite.sh long|adapters" >&2; exit 2 ;;
 esac
 export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
 [[ "$MICRO_BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo 'MICRO_BATCH_SIZE must be positive' >&2; exit 2; }
@@ -71,7 +71,7 @@ print('Output:', root, flush=True)
 PY
 # Check C's learnable Flex score modifier and optimizer ownership before any
 # long training. No Target weights or external dataset are loaded by this test.
-if [[ "$1" == quick ]]; then
+if [[ "$1" == adapters ]]; then
     "$PYTHON_BIN" tests/check_dflash_layer_adapters.py --device cuda --flex \
         2>&1 | tee "$RUN_GROUP/layer_adapter_check.log"
 fi

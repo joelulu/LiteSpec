@@ -106,12 +106,16 @@ touch "$RESULT_DIR/comparison.md"
                 self.assertEqual(evaluations,[])
                 return
             self.assertEqual(result.returncode,0,result.stderr+result.stdout)
-            modes=['full','recent128','pivot1','pivot5','pivot12'] if preset==1 else ['pivot1','pivot5','pivot12','pivot5_B','pivot5_C']
+            modes=['full','recent128','pivot1','pivot5','pivot12'] if preset==1 else ['pivot5_B','pivot5_C']
             self.assertEqual([r['args'][0] for r in trains],modes)
             for row in trains:
                 e=row['env']
-                self.assertEqual(e['EPOCHS'],'5' if preset==1 else '1')
-                self.assertEqual(e['MAX_SAMPLES'],'0' if preset==1 else '20000')
+                self.assertEqual(e['EPOCHS'],'5')
+                self.assertEqual(e['MAX_SAMPLES'],'0')
+                self.assertEqual(e['TRAIN_DATA'],str(workspace/'data/finevision_qwen35_10w_img1024_relaxed/train.jsonl'))
+                self.assertEqual(e['REUSE_VALIDATION_FROM'],str(workspace/'runs/preflight_10w_img1024_parallel_20261110_092423_ccec48bb'))
+                self.assertEqual(e['NPROC_PER_NODE'],'8' if preset==1 else '4')
+                self.assertEqual(e['ACCUMULATION_STEPS'],str(256//((8 if preset==1 else 4)*int(micro))))
                 self.assertEqual(int(e['MICRO_BATCH_SIZE'])*int(e['NPROC_PER_NODE'])*int(e['ACCUMULATION_STEPS']),256)
                 self.assertEqual(e['SAVE_EVERY_EPOCH'],'1')
                 self.assertTrue(all(key not in e for key in ['INIT_CHECKPOINT','RESUME','MAX_STEPS']))
@@ -125,7 +129,7 @@ touch "$RESULT_DIR/comparison.md"
             self.assertEqual(len(checks),0 if preset==1 else 1)
 
     def test_long_preset(self): self.exercise(1)
-    def test_quick_preset(self): self.exercise(2)
+    def test_adapter_preset_skips_baselines_and_uses_10w_five_epochs(self): self.exercise(2)
     def test_smaller_micro_preserves_global_batch(self): self.exercise(1,micro='2')
     def test_failure_stops_before_other_training_and_eval(self): self.exercise(2,fail=True)
 

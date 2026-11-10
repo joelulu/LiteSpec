@@ -4,6 +4,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PATHS = (
+    "tests/check_dflash_context_cuda.py",
     "tests/run_dflash_context_ablation.sh",
     "litespec/vlm/dflash_context.py",
     "tests/dflash_context_config.py",

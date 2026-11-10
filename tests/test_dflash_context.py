@@ -203,3 +203,39 @@ def test_benchmark_cli_wrong_and_mask_reuse_ar(tmp_path,monkeypatch):
         rows=json.loads((tmp_path/condition/'summary.json').read_text())
         assert len(rows)==2 and rows[1]['visual_condition']==condition
         assert (tmp_path/condition/'summary.csv').is_file()
+
+
+def test_flex_callback_has_no_mutation_after_functionalization(monkeypatch):
+    """CUDA lowering rejects copy_ introduced by functionalizing &= in mask_mod."""
+    import ast, inspect
+    from torch.fx.experimental.proxy_tensor import make_fx
+    from litespec.core import attention_masks as m
+    assert not any(isinstance(node,ast.AugAssign) for node in ast.walk(ast.parse(inspect.getsource(m.create_dflash_flex_mask))))
+    captured={}
+    def capture(rule,**kw): captured['rule']=rule
+    monkeypatch.setattr(m,'FLEX_ATTENTION_AVAILABLE',True)
+    monkeypatch.setattr(m,'create_flex_block_mask',capture)
+    for slots,window,sliding in [(1,128,None),(1,1,None),(12,1,None),(1,None,4)]:
+        m.create_dflash_flex_mask(torch.tensor([[3,7]]),torch.tensor([[True,True]]),8,4,'cpu',
+            context_window=window,context_slots=slots,sliding_window=sliding)
+        rule=captured['rule']
+        callback=lambda q,k: rule(0,0,q,k)
+        graph=make_fx(torch.func.functionalize(callback))(torch.tensor([2]),torch.tensor([1]))
+        mutations=[n.target for n in graph.graph.nodes if n.op=='call_function' and
+                   getattr(getattr(n.target,'_schema',None),'is_mutable',False)]
+        assert mutations==[], mutations
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='requires CUDA FlexAttention')
+@pytest.mark.parametrize('slots,window',[(1,128),(1,1),(12,1)])
+def test_cuda_flex_context_forward_backward(slots,window):
+    from litespec.core.attention_masks import create_dflash_flex_mask
+    from litespec.modeling.draft.flex_attention import compile_friendly_flex_attention
+    q=torch.randn(1,2,8,32,device='cuda',dtype=torch.bfloat16,requires_grad=True)
+    k=torch.randn(1,1,17*slots+8,32,device='cuda',dtype=torch.bfloat16,requires_grad=True)
+    v=torch.randn_like(k,requires_grad=True)
+    mask=create_dflash_flex_mask(torch.tensor([[8,13]],device='cuda'),torch.ones(1,2,device='cuda',dtype=torch.bool),
+        17,4,'cuda',context_window=window,context_slots=slots)
+    result=compile_friendly_flex_attention(q,k,v,block_mask=mask,enable_gqa=True)
+    result.float().square().mean().backward()
+    assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in (q,k,v))

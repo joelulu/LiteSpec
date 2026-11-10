@@ -71,12 +71,12 @@ def create_dflash_sdpa_mask(
     )
     context_mask = (kv < C) & (kv // context_slots < anchors)
     if context_window is not None:
-        context_mask &= kv // context_slots >= anchors - context_window
+        context_mask = context_mask & (kv // context_slots >= anchors - context_window)
     if sliding_window is not None:
-        context_mask &= kv // context_slots >= anchors + q_offset - (sliding_window - 1)
+        context_mask = context_mask & (kv // context_slots >= anchors + q_offset - (sliding_window - 1))
     draft_mask = (kv >= C) & (q_block == (kv - C) // block_size)
     if sliding_window is not None:
-        draft_mask &= (kv - C) % block_size <= q_offset
+        draft_mask = draft_mask & ((kv - C) % block_size <= q_offset)
     valid = block_keep_mask.view(bsz, 1, num_blocks, 1).repeat_interleave(block_size, 2)
     return (context_mask | draft_mask) & valid
 
@@ -112,12 +112,12 @@ def create_dflash_flex_mask(
         anchor = anchor_positions[b, safe_block_indices]
         context_mask = (kv_idx < C) & (kv_idx // context_slots < anchor)
         if context_window is not None:
-            context_mask &= kv_idx // context_slots >= anchor - context_window
+            context_mask = context_mask & (kv_idx // context_slots >= anchor - context_window)
         if sliding_window is not None:
-            context_mask &= kv_idx // context_slots >= anchor + qo - (sliding_window - 1)
+            context_mask = context_mask & (kv_idx // context_slots >= anchor + qo - (sliding_window - 1))
         draft_mask = (kv_idx >= C) & (qb == (kv_idx - C) // block_size)
         if sliding_window is not None:
-            draft_mask &= (kv_idx - C) % block_size <= qo
+            draft_mask = draft_mask & ((kv_idx - C) % block_size <= qo)
         return (
             (context_mask | draft_mask)
             & block_keep_mask[b, safe_block_indices]

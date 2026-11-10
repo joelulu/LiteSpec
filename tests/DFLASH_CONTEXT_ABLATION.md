@@ -95,3 +95,21 @@ CPU tiny Qwen3.5 integration covers training/backprop, export/reload, bounded/fu
 `per_token` GDN commit, Wrong/Mask, and the actual fixed-prefix CLI. Mask tests compare dense/Flex rules
 and compare packed training hidden against independent same-prefix inference.
 Full-size H100 eight-rank training and CUDA Flex kernels must still be exercised on the user's machine.
+
+## PyTorch 2.9.1 CUDA callback compatibility
+
+The first release used `&=` in a Flex mask callback, which lowered to `aten.copy_` and
+failed Inductor pointwise-subgraph lowering on CUDA. All DFlash mask combinations now
+use out-of-place boolean expressions. Visibility and the training objective are unchanged.
+Regression checks prohibit augmented assignment inside the callback and inspect its functionalized FX graph.
+Before allocating eight ranks, run:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 "$PYTHON_BIN" tests/check_dflash_context_cuda.py
+```
+
+This compiles and backpropagates actual recent128/pivot1/pivot12 Flex kernels with head_dim=256
+and compares outputs to dense SDPA. It requires a CUDA machine; it was not executed in the CPU editor environment.
+A completed Full checkpoint remains valid. Restart the three bounded variants in a fresh run group
+using `CONTEXTS="recent128 pivot1 pivot12"` and `REUSE_VALIDATION_FROM=<old-run>/full`.
+After training, symlink `<new-run>/full` to `<old-run>/full` before the combined evaluation.

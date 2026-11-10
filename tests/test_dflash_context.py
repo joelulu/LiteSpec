@@ -279,3 +279,52 @@ def test_pivot5_configuration_keeps_matched_budget(monkeypatch):
     assert config['block_size']==8 and config['num_epochs']==1
     assert config['batch_size']==4 and config['accumulation_steps']==2
     assert config['draft_context']=='pivot5' and config['final_only']
+
+
+def test_video_probe_selects_frozen_mixed_packets(monkeypatch,tmp_path):
+    import json
+    import probe_dflash_visual as cli
+    import video_benchmark_data as video
+    calls=[]
+    def images(args):
+        assert args.tests==['textvqa']
+        return dict(textvqa=dict(source='image.jsonl',serialized='{"id":"im"}\n'))
+    def videos(root,names,count,seed):
+        calls.append((root,names,count,seed))
+        return {name:[dict(id=f'{name}:a',video='a.mp4'),dict(id=f'{name}:b',video='b.mp4')] for name in names}
+    monkeypatch.setattr(cli,'select_data',images)
+    monkeypatch.setattr(video,'select_data',videos)
+    packets=cli.select_packets(SimpleNamespace(tests=['textvqa','Video-MME','VideoDetailCaption'],samples=50,seed=42,video_data_root=tmp_path))
+    assert list(packets)==['textvqa','Video-MME','VideoDetailCaption']
+    assert calls==[(tmp_path,['Video-MME','VideoDetailCaption'],50,42)]
+    assert len(packets['Video-MME']['serialized'].splitlines())==2
+
+
+def test_video_probe_preparation_and_real_target_collection(monkeypatch):
+    import probe_dflash_visual as cli
+    import video_runtime
+    from test_vlm import tiny_qwen35,tiny_image_inputs
+    from test_vlm_aligned import Processor
+    from litespec.vlm.baselines import make_draft
+    from litespec.vlm.runtime import PreparedExample
+    target=tiny_qwen35().requires_grad_(False)
+    target.config.video_token_id=93
+    target.config.text_config.eos_token_id=None
+    inputs=tiny_image_inputs()
+    inputs['input_ids'][inputs['input_ids']==91]=93
+    inputs['mm_token_type_ids']*=2
+    inputs['pixel_values_videos']=inputs.pop('pixel_values')
+    inputs['video_grid_thw']=inputs.pop('image_grid_thw')
+    initial=PreparedExample(inputs,8,inputs['input_ids'][0]==93,'video:1')
+    def prepare(processor,config,record,frames,max_pixels):
+        assert frames==16 and max_pixels==200704
+        return initial,dict(actual_frames=frames,video_tokens=4)
+    monkeypatch.setattr(video_runtime,'prepare_video',prepare)
+    args=SimpleNamespace(device='cpu',frames=16,max_pixels_per_frame=200704)
+    example,metadata,fingerprint=cli.prepare_probe_input(Processor(),target.config,dict(video='a.mp4'),args,'source')
+    assert int(example.vision_mask.sum())==6  # includes both delimiters
+    assert metadata['modality']=='video' and metadata['intervention_slots']==6
+    assert len(fingerprint)==64
+    draft=make_draft(target,Processor(),dict(algorithm='dflash',num_draft_layers=1,block_size=4,target_model='tiny',context_policy={}))
+    item=cli.collect(target,draft,example,8)
+    assert len(item['tokens'])==8 and item['features'].shape[1]==15

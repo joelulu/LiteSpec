@@ -137,3 +137,21 @@ RUN_GROUP="$COMPARISON_RUN" PIVOT5_CHECKPOINT="$PIVOT5_RUN/pivot5/last" \
 ```
 
 No copying or overwriting of the four completed checkpoints is needed.
+
+## Video visual-slot probes (no training)
+
+`bash tests/probe_dflash_visual_video.sh` probes the original Full-2w and historical
+DFlash-100k checkpoints on TextVQA, Video-MME and VideoDetailCaption, 50 distinct inputs
+per dataset, seed42, cap256. Up to8 fixed AR-prefix probes/input, stride16. Thus N counts
+probe prefixes, not source samples; short/EOS outputs can yield fewer than400 prefixes.
+Video defaults:16 evenly sampled frames,200704 pixels/frame; TextVQA image budget1024.
+`FULL_2W`, `DFLASH_100K`, `VIDEO_DATA_ROOT`, `TESTS`, `EVAL_GPU`, and `RESULT_DIR` are overridable.
+Use a fresh RESULT_DIR. No training or performance benchmark is run by this entry point.
+
+Video uses the existing native video preparation, timestamps and prompts. Video-MME
+continues to use the repository's description prompt, not official multiple-choice accuracy.
+Wrong swaps another video's visual-position Target features from within the same dataset.
+Recipient text, pivot, positions and visual-slot count remain fixed; unequal donor lengths
+use the same deterministic index alignment as images. Both image and video probe masks
+include visual delimiters. Target always retains the correct original image/video.
+Processed grids/frame counts and intervention-slot counts are recorded in settings.json.

@@ -117,6 +117,37 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--video-samples", result.stdout)
 
+    def test_five_checkpoints_four_gpu_queues_and_32_video_samples(self):
+        labels = ['pivot1', 'pivot5', 'pivot12', 'pivot5_B', 'pivot5_C']
+        self.args.checkpoint = []
+        self.args.gpus = ['4','5','6','7']
+        self.args.video_samples = 32
+        for label in labels:
+            directory = self.root / 'models' / label
+            directory.mkdir(parents=True)
+            (directory / 'config.json').write_text(json.dumps(dict(
+                architectures=['DFlashDraftModel'],
+                vlm_config=dict(draft_context='pivot5' if label.endswith(('_B','_C')) else label),
+                dflash_config=dict(context_projection='per_layer' if label.endswith(('_B','_C')) else 'shared',
+                                   position_layer_bias=label == 'pivot5_C'))))
+            (directory / 'model.safetensors').touch()
+            self.args.checkpoint.append((label, directory))
+        with patch.dict(sys.modules, self.modules):
+            root, jobs = cli.prepare(self.args)
+        self.assertEqual([j['gpu'] for j in jobs], ['4','5','6','7']*2)
+        self.assertTrue(all(j['models'] == ['ar', *labels] for j in jobs))
+        self.assertTrue(all(j['samples'] == 32 for j in jobs))
+        for job in jobs:
+            command = job['command']
+            self.assertEqual([command[i+1] for i, a in enumerate(command) if a == '--checkpoint'], labels)
+
+    def test_wrong_c_adapter_is_rejected(self):
+        self.args.checkpoint = [('pivot5_C', self.args.run_group / 'pivot1/last')]
+        path = self.args.run_group / 'pivot1/last/config.json'
+        path.write_text(json.dumps(dict(architectures=['DFlashDraftModel'], vlm_config=dict(draft_context='pivot5'))))
+        with patch.dict(sys.modules, self.modules), self.assertRaisesRegex(ValueError, 'wrong layer adapter'):
+            cli.prepare(self.args)
+
 
 class ExecutionTests(unittest.TestCase):
     def setUp(self):
@@ -160,6 +191,22 @@ class ExecutionTests(unittest.TestCase):
         status = json.loads((self.root / "status.json").read_text())["partial"]
         self.assertEqual(status["status"], "invalid_summary")
         self.assertEqual(json.loads((self.root / "comparison.json").read_text()), [])
+
+    def test_same_gpu_jobs_never_overlap_and_ar_plus_five_rows_are_checked(self):
+        labels = ['ar', 'pivot1', 'pivot5', 'pivot12', 'pivot5_B', 'pivot5_C']
+        jobs = [self.job('dataset'+str(i), 'image', i % 2) for i in range(8)]
+        # A nonblocking per-GPU OS lock fails immediately if the scheduler
+        # accidentally launches two datasets on the same physical selector.
+        code = ("import fcntl,json,os,pathlib,sys,time; "
+                "lock=open(sys.argv[3]+'/gpu'+os.environ['CUDA_VISIBLE_DEVICES']+'.lock','w'); "
+                "fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB); time.sleep(.03); "
+                "p=pathlib.Path(sys.argv[1]); p.mkdir(); (p/'summary.json').write_text(sys.argv[2])")
+        for job in jobs:
+            job['models'] = labels
+            job['command'] = [sys.executable, '-c', code, job['output'],
+                              json.dumps([row(label, 32) for label in labels]), str(self.root)]
+        self.assertEqual(cli.execute(self.root, jobs, 1), 0)
+        self.assertEqual(len(json.loads((self.root/'comparison.json').read_text())), 8*6)
 
     def test_interrupt_cleans_up_only_owned_child_process(self):
         pid_file = self.root / "child.pid"

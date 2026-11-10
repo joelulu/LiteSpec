@@ -7,6 +7,8 @@ from litespec.vlm.dflash_context import CONTEXTS
 
 
 def build(mode):
+    variant = mode
+    mode = "pivot5" if variant in ("pivot5_B", "pivot5_C") else variant
     if mode not in CONTEXTS:
         raise ValueError(mode)
     epoch_save = os.getenv('SAVE_EVERY_EPOCH', '0')
@@ -19,6 +21,9 @@ def build(mode):
         accumulation_steps=int(os.getenv('ACCUMULATION_STEPS','2')), block_size=8,
         num_anchors=512, save_every_epoch=epoch_save, final_only=not epoch_save, final_save=True, save_interval=10**12,
         image_max_tokens=int(os.getenv('IMAGE_MAX_TOKENS','1024')), log_interval=1)
+    config.update(context_projection="per_layer" if variant in ("pivot5_B", "pivot5_C") else "shared",
+                  position_layer_bias=variant == "pivot5_C", context_experiment_variant=variant,
+                  loss_decay_gamma=4.0)
     if os.getenv('INIT_CHECKPOINT'):
         config['init_checkpoint'] = str(Path(os.environ['INIT_CHECKPOINT']).expanduser().resolve(strict=True))
     return config

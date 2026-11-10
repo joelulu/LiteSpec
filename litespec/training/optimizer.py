@@ -42,7 +42,7 @@ def register_optimizer_parameters(model, parameters=None):
                 muon_exceptions.intersection(path.split("."))
                 or isinstance(module, torch.nn.Embedding)
                 or "norm" in type(module).__name__.lower()
-                or name in ("bias", "base_kernel")
+                or name in ("bias", "base_kernel", "context_layer_bias")
             ):
                 kind = "adamw"
             elif (
@@ -757,3 +757,4 @@ def normalize_accumulated_gradients(
     scale = world_size * int(accumulation_steps) / denominator_value
     optimizer.scale_model_gradients(scale)
     return denominator_value
+

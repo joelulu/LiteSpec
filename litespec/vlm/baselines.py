@@ -56,6 +56,9 @@ def make_draft(target, processor, cfg):
     if context == "pivot12" and not cfg.get("target_layer_ids"):
         layers = [0, 1, 4, 7, 11, 14, 17, 20, 24, 27, 30, 31]
     method = dict(target_layer_ids=layers, mask_token_id=mask, attention_mode="gqa")
+    if family == "dflash":
+        method.update(context_projection=cfg.get("context_projection", "shared"),
+                      position_layer_bias=cfg.get("position_layer_bias", False))
     if family == "dspark":
         method.update(projector_type="dspark", markov_head_type=cfg["markov_head_type"],
                       markov_rank=cfg["markov_rank"], enable_confidence_head=cfg["confidence_head"],
@@ -145,4 +148,5 @@ class DraftCache:
         else:
             self.hidden = torch.cat([self.hidden, new], 1)[:, -self.window:]
             self.visual_keep = self.visual_keep[:, -self.window:]
+
 

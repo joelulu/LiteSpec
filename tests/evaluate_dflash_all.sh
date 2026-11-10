@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Eight distinct GPUs, one dataset per GPU. Existing checkpoints are read only.
+# One to eight GPU queues; existing checkpoints are read only.
 set -euo pipefail
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
@@ -7,7 +7,7 @@ export DLITE_WORKSPACE="${DLITE_WORKSPACE:-$(dirname -- "$REPO")}"
 export PYTHON_BIN="${PYTHON_BIN:-$DLITE_WORKSPACE/LiteSpec/.venv-vlm/bin/python}"
 export PYTHONPATH="$REPO:$REPO/tests${PYTHONPATH:+:$PYTHONPATH}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
-: "${RUN_GROUP:?Set RUN_GROUP to the intended Full/Pivot1 training directory}"
+: "${RUN_GROUP:?Set RUN_GROUP to the intended training directory}"
 RESULT_DIR="${RESULT_DIR:-$RUN_GROUP/eval_all_$(date +%Y%m%d_%H%M%S)_$$}"
 read -r -a gpus <<< "${EVAL_GPUS:-0 1 2 3 4 5 6 7}"
 args=(

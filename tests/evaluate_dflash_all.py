@@ -1,8 +1,10 @@
-"""Eight GPU-affine datasets: AR/Full/Pivot1, frozen inputs and combined reports."""
+"""Eight datasets, arbitrary DFlash checkpoints, GPU queues and frozen inputs."""
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from collections import defaultdict, deque
+import re
 import csv
 import hashlib
 import json
@@ -50,12 +52,23 @@ def prepare(args):
     if root.exists():
         raise FileExistsError(f"Choose a fresh evaluation output directory: {root}")
     group = args.run_group.expanduser().resolve(strict=True)
-    models = {name: fingerprint(group / name / "last") for name in ("full", "pivot1")}
+    selections = getattr(args, "checkpoint", None) or [(name, group / name / "last") for name in ("full", "pivot1")]
+    labels = [label for label, path in selections]
+    if len(set(labels)) != len(labels) or any(label == "ar" or not re.fullmatch(r"[A-Za-z0-9_-]+", label) for label in labels):
+        raise ValueError("Checkpoint labels must be unique, safe names other than ar")
+    models = {label: fingerprint(path) for label, path in selections}
     target = fingerprint(args.target_model)
     for label, item in models.items():
         config = json.loads((Path(item["path"]) / "config.json").read_text())
-        if config.get("architectures") != ["DFlashDraftModel"] or config.get("vlm_config", {}).get("draft_context", "full") != label:
+        context = config.get("vlm_config", {}).get("draft_context", "full")
+        known = {name: name for name in ("full", "recent128", "pivot1", "pivot5", "pivot12")}
+        known.update(pivot5_B="pivot5", pivot5_C="pivot5")
+        if config.get("architectures") != ["DFlashDraftModel"] or context != known.get(label, context):
             raise ValueError(f"Checkpoint {label} has the wrong architecture/context: {item['path']}")
+        if label in ("pivot5_B", "pivot5_C"):
+            method = config.get("dflash_config", {})
+            if method.get("context_projection") != "per_layer" or method.get("position_layer_bias", False) != (label == "pivot5_C"):
+                raise ValueError(f"Checkpoint {label} has the wrong layer adapter: {item['path']}")
 
     # Explicitly override inherited PROMPT_FIELD=question. Existing reference
     # policy reads prompt, otherwise the first conversation content.
@@ -85,7 +98,8 @@ def prepare(args):
     (root / "logs").mkdir()
     (root / "results").mkdir()
     jobs = []
-    for (name, kind), gpu in zip(PLAN, args.gpus):
+    for index, (name, kind) in enumerate(PLAN):
+        gpu = args.gpus[index % len(args.gpus)]
         sample_count = args.video_samples if kind == "video" else args.samples
         if kind == "video":
             snapshot = root / "inputs" / (name + ".json")
@@ -95,6 +109,7 @@ def prepare(args):
             snapshot.write_text(packets[name]["serialized"])
         job = dict(dataset=name, kind=kind, gpu=gpu, samples=sample_count,
                    snapshot=str(snapshot), output=str(root / "results" / name), log=str(root / "logs" / (name + ".log")))
+        job["models"] = ["ar", *models]
         job["input_sha256"] = hashlib.sha256(snapshot.read_bytes()).hexdigest()
         if kind != "video":
             job["source"] = packets[name]["source"]
@@ -140,8 +155,9 @@ def normalized(job, row):
 def read_summary(job, batch_size):
     rows = json.loads((Path(job["output"]) / "summary.json").read_text())
     labels = [row["model"] for row in rows]
-    if len(labels) != 3 or set(labels) != {"ar", "full", "pivot1"}:
-        raise ValueError(f"Expected completed AR/Full/Pivot1 rows, got {labels}")
+    expected = job.get("models", ["ar", "full", "pivot1"])
+    if len(labels) != len(expected) or set(labels) != set(expected):
+        raise ValueError(f"Expected completed {expected} rows, got {labels}")
     if any(row["batch_size"] != batch_size or row["requests"] != job["samples"] * batch_size for row in rows):
         raise ValueError("Summary batch/sample counts differ from the requested job")
     # Token mismatches remain visible but do not hide measured throughput.
@@ -205,20 +221,30 @@ def execute(root, jobs, batch_size):
                 result.update(status="invalid_summary", returncode=1, error=str(exc))
         return result
 
-    pool = ThreadPoolExecutor(max_workers=len(jobs))
+    queues = defaultdict(deque)
+    for job in jobs:
+        queues[job["gpu"]].append(job)
+    pool = ThreadPoolExecutor(max_workers=max(1, len(queues)))
     pending = {}
     try:
-        for job in jobs:
+        for queue in queues.values():
+            job = queue.popleft()
             pending[pool.submit(run, job)] = job
-        for future in as_completed(pending):
-            job = pending[future]
-            try:
-                status = future.result()
-            except Exception as exc:
-                status = dict(status="failed", returncode=1, error=str(exc), log=job["log"])
-            statuses[job["dataset"]] = status
-            print(f"{job['dataset']} GPU {job['gpu']}: {status['status']}; {job['log']}", flush=True)
-            report(root, jobs, statuses)
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                job = pending.pop(future)
+                try:
+                    status = future.result()
+                except Exception as exc:
+                    status = dict(status="failed", returncode=1, error=str(exc), log=job["log"])
+                statuses[job["dataset"]] = status
+                print(f"{job['dataset']} GPU {job['gpu']}: {status['status']}; {job['log']}", flush=True)
+                report(root, jobs, statuses)
+                queue = queues[job["gpu"]]
+                if queue:
+                    next_job = queue.popleft()
+                    pending[pool.submit(run, next_job)] = next_job
     except KeyboardInterrupt:
         stop.set()
         with lock:
@@ -251,6 +277,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-group", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint", nargs=2, action="append", metavar=("LABEL", "PATH"),
+                        help="repeat for arbitrary checkpoints; defaults to Full/Pivot1")
     parser.add_argument("--workspace", type=Path, default=HERE.parent.parent)
     parser.add_argument("--target-model", type=Path, default=Path.home() / "LMM/lmm_model/Qwen3.5-4B")
     parser.add_argument("--data-dir", type=Path, default=Path.home() / "LMM/liyt/datasets/jsonl_datas")
@@ -270,14 +298,14 @@ def main(argv=None):
     parser.add_argument("--prompt-field", choices=["reference", "prompt", "question", "first-content"], default="reference")
     parser.add_argument("--dry-run", action="store_true", help="freeze inputs/commands without starting model processes")
     args = parser.parse_args(argv)
-    if len(args.gpus) != 8 or len(set(args.gpus)) != 8:
-        parser.error("exactly eight distinct GPU selectors required")
+    if not 1 <= len(args.gpus) <= 8 or len(set(args.gpus)) != len(args.gpus):
+        parser.error("one to eight distinct GPU selectors required")
     if min(args.samples, args.video_samples, args.batch_size, args.max_new_tokens,
            args.warmup, args.image_max_tokens, args.max_pixels_per_frame) < 1 or args.frames < 2 or args.frames % 2:
         parser.error("positive budgets, warmup >=1 and an even frame count >=2 required")
     root, jobs = prepare(args)
     for job in jobs:
-        print(f"GPU {job['gpu']}: {job['dataset']}, {job['samples']} samples; AR/Full/Pivot1", flush=True)
+        print(f"GPU {job['gpu']}: {job['dataset']}, {job['samples']} samples; {','.join(job['models'])}", flush=True)
         print(shlex.join(job["command"]), flush=True)
     print(f"Results: {root}\nMonitor: tail -f {root}/logs/*.log", flush=True)
     if args.dry_run:

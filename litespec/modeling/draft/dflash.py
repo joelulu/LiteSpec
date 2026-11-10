@@ -20,6 +20,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
+from .context_layers import PerLayerContextProjection, dense_layer_prior_mask, layer_prior_score_mod
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .flex_attention import compile_friendly_flex_attention
 from .registry import method_config, register_draft
@@ -342,6 +343,24 @@ class Qwen3DFlashAttentionBase(nn.Module):
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)
         valid_queries = None
+        layer_bias = kwargs.pop("context_layer_bias", None)
+        score_options = {}
+        if layer_bias is not None:
+            slots = layer_bias.shape[1]
+            # B/C are bounded-context models and never use a draft KV cache.
+            if past_key_values is not None:
+                raise ValueError("position-layer bias requires uncached bounded context")
+            if self.config._attn_implementation == "flex_attention":
+                score_options["score_mod"] = layer_prior_score_mod(
+                    layer_bias, self.config.block_size, slots, target_hidden.shape[1])
+            elif self.config._attn_implementation in ("sdpa", "eager"):
+                if attention_mask is not None and attention_mask.dtype == torch.bool:
+                    valid_queries = attention_mask.any(dim=-1, keepdim=True)
+                attention_mask = dense_layer_prior_mask(
+                    attention_mask, layer_bias, self.config.block_size, slots,
+                    target_hidden.shape[1], q_len, k.shape[-2], q.dtype, q.device)
+            else:
+                raise ValueError("position-layer bias requires FlexAttention, SDPA or eager")
         if self.config._attn_implementation == "flex_attention":
             attn_output = compile_friendly_flex_attention(
                 q,
@@ -351,15 +370,18 @@ class Qwen3DFlashAttentionBase(nn.Module):
                 enable_gqa=True,
                 scale=self.scaling,
                 kernel_options=kwargs.pop("kernel_options", None),
+                **score_options,
             ).transpose(1, 2)
             attn_weights = None
         else:
             attn_fn: Callable = eager_attention_forward
             if self.config._attn_implementation == "eager":
-                attention_mask, valid_queries = _prepare_dflash_eager_mask(
+                attention_mask, eager_valid_queries = _prepare_dflash_eager_mask(
                     attention_mask,
                     q.dtype,
                 )
+                if eager_valid_queries is not None:
+                    valid_queries = eager_valid_queries
             else:
                 attn_fn = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
             attn_output, attn_weights = attn_fn(
@@ -732,11 +754,26 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.context_window = {"full": None, "recent128": 128, "pivot1": 1, "pivot5": 1, "pivot12": 1}[context]
         if self.context_slots > 1:
             self.context_depth = nn.Embedding(self.context_slots, config.hidden_size)
-        self.fc = nn.Linear(
-            (1 if self.context_slots > 1 else len(self.target_layer_ids)) * config.hidden_size,
-            config.hidden_size,
-            bias=False,
-        )
+        self.context_projection = draft_config.get("context_projection", "shared")
+        position_layer_bias = _require_bool_config(
+            draft_config.get("position_layer_bias", False), "position_layer_bias")
+        if self.context_projection not in ("shared", "per_layer"):
+            raise ValueError("context_projection must be shared or per_layer")
+        if (self.context_projection != "shared" or position_layer_bias) and self.context_slots < 2:
+            raise ValueError("layer adapters require pivot5 or pivot12 context")
+        if position_layer_bias and self.context_projection != "per_layer":
+            raise ValueError("C requires B's per-layer input projections")
+        self.fc = (PerLayerContextProjection(self.context_slots, config.hidden_size)
+                   if self.context_projection == "per_layer" else nn.Linear(
+                       (1 if self.context_slots > 1 else len(self.target_layer_ids)) * config.hidden_size,
+                       config.hidden_size, bias=False))
+        if position_layer_bias:
+            if self.block_size < 2:
+                raise ValueError("position-layer bias requires block_size >= 2")
+            # One shared table across draft layers/heads. Zero starts exactly at B.
+            self.context_layer_bias = nn.Parameter(torch.zeros(self.block_size - 1, self.context_slots))
+        else:
+            self.register_parameter("context_layer_bias", None)
         self.hidden_norm = kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
@@ -848,8 +885,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             batch, positions, _ = target_hidden.shape
             target_hidden = target_hidden.reshape(batch, positions, self.context_slots, -1)
             target_hidden = target_hidden + self.context_depth.weight[None, None]
-            target_hidden = target_hidden.flatten(1, 2)
-        target_hidden = self.hidden_norm(self.fc(target_hidden))
+            if self.context_projection == "per_layer":
+                target_hidden = self.fc(target_hidden).flatten(1, 2)
+            else:
+                target_hidden = self.fc(target_hidden.flatten(1, 2))
+        else:
+            target_hidden = self.fc(target_hidden)
+        target_hidden = self.hidden_norm(target_hidden)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
@@ -865,6 +907,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
+                context_layer_bias=self.context_layer_bias,
                 **kwargs,
             )
         return self.norm(hidden_states)
@@ -1027,3 +1070,4 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
 
     def get_last_decode_stats(self) -> dict:
         return dict(self._last_decode_stats)
+

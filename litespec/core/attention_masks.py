@@ -56,24 +56,27 @@ def flash_kv_padding(kv_len: int) -> int:
 #   draft becomes causal: draft_offset <= o
 # Without W, intra-block draft is full (not causal).
 def create_dflash_sdpa_mask(
-    anchor_positions, block_keep_mask, S, block_size, device, sliding_window=None
+    anchor_positions, block_keep_mask, S, block_size, device, sliding_window=None, context_window=None, context_slots=1
 ):
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
     bsz, num_blocks = anchor_positions.shape
-    q_len, kv_len = num_blocks * block_size, S + num_blocks * block_size
+    C = S * context_slots
+    q_len, kv_len = num_blocks * block_size, C + num_blocks * block_size
     q = torch.arange(q_len, device=device).view(1, 1, -1, 1)
     kv = torch.arange(kv_len, device=device).view(1, 1, 1, -1)
     q_block, q_offset = q // block_size, q % block_size
     anchors = anchor_positions.view(bsz, 1, num_blocks, 1).repeat_interleave(
         block_size, 2
     )
-    context_mask = (kv < S) & (kv < anchors)
+    context_mask = (kv < C) & (kv // context_slots < anchors)
+    if context_window is not None:
+        context_mask &= kv // context_slots >= anchors - context_window
     if sliding_window is not None:
-        context_mask &= kv >= anchors + q_offset - (sliding_window - 1)
-    draft_mask = (kv >= S) & (q_block == (kv - S) // block_size)
+        context_mask &= kv // context_slots >= anchors + q_offset - (sliding_window - 1)
+    draft_mask = (kv >= C) & (q_block == (kv - C) // block_size)
     if sliding_window is not None:
-        draft_mask &= (kv - S) % block_size <= q_offset
+        draft_mask &= (kv - C) % block_size <= q_offset
     valid = block_keep_mask.view(bsz, 1, num_blocks, 1).repeat_interleave(block_size, 2)
     return (context_mask | draft_mask) & valid
 
@@ -88,12 +91,15 @@ def create_dflash_flex_mask(
     device,
     flex_backend="TRITON",
     sliding_window=None,
+    context_window=None,
+    context_slots=1,
 ):
     if not FLEX_ATTENTION_AVAILABLE:
         raise RuntimeError("flex_attention is not available")
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
     bsz, num_blocks = anchor_positions.shape
+    C = S * context_slots
 
     # Mask closures outlive this call inside BlockMask. Do not capture views:
     # Dynamo 2.9.1 may lose the symbolic source for a view's _base shape.
@@ -104,12 +110,14 @@ def create_dflash_flex_mask(
         qb, qo = q_idx // block_size, q_idx % block_size
         safe_block_indices = qb.clamp(max=num_blocks - 1)
         anchor = anchor_positions[b, safe_block_indices]
-        context_mask = (kv_idx < S) & (kv_idx < anchor)
+        context_mask = (kv_idx < C) & (kv_idx // context_slots < anchor)
+        if context_window is not None:
+            context_mask &= kv_idx // context_slots >= anchor - context_window
         if sliding_window is not None:
-            context_mask &= kv_idx >= anchor + qo - (sliding_window - 1)
-        draft_mask = (kv_idx >= S) & (qb == (kv_idx - S) // block_size)
+            context_mask &= kv_idx // context_slots >= anchor + qo - (sliding_window - 1)
+        draft_mask = (kv_idx >= C) & (qb == (kv_idx - C) // block_size)
         if sliding_window is not None:
-            draft_mask &= (kv_idx - S) % block_size <= qo
+            draft_mask &= (kv_idx - C) % block_size <= qo
         return (
             (context_mask | draft_mask)
             & block_keep_mask[b, safe_block_indices]
@@ -121,7 +129,7 @@ def create_dflash_flex_mask(
         B=bsz,
         H=None,
         Q_LEN=num_blocks * block_size,
-        KV_LEN=S + num_blocks * block_size,
+        KV_LEN=C + num_blocks * block_size,
         device=device,
         backend=flex_backend,
     )

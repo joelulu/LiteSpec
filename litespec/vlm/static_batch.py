@@ -93,7 +93,8 @@ def replicate_inputs(example, batch_size):
 
 @torch.no_grad()
 def generate_static_batch(target, draft, example, *, batch_size=1, max_new_tokens=128,
-                          verification="block", profile=False, state_mode="full_target_replay"):
+                          verification="block", profile=False, state_mode="full_target_replay",
+                          visual_condition="correct", donor_features=None):
     from .gdn_state import STATE_MODES, GDNStateTransaction
     if state_mode not in STATE_MODES:
         raise ValueError(f"unknown GDN state mode: {state_mode}")
@@ -103,13 +104,13 @@ def generate_static_batch(target, draft, example, *, batch_size=1, max_new_token
         with GDNStateTransaction(target, state_mode) as transaction:
             return _generate_static_batch(target, draft, example, batch_size=batch_size,
                 max_new_tokens=max_new_tokens, verification=verification, profile=profile,
-                transaction=transaction, state_mode=state_mode)
+                transaction=transaction, state_mode=state_mode, visual_condition=visual_condition, donor_features=donor_features)
     return _generate_static_batch(target, draft, example, batch_size=batch_size,
-        max_new_tokens=max_new_tokens, verification=verification, profile=profile, state_mode=state_mode)
+        max_new_tokens=max_new_tokens, verification=verification, profile=profile, state_mode=state_mode, visual_condition=visual_condition, donor_features=donor_features)
 
 
 def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens,
-                           verification, profile, state_mode, transaction=None):
+                           verification, profile, state_mode, transaction=None, visual_condition="correct", donor_features=None):
     """One true batch of identical greedy requests; no request-by-request loop."""
     from .baselines import DraftCache, is_baseline
     if max_new_tokens < 1 or verification not in {"block", "sequential"}:
@@ -140,7 +141,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     pivot = (selected_layers(output.hidden_states, draft.target_layer_ids,
                              draft.config.num_target_layers)[:, -1:].detach().clone()
              if draft is not None and getattr(draft, "context_window_size", 1) == 1 else None)
-    history = DraftCache(draft, target, output, anchor) if baseline else None
+    history = DraftCache(draft, target, output, anchor, vision_mask=example.vision_mask,
+                         visual_condition=visual_condition, donor_features=donor_features) if baseline else None
     recent = None
     augmentation_state = None
     if augmentation is not None and augmentation.mode in ("B", "C", "D1", "D2"):
@@ -283,7 +285,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     tokens = torch.cat(blocks, 1)
     if not torch.equal(tokens, tokens[:1].expand_as(tokens)):
         raise RuntimeError("greedy replicas diverged within a batch; lockstep replicated-input benchmark assumptions failed")
-    result = dict(token_ids=tokens[0].tolist(), batch_size=batch_size,
+    result = dict(visual_intervention=history.visual_metadata if history is not None else None,
+        draft_context=getattr(draft.config, "vlm_config", {}).get("draft_context", "full") if draft is not None else None, token_ids=tokens[0].tolist(), batch_size=batch_size,
         output_tokens=batch_size * emitted, accept_lengths=lengths,
         prefill_tokens=example.prefill_length,
         visual_tokens_with_delimiters=int(example.vision_mask.sum()),

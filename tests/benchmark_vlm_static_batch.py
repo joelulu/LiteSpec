@@ -11,7 +11,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
-from litespec.vlm.baselines import load_draft
+from litespec.vlm.baselines import load_draft, DraftCache
 from litespec.vlm.benchmark import RequestPositionState
 from litespec.vlm.runtime import load_target, prepare_example
 from litespec.vlm.static_batch import generate_static_batch
@@ -43,6 +43,7 @@ def summarize_batches(results, batch_size):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--visual-condition", choices=["correct", "wrong", "mask"], default="correct")
     parser.add_argument("--context-window-size", type=int, help="inference override; omit to use trained window")
     parser.add_argument("--target-model", required=True)
     parser.add_argument("--checkpoint", nargs=2, action="append", default=[], metavar=("LABEL", "PATH"))
@@ -141,6 +142,21 @@ def main():
     (root/"inputs.json").write_text(json.dumps(input_metadata, indent=2))
     if args.reference_input:
         print("First processed input: " + json.dumps(input_metadata[0]), flush=True)
+    if args.visual_condition != "correct" and len(examples) < 2:
+        parser.error("visual interventions require at least two distinct images")
+    donor_indices = {}
+    if args.visual_condition == "wrong":
+        for i, example in enumerate(examples):
+            pixels = example.inputs.get("pixel_values")
+            for distance in range(1, len(examples)):
+                j = (i+distance) % len(examples)
+                other = examples[j].inputs.get("pixel_values")
+                if pixels is not None and other is not None and not torch.equal(pixels, other):
+                    donor_indices[example.sample_id] = j
+                    break
+            else:
+                raise ValueError("no different-image donor found")
+        (root/"donors.json").write_text(json.dumps({k: examples[j].sample_id for k,j in donor_indices.items()}, indent=2))
     rows, references, profile_rows = [], {}, []
     if args.ar_reference:
         directory = args.ar_reference.resolve()
@@ -166,6 +182,11 @@ def main():
         if draft is not None and args.context_window_size is not None:
             from litespec.vlm.sw_token import set_window
             set_window(draft,args.context_window_size)
+        donor_cache = {}
+        if draft is not None and args.visual_condition != "correct":
+            from litespec.modeling.draft.dflash import DFlashDraftModel
+            if type(draft) is not DFlashDraftModel or getattr(draft, "context_window", None) is not None:
+                raise ValueError("visual intervention benchmark requires full-context DFlash")
         for batch_size in sorted(set(args.batch_sizes)):
             if draft is not None and args.state_mode != "full_target_replay":
                 from litespec.vlm.gdn_state import warmup_state_kernels
@@ -175,9 +196,20 @@ def main():
                 if args.cpu_inputs:
                     example = replace(example, inputs={k:v.to(args.device) if torch.is_tensor(v) else v
                         for k,v in example.inputs.items()}, vision_mask=example.vision_mask.to(args.device))
+                donor_features = None
+                if draft is not None and args.visual_condition == "wrong":
+                    key = example.sample_id
+                    if key not in donor_cache:
+                        donor = examples[donor_indices[key]]
+                        donor_inputs = {k:v.to(args.device) if torch.is_tensor(v) else v for k,v in donor.inputs.items()}
+                        with torch.no_grad(), RequestPositionState(target).activate():
+                            out = target(**donor_inputs, use_cache=False, output_hidden_states=True, logits_to_keep=1)
+                            donor_cache[key] = DraftCache.features(draft,out)[:, donor.vision_mask.to(args.device)].cpu()
+                        del out
+                    donor_features = donor_cache[key].to(args.device)
                 with RequestPositionState(target).activate():
                     return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap,
-                                                 profile=profile, state_mode=args.state_mode)
+                                                 profile=profile, state_mode=args.state_mode, visual_condition=args.visual_condition, donor_features=donor_features)
             for _ in range(args.warmup):
                 run(examples[0], min(16, args.max_new_tokens))
             if torch.device(args.device).type == "cuda":
@@ -189,7 +221,7 @@ def main():
                 references[batch_size] = tokens
             expected = references[batch_size]
             matched = sum(a == b for a, b in zip(tokens, expected))*batch_size
-            summary = dict(model=label, checkpoint=checkpoint, dataset_split=args.data_split,
+            summary = dict(model=label, checkpoint=checkpoint, visual_condition=args.visual_condition, donor_prefill_excluded=args.visual_condition == "wrong", draft_context=getattr(draft.config, "vlm_config", {}).get("draft_context", "full") if draft is not None else None, dataset_split=args.data_split,
                 dataset_path=str(data), dataset_name=args.dataset_name,
                 input_mode=args.input_mode if args.reference_input else "from_manifest",
                 mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),

@@ -47,6 +47,10 @@ def load_config(path):
     reference = root / source.pop("upstream_config")
     upstream = yaml.safe_load(reference.read_text())
     family = source.get("algorithm", "dlite")
+    if source.get("draft_context", "full") not in ("full", "recent128", "pivot1", "pivot12"):
+        raise ValueError("unknown draft_context")
+    if source.get("draft_context", "full") != "full" and family != "dflash":
+        raise ValueError("bounded draft_context is supported only for DFlash")
     if family not in {"dlite", "dflash", "dspark"}:
         raise ValueError("unsupported VLM algorithm")
     if family == "dlite" and upstream.get("mode") != "sft":
@@ -463,7 +467,7 @@ def run(argv=None):
                         help="optional scalar tracking; defaults to YAML report_to")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
-    if cfg.get("pivot_augmentation") or cfg.get("pivot_two_rounds"):
+    if cfg.get("pivot_augmentation") or cfg.get("pivot_two_rounds") or cfg.get("dflash_context_experiment"):
         if args.resume or args.init_checkpoint or cfg.get("init_checkpoint"):
             raise ValueError("pivot screen runs must train from scratch")
         if args.save_training_state:

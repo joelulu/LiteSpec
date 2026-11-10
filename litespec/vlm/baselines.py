@@ -48,6 +48,11 @@ def make_draft(target, processor, cfg):
     config.sliding_window, config.use_sliding_window = None, False
     config._attn_implementation = "sdpa"
     layers = cfg.get("target_layer_ids") or build_target_layer_ids(text.num_hidden_layers, cfg["num_draft_layers"])
+    context = cfg.get("draft_context", "full")
+    if context != "full" and family != "dflash":
+        raise ValueError("context ablation is DFlash only")
+    if context == "pivot12" and not cfg.get("target_layer_ids"):
+        layers = [0, 1, 4, 7, 11, 14, 17, 20, 24, 27, 30, 31]
     method = dict(target_layer_ids=layers, mask_token_id=mask, attention_mode="gqa")
     if family == "dspark":
         method.update(projector_type="dspark", markov_head_type=cfg["markov_head_type"],
@@ -56,7 +61,7 @@ def make_draft(target, processor, cfg):
                       dspark_backbone_conv_enabled=False)
     setattr(config, family + "_config", method)
     config.vlm_config = dict(algorithm=family, target_model=cfg["target_model"],
-                             context_policy=cfg["context_policy"], training="upstream_sft_v1")
+                             context_policy=cfg["context_policy"], training="upstream_sft_v1", draft_context=context)
     return cls(config).to(device=target.device, dtype=target.dtype)
 
 
@@ -86,11 +91,20 @@ def prepare_forward(target, online, example, mask):
 
 class DraftCache:
     """Keep only projected target-history KV; discard speculative query KV."""
-    def __init__(self, draft, target, output, prefill_length):
+    def __init__(self, draft, target, output, prefill_length, vision_mask=None, visual_condition="correct", donor_features=None):
         from transformers import DynamicCache
         self.cache = DynamicCache()
         self.hidden = self.features(draft, output)
         self.history_tokens = prefill_length
+        from .dflash_context import intervene_visual
+        self.hidden, self.visual_keep, self.visual_metadata = intervene_visual(
+            self.hidden, vision_mask, visual_condition, donor_features)
+        self.mask_visual = visual_condition == "mask"
+        self.window = getattr(draft, "context_window", None)
+        if self.window is not None:
+            self.hidden = self.hidden[:, -self.window:]
+            self.visual_keep = self.visual_keep[:, -self.window:]
+
 
     @staticmethod
     def features(draft, output):
@@ -100,10 +114,20 @@ class DraftCache:
     def propose(self, draft, target, pending, anchor):
         ids = pending.new_full((pending.shape[0], draft.block_size), draft.mask_token_id)
         ids[:, :1] = pending
+        if self.window is not None:
+            positions = torch.cat([torch.arange(anchor-self.hidden.size(1), anchor, device=pending.device).repeat_interleave(draft.context_slots),
+                                   torch.arange(anchor, anchor+draft.block_size, device=pending.device)])[None].expand(pending.size(0), -1)
+            keep = self.visual_keep.repeat_interleave(draft.context_slots, -1)
+            mask = torch.cat([keep, torch.ones_like(ids, dtype=torch.bool)], -1)[:, None, None, :]
+            hidden = draft(noise_embedding=target.get_input_embeddings()(ids), target_hidden=self.hidden,
+                           position_ids=positions, attention_mask=mask, use_cache=False, is_causal=False)
+            tokens, _, _ = draft._propose_draft_tokens(target, hidden, ids, temperature=0.)
+            return tokens, dict(physical_history=self.hidden.size(1), visible_history=self.hidden.size(1))
         start = self.cache.get_seq_length()
         positions = torch.arange(start, anchor + draft.block_size, device=pending.device)[None].expand(pending.shape[0], -1)
         hidden = draft(noise_embedding=target.get_input_embeddings()(ids), target_hidden=self.hidden,
-                       position_ids=positions, past_key_values=self.cache, use_cache=True, is_causal=False)
+                       position_ids=positions, past_key_values=self.cache, use_cache=True, is_causal=False,
+                       attention_mask=(torch.cat([self.visual_keep, torch.ones_like(ids, dtype=torch.bool)], -1)[:, None, None, :] if self.mask_visual else None))
         remove = self.cache.get_seq_length() - anchor
         if remove:
             # Negative removal counts work with both Transformers 4.x and 5.x.
@@ -112,5 +136,11 @@ class DraftCache:
         return tokens, dict(physical_history=anchor, visible_history=anchor)
 
     def commit(self, draft, output, kept):
-        self.hidden = self.features(draft, output)[:, :kept]
+        new = self.features(draft, output)[:, :kept]
+        self.visual_keep = torch.cat([self.visual_keep, torch.ones(new.shape[:2], device=new.device, dtype=torch.bool)], 1)
+        if self.window is None:
+            self.hidden = new
+        else:
+            self.hidden = torch.cat([self.hidden, new], 1)[:, -self.window:]
+            self.visual_keep = self.visual_keep[:, -self.window:]
 

@@ -463,6 +463,8 @@ class DFlashTrainingBase(nn.Module):
         context_position_ids = (
             torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
         )
+        slots = getattr(self.draft_model, "context_slots", 1)
+        context_position_ids = context_position_ids.repeat_interleave(slots, dim=1)
         draft_position_ids = self._create_position_ids(anchor_positions)
         full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
 
@@ -477,6 +479,8 @@ class DFlashTrainingBase(nn.Module):
             "S": seq_len,
             "block_size": self.block_size,
             "device": device,
+            "context_slots": slots,
+            "context_window": getattr(self.draft_model, "context_window", None),
         }
         if self.attention_backend == "flex_attention":
             mask_args["flex_backend"] = self.flex_attention_backend

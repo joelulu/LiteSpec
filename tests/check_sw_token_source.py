@@ -4,6 +4,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PATHS = (
+    "tests/run_dflash_context_ablation.sh",
+    "litespec/vlm/dflash_context.py",
+    "tests/dflash_context_config.py",
+    "tests/train_dflash_context.sh",
+    "tests/evaluate_dflash_context.py",
+    "tests/evaluate_dflash_context.sh",
+    "tests/probe_dflash_visual.py",
+    "tests/test_dflash_context.py",
+    "litespec/vlm/baselines.py",
+    "litespec/modeling/draft/dflash.py",
+    "litespec/core/attention_masks.py",
+    "litespec/core/_dflash_common.py",
     "tests/pivot_feedback_probe.py",
     "tests/diagnose_pivot_feedback.py",
     "tests/diagnose_pivot_feedback.sh",

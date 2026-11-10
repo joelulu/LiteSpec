@@ -723,8 +723,17 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.rotary_emb = Qwen3RotaryEmbedding(
             _rope_config(config, self.attention_mode)
         )
+        context = getattr(config, "vlm_config", {}).get("draft_context", "full")
+        if context not in ("full", "recent128", "pivot1", "pivot12"):
+            raise ValueError(f"unknown DFlash context: {context}")
+        self.context_slots = 12 if context == "pivot12" else 1
+        if context == "pivot12" and len(self.target_layer_ids) != 12:
+            raise ValueError("pivot12 requires exactly twelve selected Target layers")
+        self.context_window = {"full": None, "recent128": 128, "pivot1": 1, "pivot12": 1}[context]
+        if self.context_slots > 1:
+            self.context_depth = nn.Embedding(self.context_slots, config.hidden_size)
         self.fc = nn.Linear(
-            len(self.target_layer_ids) * config.hidden_size,
+            (1 if self.context_slots > 1 else len(self.target_layer_ids)) * config.hidden_size,
             config.hidden_size,
             bias=False,
         )
@@ -835,6 +844,11 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
+        if self.context_slots > 1:
+            batch, positions, _ = target_hidden.shape
+            target_hidden = target_hidden.reshape(batch, positions, self.context_slots, -1)
+            target_hidden = target_hidden + self.context_depth.weight[None, None]
+            target_hidden = target_hidden.flatten(1, 2)
         target_hidden = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer_type, layer in zip(self.layer_types, self.layers):
@@ -867,6 +881,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         top_k: int = 0,
         target_cache: Optional[Cache] = None,
     ):
+        if self.context_window is not None:
+            raise ValueError("bounded-context checkpoints require the VLM DraftCache/static benchmark entry point")
         if temperature < 0:
             raise ValueError(f"temperature must be non-negative, got {temperature}")
         if not 0 < top_p <= 1:

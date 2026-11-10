@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Four from-scratch DFlash runs; final weights only.
+# Five from-scratch DFlash runs; final weights only.
 set -euo pipefail
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
@@ -17,7 +17,7 @@ export RUN_GROUP="${RUN_GROUP:-$DLITE_WORKSPACE/runs/dflash_context_20k_1ep_$(da
 unset INIT_CHECKPOINT RESUME MAX_STEPS CONFIG OUTPUT_DIR
 [[ ! -e "$RUN_GROUP" ]] || { echo "Choose fresh RUN_GROUP: $RUN_GROUP" >&2; exit 1; }
 "$PYTHON_BIN" tests/check_sw_token_source.py
-read -r -a modes <<< "${CONTEXTS:-full recent128 pivot1 pivot12}"
+read -r -a modes <<< "${CONTEXTS:-full recent128 pivot1 pivot5 pivot12}"
 "$PYTHON_BIN" - "${modes[@]}" <<'PY'
 import sys, os, torch
 from litespec.vlm.dflash_context import CONTEXTS
@@ -35,4 +35,4 @@ for context in "${modes[@]}"; do
     [[ -f "$OUTPUT_DIR/last/config.json" ]] || exit 1
     export REUSE_VALIDATION_FROM="$OUTPUT_DIR"
 done
-echo "Final checkpoints: $RUN_GROUP/{full,recent128,pivot1,pivot12}/last"
+echo "Final checkpoints: $RUN_GROUP/{full,recent128,pivot1,pivot5,pivot12}/last"

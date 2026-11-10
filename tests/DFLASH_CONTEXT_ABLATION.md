@@ -5,7 +5,7 @@ No rollout regeneration is necessary. Target inputs/weights, Draft block/head an
 
 ## Training
 
-Four from-scratch runs, same 20k validated FineVision rows, one epoch, block=8,
+Five from-scratch runs, same 20k validated FineVision rows, one epoch, block=8,
 512 sampled supervised anchors, seed=42, 8 GPUs, micro=4, accumulation=2 (global=64).
 Uses the original DFlash recipe (AdamW, LR 6e-4), not the DLite RNN or feedback recipe.
 Target image budget=1024 tokens. One frozen Target full-sequence extraction per batch.
@@ -17,10 +17,11 @@ Intermediate checkpoints and per-rank optimizer/RNG states are disabled. No warm
 | full | all positions before anchor | original 5 selected layers, feature-concat and projection |
 | recent128 | [anchor-128, anchor) | same 5-layer concat |
 | pivot1 | anchor-1 | same 5-layer concat, one slot |
+| pivot5 | anchor-1 | same 5 source layers as pivot1, separate depth slots and shared H-to-H projection |
 | pivot12 | anchor-1 | 12 separate slots with learned depth embeddings and shared H-to-H projection |
 
 12 layer IDs are `[0,1,4,7,11,14,17,20,24,27,30,31]` (language block outputs, final norm excluded).
-All 12 pivot slots carry the same absolute time position; depth embedding distinguishes layers.
+All pivot5/pivot12 depth slots carry the same absolute time position; depth embedding distinguishes layers.
 The bidirectional intra-block query attention is unchanged. This is not the architecture's causal SWA mode.
 Padding/inactive blocks cannot expose other blocks or future Target positions.
 Training masks source positions; inference physically retains <=128/1 raw positions for bounded modes,
@@ -48,7 +49,7 @@ Use `bash tests/run_dflash_context_ablation.sh` instead to train and then run al
 It clears a stale RESULT_DIR and assigns a fresh run group unless you explicitly set RUN_GROUP.
 
 Optional `REUSE_VALIDATION_FROM` must point at a compatible existing preflight. Otherwise full validates once,
-and the other three reuse its exact eligible set. `CONTEXTS` selects subsets; one run group must be fresh.
+and the other variants reuse its exact eligible set. `CONTEXTS` selects subsets; one run group must be fresh.
 `TRAIN_SAMPLES`, `EPOCHS`, `MICRO_BATCH_SIZE`, `ACCUMULATION_STEPS` are explicit overrides.
 The script unsets stale MAX_STEPS and initial/resume paths. `MAX_LENGTH` is set in the YAML (4096).
 
@@ -63,9 +64,9 @@ EVAL_GPU=7 EVAL_SAMPLES=64 EVAL_MAX_NEW_TOKENS=256 \
 Defaults: B=1, seed42, image1024, `per_token` Target state management. No training occurs here.
 `DFLASH_100K` optionally overrides the historical checkpoint (actual eligible sample count must be checked before publication).
 Default is `runs/vlm_dlite_dflash_3ep_mb2_b8_20261022_060311_3121049/dflash/last`.
-Evaluation requires all four fresh checkpoints plus that old full-context checkpoint.
+Evaluation requires the original four checkpoints plus that old full-context checkpoint. Pivot5 is automatically added when `RUN_GROUP/pivot5/last/config.json` exists or `PIVOT5_CHECKPOINT` is supplied. `EVAL_CONTEXTS` explicitly selects context variants (include full for the visual diagnosis).
 
-1. Correct-context closed-loop: AR + four new checkpoints + old DFlash.
+1. Correct-context closed-loop: AR + context checkpoints + old DFlash.
 2. Wrong/Mask closed-loop: new Full + old DFlash, reusing same-GPU/input AR reference.
 3. Fixed-AR-prefix probes: both Full checkpoints; equal prefixes, anchor/pivot and references
    within each checkpoint. Candidate proposals never enter the AR Target cache.
@@ -108,8 +109,31 @@ Before allocating eight ranks, run:
 CUDA_VISIBLE_DEVICES=7 "$PYTHON_BIN" tests/check_dflash_context_cuda.py
 ```
 
-This compiles and backpropagates actual recent128/pivot1/pivot12 Flex kernels with head_dim=256
+This compiles and backpropagates actual recent128/pivot1/pivot5/pivot12 Flex kernels with head_dim=256
 and compares outputs to dense SDPA. It requires a CUDA machine; it was not executed in the CPU editor environment.
 A completed Full checkpoint remains valid. Restart the three bounded variants in a fresh run group
 using `CONTEXTS="recent128 pivot1 pivot12"` and `REUSE_VALIDATION_FROM=<old-run>/full`.
 After training, symlink `<new-run>/full` to `<old-run>/full` before the combined evaluation.
+
+## Supplement Pivot5 without retraining existing checkpoints
+
+Pivot5 uses `[1,8,15,22,29]` for Qwen3.5-4B, matching Pivot1. Each source
+layer contributes one slot, with learned depth embedding and shared H-to-H projector,
+exactly as in Pivot12's organization. All slots use the same pivot time position.
+Block size remains 8; prediction head/objective and 20k/1-epoch budget are unchanged.
+Pivot1 vs Pivot5 also changes projector parameter count; report it with the organization change.
+
+```bash
+export COMPARISON_RUN="$DLITE_WORKSPACE/runs/dflash_context_fixed_20261110_062258_1299222"
+export PIVOT5_RUN="$DLITE_WORKSPACE/runs/dflash_pivot5_20k_1ep_$(date +%Y%m%d_%H%M%S)_$$"
+RUN_GROUP="$PIVOT5_RUN" CONTEXTS=pivot5 \
+REUSE_VALIDATION_FROM="$DLITE_WORKSPACE/runs/dflash_context_20k_1ep_20261110_041837_1299222/full" \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NPROC_PER_NODE=8 \
+  bash tests/train_dflash_context.sh
+
+unset RESULT_DIR
+RUN_GROUP="$COMPARISON_RUN" PIVOT5_CHECKPOINT="$PIVOT5_RUN/pivot5/last" \
+  EVAL_GPU=7 EVAL_SAMPLES=64 bash tests/evaluate_dflash_context.sh
+```
+
+No copying or overwriting of the four completed checkpoints is needed.

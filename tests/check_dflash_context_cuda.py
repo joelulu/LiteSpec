@@ -11,7 +11,7 @@ from litespec.modeling.draft.flex_attention import compile_friendly_flex_attenti
 def main():
     if not torch.cuda.is_available():raise RuntimeError('CUDA required; no CPU fallback for this check')
     torch.manual_seed(42)
-    for mode,slots,window in [('recent128',1,128),('pivot1',1,1),('pivot12',12,1)]:
+    for mode,slots,window in [('recent128',1,128),('pivot1',1,1),('pivot5',5,1),('pivot12',12,1)]:
         anchors=torch.tensor([[16,24]],device='cuda')
         keep=torch.ones_like(anchors,dtype=torch.bool)
         q=torch.randn(1,16,16,256,device='cuda',dtype=torch.bfloat16,requires_grad=True)

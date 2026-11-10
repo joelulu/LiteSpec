@@ -47,7 +47,7 @@ def load_config(path):
     reference = root / source.pop("upstream_config")
     upstream = yaml.safe_load(reference.read_text())
     family = source.get("algorithm", "dlite")
-    if source.get("draft_context", "full") not in ("full", "recent128", "pivot1", "pivot12"):
+    if source.get("draft_context", "full") not in ("full", "recent128", "pivot1", "pivot5", "pivot12"):
         raise ValueError("unknown draft_context")
     if source.get("draft_context", "full") != "full" and family != "dflash":
         raise ValueError("bounded draft_context is supported only for DFlash")

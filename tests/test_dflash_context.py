@@ -19,7 +19,7 @@ def make(mode):
     return DFlashDraftModel(c)
 
 
-@pytest.mark.parametrize('mode,window,slots', [('full',None,1),('recent128',128,1),('pivot1',1,1),('pivot12',1,12)])
+@pytest.mark.parametrize('mode,window,slots', [('full',None,1),('recent128',128,1),('pivot1',1,1),('pivot5',1,5),('pivot12',1,12)])
 def test_train_export_and_cache_matches_uncached(mode,window,slots,tmp_path):
     torch.manual_seed(42)
     draft=make(mode)
@@ -31,7 +31,7 @@ def test_train_export_and_cache_matches_uncached(mode,window,slots,tmp_path):
     loss=online(input_ids=ids,hidden_states=features,loss_mask=torch.ones_like(ids).float()).loss
     assert torch.isfinite(loss); loss.backward()
     assert draft.fc.weight.grad.abs().sum()>0
-    if slots==12: assert draft.context_depth.weight.grad.abs().sum()>0
+    if slots>1: assert draft.context_depth.weight.grad.abs().sum()>0
     draft.eval(); draft.save_pretrained(tmp_path)
     draft=load_draft(tmp_path,attn_implementation='sdpa').eval()
     assert draft.context_window==window and draft.context_slots==slots
@@ -53,7 +53,7 @@ def test_train_export_and_cache_matches_uncached(mode,window,slots,tmp_path):
 
 def test_mask_visibility_no_future_and_same_query_block():
     anchors=torch.tensor([[3,7]])
-    for slots,window in [(1,None),(1,128),(1,1),(12,1)]:
+    for slots,window in [(1,None),(1,128),(1,1),(5,1),(12,1)]:
         mask=create_dflash_sdpa_mask(anchors,torch.tensor([[True,True]]),8,4,'cpu',context_window=window,context_slots=slots)[0,0]
         for q in range(8):
             a=int(anchors[0,q//4]); left=0 if window is None else max(0,a-window)
@@ -76,7 +76,7 @@ def test_visual_interventions_preserve_text_and_positions():
     with pytest.raises(ValueError): intervene_visual(f,mask,'wrong')
 
 
-@pytest.mark.parametrize('mode',['full','recent128','pivot1','pivot12'])
+@pytest.mark.parametrize('mode',['full','recent128','pivot1','pivot5','pivot12'])
 def test_real_hybrid_static_decode_and_visual_intervention(mode):
     from test_vlm import tiny_qwen35,tiny_image_inputs
     from test_vlm_aligned import Processor
@@ -89,6 +89,7 @@ def test_real_hybrid_static_decode_and_visual_intervention(mode):
     target=tiny_qwen35().requires_grad_(False)
     config=dict(algorithm='dflash',draft_context=mode,num_draft_layers=1,block_size=4,
         target_model='tiny',context_policy=dict(prefill_text='keep',prefill_vision='keep',decode_mode='all'))
+    if mode=='pivot5':config['target_layer_ids']=[0,1,2,3,3]
     if mode=='pivot12':config['target_layer_ids']=[0,1,2,3]*3
     draft=baselines.make_draft(target,Processor(),config).eval()
     inputs=tiny_image_inputs()
@@ -106,7 +107,7 @@ def test_real_hybrid_static_decode_and_visual_intervention(mode):
             assert changed['visual_intervention']['visual_slots']>0
 
 
-@pytest.mark.parametrize('mode',['full','recent128','pivot1','pivot12'])
+@pytest.mark.parametrize('mode',['full','recent128','pivot1','pivot5','pivot12'])
 def test_training_block_hidden_equals_same_prefix_inference(mode):
     torch.manual_seed(19)
     d=make(mode).eval()
@@ -132,7 +133,7 @@ def test_flex_mask_rule_matches_dense(monkeypatch):
     def capture(rule,**kw): captured.update(rule=rule,**kw); return captured
     monkeypatch.setattr(m,'FLEX_ATTENTION_AVAILABLE',True)
     monkeypatch.setattr(m,'create_flex_block_mask',capture)
-    for slots,window in [(1,None),(1,128),(1,1),(12,1)]:
+    for slots,window in [(1,None),(1,128),(1,1),(5,1),(12,1)]:
         anchors=torch.tensor([[3,7]]);keep=torch.tensor([[True,False]])
         m.create_dflash_flex_mask(anchors,keep,8,4,'cpu',context_window=window,context_slots=slots)
         q=torch.arange(8)[:,None];kv=torch.arange(captured['KV_LEN'])[None,:]
@@ -215,7 +216,7 @@ def test_flex_callback_has_no_mutation_after_functionalization(monkeypatch):
     def capture(rule,**kw): captured['rule']=rule
     monkeypatch.setattr(m,'FLEX_ATTENTION_AVAILABLE',True)
     monkeypatch.setattr(m,'create_flex_block_mask',capture)
-    for slots,window,sliding in [(1,128,None),(1,1,None),(12,1,None),(1,None,4)]:
+    for slots,window,sliding in [(1,128,None),(1,1,None),(5,1,None),(12,1,None),(1,None,4)]:
         m.create_dflash_flex_mask(torch.tensor([[3,7]]),torch.tensor([[True,True]]),8,4,'cpu',
             context_window=window,context_slots=slots,sliding_window=sliding)
         rule=captured['rule']
@@ -227,7 +228,7 @@ def test_flex_callback_has_no_mutation_after_functionalization(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='requires CUDA FlexAttention')
-@pytest.mark.parametrize('slots,window',[(1,128),(1,1),(12,1)])
+@pytest.mark.parametrize('slots,window',[(1,128),(1,1),(5,1),(12,1)])
 def test_cuda_flex_context_forward_backward(slots,window):
     from litespec.core.attention_masks import create_dflash_flex_mask
     from litespec.modeling.draft.flex_attention import compile_friendly_flex_attention
@@ -239,3 +240,42 @@ def test_cuda_flex_context_forward_backward(slots,window):
     result=compile_friendly_flex_attention(q,k,v,block_mask=mask,enable_gqa=True)
     result.float().square().mean().backward()
     assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in (q,k,v))
+
+
+def test_pivot5_uses_pivot1_sources_and_pivot12_slot_projector():
+    from test_vlm import tiny_qwen35
+    from test_vlm_aligned import Processor
+    from litespec.vlm.baselines import make_draft
+    target=tiny_qwen35()
+    target.config.text_config.num_hidden_layers=32
+    config=dict(algorithm='dflash',num_draft_layers=5,block_size=8,target_model='tiny',context_policy={})
+    one=make_draft(target,Processor(),dict(config,draft_context='pivot1'))
+    five=make_draft(target,Processor(),dict(config,draft_context='pivot5'))
+    twelve=make_draft(target,Processor(),dict(config,draft_context='pivot12'))
+    assert one.target_layer_ids==five.target_layer_ids==[1,8,15,22,29]
+    assert five.context_slots==5 and five.context_window==1 and five.block_size==8
+    assert five.fc.in_features==twelve.fc.in_features==32
+    assert one.fc.in_features==5*32
+    assert five.context_depth.weight.shape==(5,32)
+    with pytest.raises(ValueError,match='exactly 5'):
+        make_draft(target,Processor(),dict(config,draft_context='pivot5',target_layer_ids=[1,8]))
+
+
+def test_pivot5_eval_optional_and_external_checkpoint(tmp_path):
+    from evaluate_dflash_context import context_checkpoints
+    old=context_checkpoints(tmp_path, {})
+    assert list(old)==['full','recent128','pivot1','pivot12']
+    path=tmp_path/'pivot5'/'last';path.mkdir(parents=True);(path/'config.json').write_text('{}')
+    assert list(context_checkpoints(tmp_path,{}))==['full','recent128','pivot1','pivot5','pivot12']
+    override=tmp_path/'another'/'last'
+    assert context_checkpoints(tmp_path,{'PIVOT5_CHECKPOINT':str(override)})['pivot5']==override
+    assert list(context_checkpoints(tmp_path,{'EVAL_CONTEXTS':'full pivot1 pivot5'}))==['full','pivot1','pivot5']
+
+
+def test_pivot5_configuration_keeps_matched_budget(monkeypatch):
+    from dflash_context_config import build
+    monkeypatch.setenv('EPOCHS','1');monkeypatch.setenv('MICRO_BATCH_SIZE','4');monkeypatch.setenv('ACCUMULATION_STEPS','2')
+    config=build('pivot5')
+    assert config['block_size']==8 and config['num_epochs']==1
+    assert config['batch_size']==4 and config['accumulation_steps']==2
+    assert config['draft_context']=='pivot5' and config['final_only']

@@ -51,6 +51,8 @@ def make_draft(target, processor, cfg):
     context = cfg.get("draft_context", "full")
     if context != "full" and family != "dflash":
         raise ValueError("context ablation is DFlash only")
+    if context == "pivot5" and not cfg.get("target_layer_ids"):
+        layers = build_target_layer_ids(text.num_hidden_layers, 5)
     if context == "pivot12" and not cfg.get("target_layer_ids"):
         layers = [0, 1, 4, 7, 11, 14, 17, 20, 24, 27, 30, 31]
     method = dict(target_layer_ids=layers, mask_token_id=mask, attention_mode="gqa")

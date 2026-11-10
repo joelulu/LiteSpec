@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train four variants on eight GPUs, then evaluate on one GPU.
+# Train five variants on eight GPUs, then evaluate on one GPU.
 set -euo pipefail
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export DLITE_WORKSPACE="${DLITE_WORKSPACE:-$(dirname -- "$REPO")}"

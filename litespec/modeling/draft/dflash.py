@@ -724,12 +724,12 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             _rope_config(config, self.attention_mode)
         )
         context = getattr(config, "vlm_config", {}).get("draft_context", "full")
-        if context not in ("full", "recent128", "pivot1", "pivot12"):
+        if context not in ("full", "recent128", "pivot1", "pivot5", "pivot12"):
             raise ValueError(f"unknown DFlash context: {context}")
-        self.context_slots = 12 if context == "pivot12" else 1
-        if context == "pivot12" and len(self.target_layer_ids) != 12:
-            raise ValueError("pivot12 requires exactly twelve selected Target layers")
-        self.context_window = {"full": None, "recent128": 128, "pivot1": 1, "pivot12": 1}[context]
+        self.context_slots = {"pivot5": 5, "pivot12": 12}.get(context, 1)
+        if self.context_slots > 1 and len(self.target_layer_ids) != self.context_slots:
+            raise ValueError(f"{context} requires exactly {self.context_slots} selected Target layers")
+        self.context_window = {"full": None, "recent128": 128, "pivot1": 1, "pivot5": 1, "pivot12": 1}[context]
         if self.context_slots > 1:
             self.context_depth = nn.Embedding(self.context_slots, config.hidden_size)
         self.fc = nn.Linear(

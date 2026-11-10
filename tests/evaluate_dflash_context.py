@@ -16,6 +16,20 @@ def execute(cmd):
     subprocess.run(list(map(str,cmd)),check=True)
 
 
+def context_checkpoints(group, env=None):
+    """Keep completed four-model runs usable; include Pivot5 when available."""
+    env = os.environ if env is None else env
+    override = env.get('PIVOT5_CHECKPOINT')
+    pivot5 = Path(override).expanduser() if override else group/'pivot5'/'last'
+    defaults = [mode for mode in CONTEXTS if mode != 'pivot5' or override or (pivot5/'config.json').is_file()]
+    selected = env.get('EVAL_CONTEXTS', ' '.join(defaults)).split()
+    if not selected or len(selected) != len(set(selected)) or any(x not in CONTEXTS for x in selected):
+        raise ValueError('EVAL_CONTEXTS must contain unique supported context names')
+    if 'full' not in selected:
+        raise ValueError('combined visual diagnosis requires full in EVAL_CONTEXTS')
+    return {mode: pivot5 if mode == 'pivot5' else group/mode/'last' for mode in selected}
+
+
 def main():
     workspace=Path(os.environ['DLITE_WORKSPACE']).expanduser()
     group=Path(os.environ['RUN_GROUP']).expanduser().resolve(strict=True)
@@ -23,7 +37,7 @@ def main():
     root.mkdir(parents=True,exist_ok=False)
     target=Path(os.getenv('TARGET_MODEL',str(Path.home()/'LMM/lmm_model/Qwen3.5-4B'))).expanduser()
     old=Path(os.getenv('DFLASH_100K',str(workspace/'runs/vlm_dlite_dflash_3ep_mb2_b8_20261022_060311_3121049/dflash/last'))).expanduser().resolve(strict=True)
-    models={mode:group/mode/'last' for mode in CONTEXTS}
+    models=context_checkpoints(group)
     models['dflash_100k']=old
     for path in models.values():
         if not (path/'config.json').is_file():raise FileNotFoundError(path)

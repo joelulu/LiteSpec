@@ -1,7 +1,7 @@
 """DFlash-only context controls; never modify the Target's image or cache."""
 import torch
 
-CONTEXTS = ("full", "recent128", "pivot1", "pivot12")
+CONTEXTS = ("full", "recent128", "pivot1", "pivot5", "pivot12")
 CONDITIONS = ("correct", "wrong", "mask")
 
 

@@ -15,6 +15,8 @@ def build(mode):
         accumulation_steps=int(os.getenv('ACCUMULATION_STEPS','2')), block_size=8,
         num_anchors=512, final_only=True, final_save=True, save_interval=10**12,
         image_max_tokens=int(os.getenv('IMAGE_MAX_TOKENS','1024')), log_interval=1)
+    if os.getenv('INIT_CHECKPOINT'):
+        config['init_checkpoint'] = str(Path(os.environ['INIT_CHECKPOINT']).expanduser().resolve(strict=True))
     return config
 
 

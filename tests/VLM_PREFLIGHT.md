@@ -70,8 +70,10 @@ Images and processor files must remain unchanged, as with the original reuse
 mechanism: the JSONL hash does not hash image contents or processor files. After
 changing those files, unset `REUSE_VALIDATION_FROM` and run
 `bash tests/prepare_vlm_validation.sh --force`; use its printed directory for
-training. Reader-only adaptation and unresolved init checkpoints are not supported
-by this helper; use their original runner's preflight.
+training. Full/Pivot1 DFlash weights-only initialization is resolved before the
+eligibility check; see [recorded training presets](DFLASH_CONTEXT_RUNS.md).
+Reader-only adaptation and other init-checkpoint modes are not supported by this
+helper; use their original runner's preflight.
 
 Increase `VALIDATION_WORKERS` only when CPU/storage capacity allows it; speedup
 depends on image I/O and preprocessing. `VALIDATION_CHUNK_SIZE` defaults to 64.

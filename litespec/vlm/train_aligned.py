@@ -473,11 +473,17 @@ def run(argv=None):
                         help="optional scalar tracking; defaults to YAML report_to")
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
-    if cfg.get("pivot_augmentation") or cfg.get("pivot_two_rounds") or cfg.get("dflash_context_experiment"):
+    if cfg.get("pivot_augmentation") or cfg.get("pivot_two_rounds"):
         if args.resume or args.init_checkpoint or cfg.get("init_checkpoint"):
             raise ValueError("pivot screen runs must train from scratch")
         if args.save_training_state:
             raise ValueError("pivot screen saves final inference weights only")
+        cfg["final_only"] = True
+    if cfg.get("dflash_context_experiment"):
+        if args.resume:
+            raise ValueError("DFlash context runs use a fresh optimizer; use init-checkpoint for weights-only adaptation")
+        if args.save_training_state:
+            raise ValueError("DFlash context runs save final inference weights only")
         cfg["final_only"] = True
     init = args.init_checkpoint or cfg.get("init_checkpoint")
     if init:

@@ -10,6 +10,8 @@ launchers below are unchanged.
 
 For reusable eight-thread image/token eligibility preprocessing before VLM
 training, see [parallel VLM preflight](tests/VLM_PREFLIGHT.md).
+The [recorded Full/Pivot1 presets](tests/DFLASH_CONTEXT_RUNS.md) cover 10w training
+and two-epoch 20k adaptation from the same original 10w DFlash checkpoint.
 
 LiteSpec is a unified training framework for four independent speculative
 decoding algorithms: **DFlash, DFlash2, DSpark, and DLite**. They share training,

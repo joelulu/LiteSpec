@@ -139,8 +139,13 @@ def prepare(args):
     deps = load_dependencies()
     cfg = deps.train.load_config(args.config)
     # These modes resolve their block size/checkpoint inside the training runner.
-    if cfg.get("reader_only") or cfg.get("init_checkpoint"):
-        raise ValueError("Preprocessing requires a resolved from-scratch config (no reader_only/init_checkpoint)")
+    if cfg.get("reader_only"):
+        raise ValueError("Preprocessing does not resolve reader-only adaptation")
+    if cfg.get("init_checkpoint"):
+        if cfg.get("algorithm") != "dflash":
+            raise ValueError("Preprocessing supports resolved DFlash warm starts only")
+        from litespec.vlm.dflash_warmstart import warm_start_config
+        warm_start_config(cfg, cfg["init_checkpoint"])
     cfg.update(
         train_data=str(Path(args.train_data).expanduser().resolve()),
         target_model=str(Path(args.target_model).expanduser().resolve()),

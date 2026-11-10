@@ -196,6 +196,26 @@ class PreflightTests(unittest.TestCase):
         ])
         self.assertEqual(output.read_text().strip(), str(directory))
 
+    def test_dflash_initialization_resolved_before_reusing_eligibility(self):
+        first = cli.prepare(self.args)
+        spec = importlib.util.spec_from_file_location("warm_for_preflight", ROOT / "litespec/vlm/dflash_warmstart.py")
+        warm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(warm)
+        source = self.root / "source"
+        source.mkdir()
+        (source / "config.json").write_text(json.dumps(dict(
+            architectures=["DFlashDraftModel"], block_size=8, num_hidden_layers=5,
+            num_target_layers=32, vocab_size=128,
+            dflash_config=dict(target_layer_ids=[1, 8, 15, 22, 29], mask_token_id=127),
+        )))
+        config = json.loads(self.config.read_text())
+        config.update(algorithm="dflash", draft_context="pivot1", init_checkpoint=str(source))
+        self.config.write_text(json.dumps(config))
+        self.calls.clear()
+        with patch.dict(sys.modules, {"litespec.vlm.dflash_warmstart": warm}):
+            self.assertEqual(cli.prepare(self.args), first)
+        self.assertEqual(self.calls, [])
+
     def test_help_does_not_import_cuda_dependencies(self):
         result = subprocess.run(
             [sys.executable, str(ROOT / "tests/prepare_vlm_validation.py"), "--help"],

@@ -125,6 +125,9 @@ class OnlineSWToken(OnlineDLiteModel):
 
 
 def warm_start_config(cfg,path):
+    if cfg.get('algorithm') == 'dflash':
+        from .dflash_warmstart import warm_start_config as configure_dflash
+        return configure_dflash(cfg, path)
     if cfg.get('algorithm','dlite')!='dlite':
         raise ValueError('warm start currently supports DLite only')
     path=Path(path)
@@ -140,6 +143,9 @@ def warm_start_config(cfg,path):
 
 
 def load_warm_start(path,target,cfg):
+    if cfg.get('algorithm') == 'dflash':
+        from .dflash_warmstart import load_warm_start as load_dflash
+        return load_dflash(path, target, cfg)
     from transformers import AutoConfig
     from litespec.modeling.draft.dlite import DLiteDraftModel
     config=AutoConfig.from_pretrained(path)

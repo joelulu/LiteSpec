@@ -8,6 +8,9 @@
 ablations](docs/VLM.md). It has a separate HF environment; the original text
 launchers below are unchanged.
 
+For reusable eight-thread image/token eligibility preprocessing before VLM
+training, see [parallel VLM preflight](tests/VLM_PREFLIGHT.md).
+
 LiteSpec is a unified training framework for four independent speculative
 decoding algorithms: **DFlash, DFlash2, DSpark, and DLite**. They share training,
 data, distributed execution, metrics, and checkpoint infrastructure while

@@ -188,25 +188,31 @@ def preflight(records, processor, config, cfg, base_dir, reuse_from=None):
     return packet
 
 
+def validate_record(record, processor, config, cfg, base_dir):
+    """Shared serial/parallel eligibility rule; None means this record is valid."""
+    try:
+        example = prepare_example(processor, config, record, device="cpu", training=True,
+                                  max_length=cfg["max_length"], base_dir=base_dir)
+    except ValueError as exc:
+        return str(exc)
+    compatible = has_anchor(example, cfg["block_size"])
+    if cfg.get("pivot_two_rounds"):
+        from .pivot_training import eligible_anchors
+        compatible = bool(eligible_anchors(loss_mask(example), cfg["block_size"]).any())
+    if not compatible:
+        return "upstream requires >=2*block_size answer labels and one full-block anchor"
+    return None
+
+
 def validate_records(records, processor, config, cfg, base_dir):
     from tqdm import tqdm
     valid, skipped = [], []
     for index, record in enumerate(tqdm(records, desc="VLM input validation", unit="sample")):
-        try:
-            example = prepare_example(processor, config, record, device="cpu", training=True,
-                                      max_length=cfg["max_length"], base_dir=base_dir)
-        except ValueError as exc:
-            skipped.append({"index": index, "id": record["id"], "reason": str(exc)})
-            continue
-        compatible = has_anchor(example, cfg["block_size"])
-        if cfg.get("pivot_two_rounds"):
-            from .pivot_training import eligible_anchors
-            compatible = bool(eligible_anchors(loss_mask(example), cfg["block_size"]).any())
-        if compatible:
+        reason = validate_record(record, processor, config, cfg, base_dir)
+        if reason is None:
             valid.append(index)
         else:
-            skipped.append({"index": index, "id": record["id"],
-                            "reason": "upstream requires >=2*block_size answer labels and one full-block anchor"})
+            skipped.append({"index": index, "id": record["id"], "reason": reason})
     return {"valid": valid, "skipped": skipped}
 
 

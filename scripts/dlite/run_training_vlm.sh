@@ -47,6 +47,26 @@ if visible < workers:
     )
 PY
 mkdir -p "$OUTPUT_DIR"
+# Context experiments enable this by default; other VLM launchers may opt in.
+# Preprocess before torchrun/Target loading, and serialize concurrent Full/Pivot
+# checks through the shared cache lock.
+if [[ "${PREPARE_VALIDATION:-0}" == 1 ]]; then
+    if (( $# )); then
+        echo "Automatic preflight uses CONFIG/TRAIN_DATA/TARGET_MODEL/MAX_SAMPLES; move CLI overrides there, or preprocess separately and set PREPARE_VALIDATION=0." >&2
+        exit 2
+    fi
+    validation_result="$(mktemp)"
+    if ! CONFIG="$CONFIG" TRAIN_DATA="$TRAIN_DATA" TARGET_MODEL="$TARGET_MODEL" \
+        PYTHON_BIN="$PYTHON_BIN" DLITE_WORKSPACE="${DLITE_WORKSPACE:-$WORKSPACE}" \
+        bash tests/prepare_vlm_validation.sh --result-file "$validation_result"; then
+        rm -f -- "$validation_result"
+        echo "VLM preprocessing failed; training was not started." >&2
+        exit 1
+    fi
+    export REUSE_VALIDATION_FROM="$(cat "$validation_result")"
+    rm -f -- "$validation_result"
+    [[ -n "$REUSE_VALIDATION_FROM" ]] || { echo "Missing validation cache path" >&2; exit 1; }
+fi
 limits=()
 if [[ -n "${REUSE_VALIDATION_FROM:-}" ]]; then
     limits+=(--reuse-validation-from "$REUSE_VALIDATION_FROM")

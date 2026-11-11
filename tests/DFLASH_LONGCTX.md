@@ -13,6 +13,25 @@ Data preparation needs huggingface_hub, pandas, pyarrow and Pillow. It does not
 need Torch/Transformers updates. The evaluator uses the existing working VLM
 environment. Optional HF_ENDPOINT can point to the user's Hub mirror.
 
+If the server cannot reach Hugging Face, download these two files on another
+computer and upload them into `$DLITE_WORKSPACE/data/longctx_raw/`:
+
+* MathVista: `https://huggingface.co/datasets/AI4Math/MathVista/resolve/main/data/testmini-00000-of-00001-725687bf7a18d64b.parquet?download=true`
+* GovReport: `https://huggingface.co/datasets/ccdv/govreport-summarization/resolve/main/document/test-00000-of-00001.parquet?download=true`
+
+Then prepare from uploaded files, without any Hub access:
+
+```bash
+bash tests/prepare_longctx_data.sh \
+  --mathvista-parquet "$DLITE_WORKSPACE/data/longctx_raw/testmini-00000-of-00001-725687bf7a18d64b.parquet" \
+  --govreport-parquet "$DLITE_WORKSPACE/data/longctx_raw/test-00000-of-00001.parquet"
+```
+
+Keep the `.parquet` files intact; no extraction is needed. Local source paths
+and SHA256 hashes are saved in the prepared manifest. Providing both parameters
+avoids importing the Hub downloader. Existing prepared data is still verified
+and reused.
+
 ## Sources and fixed choices
 
 `longctx_reference.json` contains the first 100 MathVista IDs and 50 GovReport

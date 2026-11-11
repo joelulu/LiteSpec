@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import types
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -61,6 +62,28 @@ class DataTests(unittest.TestCase):
             root=Path(temp)/'dataset'
             with self.assertRaisesRegex(ValueError,'missing query'):data.write_dataset(root,rows,reports,reference,100,{})
             self.assertFalse(root.exists());self.assertEqual(list(Path(temp).glob('.longctx-*')),[])
+
+    def test_uploaded_shards_prepare_100_without_importing_hub(self):
+        rows,reports,_=self.fixture()
+        with tempfile.TemporaryDirectory() as temp,redirect_stdout(io.StringIO()):
+            root=Path(temp)
+            math_file=root/'mathvista.parquet';math_file.write_bytes(b'mathvista-test')
+            report_file=root/'govreport.parquet';report_file.write_bytes(b'govreport-test')
+            fake_pandas=types.ModuleType('pandas')
+            def read_parquet(path,columns):
+                selected=rows if path==math_file else reports
+                return SimpleNamespace(to_dict=lambda orient:selected)
+            fake_pandas.read_parquet=read_parquet
+            args=argparse.Namespace(output_dir=root/'prepared',samples=100,cache_dir=root/'cache',
+                mathvista_parquet=math_file,govreport_parquet=report_file)
+            with patch.dict(sys.modules,{'pandas':fake_pandas,'huggingface_hub':None}):
+                output=data.prepare(args)
+            actual,_,manifest=data.verify_dataset(output,100)
+            self.assertEqual(len(actual),100)
+            for key,path in [('mathvista',math_file),('govreport',report_file)]:
+                self.assertEqual(manifest['sources'][key]['resolved_revision'],'local-file')
+                self.assertEqual(manifest['sources'][key]['sha256'],data.sha256(path))
+            self.assertFalse(args.cache_dir.exists())
 
 
 class SweepTests(unittest.TestCase):

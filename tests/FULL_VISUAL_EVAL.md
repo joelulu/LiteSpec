@@ -11,13 +11,19 @@ before starting model processes. It never retrains a model. Set `SOURCE_EVAL_DIR
 to a specific prior `eval_all_b1_n32` directory if automatic selection is not
 appropriate. The selected source and Full checkpoint are printed before launch.
 
-Each dataset runs Correct, Wrong, then Mask on the same physical GPU. Correct
-runs AR and Full; Wrong/Mask reuse Correct's AR outputs and timings through the
-existing strict same-GPU/same-input reference checks. Defaults: B=1, 32 samples,
-max_new_tokens=256, original seed/image budget, SDPA/per_token, warmup=1.
-`VISUAL_EVAL_GPUS="4 5 6 7"` is the default; five datasets are queued without
-overlapping jobs on a GPU. `FULL_VISUAL_RESULT_DIR` can specify a fresh output
-directory. `--dry-run` validates and freezes inputs/commands without loading models.
+The default condition schedule assigns all 15 dataset/condition cells across
+`VISUAL_EVAL_GPUS="0 1 2 3 4 5 6 7"`, with up to eight active cells and one
+active process per GPU. Every cell runs AR and Full on its own GPU. Cross-GPU
+conditions do not share AR timings; each reported ratio uses its local AR.
+All three conditions still use the same 32 prompts and image preprocessing.
+Defaults: B=1, max_new_tokens=256, original seed/image budget, SDPA/per_token,
+warmup=1. This parallelism is across independent cells; B remains 1.
+
+Set `VISUAL_EVAL_SCHEDULING=dataset` to keep each dataset's three conditions
+sequentially on the same GPU and share Correct's AR baseline through the strict
+same-GPU/same-input checks. This mode has at most five active GPUs.
+`FULL_VISUAL_RESULT_DIR` can specify a fresh output directory. `--dry-run`
+validates and freezes inputs/commands without loading models.
 
 These are **Draft visual-context interventions**. Target always sees the
 correct image. Wrong replaces visual-position Target hidden with features from

@@ -38,7 +38,7 @@ class VisualTests(unittest.TestCase):
                              target=cli.fingerprint(target), checkpoints=dict(full=cli.fingerprint(full)),
                              jobs=jobs, image_max_pixels=1048576)
         cli.write_json(self.source/'manifest.json',self.manifest)
-        self.args = argparse.Namespace(workspace=self.root, source_eval_dir=None, output_dir=self.root/'out', gpus=['4','5','6','7'])
+        self.args = argparse.Namespace(workspace=self.root, source_eval_dir=None, output_dir=self.root/'out', gpus=['4','5','6','7'], scheduling='dataset')
 
     def test_full_only_frozen_inputs_and_ar_reference_dependencies(self):
         root, jobs = cli.prepare(self.args)
@@ -115,7 +115,43 @@ class VisualTests(unittest.TestCase):
         result=subprocess.run([sys.executable,str(HERE/'evaluate_full_visual.py'),
             '--workspace',str(self.root),'--output-dir',str(self.args.output_dir),'--dry-run'],capture_output=True,text=True)
         self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual(len(json.loads((self.args.output_dir/'manifest.json').read_text())['jobs']),15)
+        manifest=json.loads((self.args.output_dir/'manifest.json').read_text())
+        self.assertEqual(len(manifest['jobs']),15)
+        self.assertEqual(manifest['settings']['scheduling'],'condition')
+        self.assertEqual(set(job['gpu'] for job in manifest['jobs']),set(map(str,range(8))))
+        self.assertTrue(all('--ar-reference' not in job['command'] for job in manifest['jobs']))
+
+    def test_eight_gpu_condition_schedule_has_no_cross_gpu_ar_dependencies(self):
+        self.args.scheduling='condition'
+        self.args.gpus=list(map(str,range(8)))
+        root,jobs=cli.prepare(self.args)
+        self.assertEqual([job['gpu'] for job in jobs],list(map(str,range(8)))+list(map(str,range(7))))
+        for index,name in enumerate(cli.DATASETS):
+            cases=jobs[index*3:(index+1)*3]
+            self.assertEqual(len({job['snapshot'] for job in cases}),1)
+            self.assertTrue(all('--ar-reference' not in job['command'] for job in cases))
+        # The first job on every GPU must be running simultaneously before any
+        # can complete. This fails if a future change silently caps workers at 5.
+        code='''import fcntl,json,os,pathlib,sys,time
+out=pathlib.Path(sys.argv[1]); root=pathlib.Path(sys.argv[2])
+gpu=os.environ['CUDA_VISIBLE_DEVICES']
+lock=open(root/('gpu'+gpu+'.lock'),'w')
+fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+(root/('started'+gpu)).touch()
+deadline=time.monotonic()+5
+while len(list(root.glob('started*')))<8 and time.monotonic()<deadline: time.sleep(.01)
+assert len(list(root.glob('started*')))==8
+out.mkdir(); (out/'summary.json').write_text(sys.argv[3])
+'''
+        rows=[dict(model=label,batch_size=1,requests=32,matched=32,
+            mean_committed_length=None if label=='ar' else 2.5,first_candidate_hit_rate=.7,
+            output_tokens_per_second=80,raw_throughput_speedup_vs_ar=2,peak_allocated_gib=10)
+            for label in ('ar','full')]
+        for job in jobs:
+            job['command']=[sys.executable,'-c',code,job['output'],str(root),json.dumps(rows)]
+        self.assertEqual(cli.execute(root,jobs,1),0)
+        path=cli.visual_report(root)
+        self.assertIn('own same-GPU AR',path.read_text())
 
 
 if __name__=='__main__': unittest.main()

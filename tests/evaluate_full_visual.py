@@ -58,11 +58,12 @@ def prepare(args):
     for directory in ('inputs', 'logs', 'results'):
         (root/directory).mkdir(parents=True, exist_ok=True)
     jobs = []
+    scheduling = args.scheduling
     for index, name in enumerate(DATASETS):
-        gpu = args.gpus[index % len(args.gpus)]
         snapshot = root/'inputs'/f'{name}.jsonl'
         snapshot.write_bytes(packets[name])
         for condition in CONDITIONS:
+            gpu = args.gpus[(len(jobs) if scheduling == 'condition' else index) % len(args.gpus)]
             output = root/'results'/name/condition
             output.parent.mkdir(exist_ok=True)
             cmd = [sys.executable, str(HERE/'benchmark_vlm_static_batch.py'),
@@ -73,14 +74,14 @@ def prepare(args):
                    '--image-max-pixels', str(manifest['image_max_pixels']), '--cpu-inputs',
                    '--attention-backend', 'sdpa', '--state-mode', 'per_token',
                    '--visual-condition', condition, '--output-dir', str(output)]
-            if condition != 'correct':
+            if condition != 'correct' and scheduling == 'dataset':
                 cmd += ['--ar-reference', str(output.parent/'correct')]
             jobs.append(dict(dataset=f'{name}/{condition}', kind='image', gpu=gpu,
                 samples=32, models=['ar','full'], snapshot=str(snapshot), output=str(output),
                 log=str(root/'logs'/f'{name}_{condition}.log'), command=cmd))
     write_json(root/'manifest.json', dict(source_evaluation=str(source), target=target, checkpoint=checkpoint,
         settings=dict(samples=32, batch_size=1, max_new_tokens=256, seed=settings['seed'],
-                      gpus=args.gpus, image_max_pixels=manifest['image_max_pixels']),
+                      gpus=args.gpus, scheduling=scheduling, image_max_pixels=manifest['image_max_pixels']),
         intervention='Draft visual-position Target hidden only; Target images and text hidden remain correct',
         wrong_donor_prefill_excluded=True, jobs=jobs))
     return root, jobs
@@ -88,12 +89,15 @@ def prepare(args):
 
 def visual_report(root):
     rows = json.loads((root/'comparison.json').read_text())
+    settings = json.loads((root/'manifest.json').read_text())['settings']
+    baseline = ('Each condition measures its own same-GPU AR baseline; no cross-GPU AR reuse.'
+                if settings.get('scheduling') == 'condition' else "Wrong/Mask reuse Correct's same-GPU AR baseline.")
     lines = ['# Full visual-context intervention', '',
         'Five image datasets; identical 32 prompts per dataset, B=1, max_new_tokens=256.',
         'Target inputs stay correct; only Draft visual-position features/attention are intervened on.',
         'Wrong replaces visual features with a different-image donor; its extra donor prefill is excluded from timing.',
         'Mask removes Draft attention to visual positions. Text hidden and positions remain unchanged.',
-        'Wrong/Mask reuse Correct\'s same-GPU AR baseline. All samples contribute, including AR mismatches.', '',
+        baseline + ' All samples contribute, including AR mismatches.', '',
         '| Dataset | GPU | Condition | Committed | First hit | tok/s | Speedup | AR match | Peak GiB |',
         '|---|---:|---|---:|---:|---:|---:|---:|---:|']
     for row in rows:
@@ -118,7 +122,9 @@ def main(argv=None):
     parser.add_argument('--workspace', type=Path, required=True)
     parser.add_argument('--source-eval-dir', type=Path, help='prior experiment-1 eval_all_b1_n32 directory')
     parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--gpus', nargs='+', default=['4','5','6','7'])
+    parser.add_argument('--gpus', nargs='+', default=list(map(str, range(8))))
+    parser.add_argument('--scheduling', choices=['condition','dataset'], default='condition',
+                        help='condition: parallel dataset/condition cells with local AR; dataset: share AR and GPU across conditions')
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
     if not 1 <= len(args.gpus) <= 8 or len(set(args.gpus)) != len(args.gpus):

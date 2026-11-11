@@ -308,5 +308,9 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         result["cache_policy"] = "preallocated_attention_kv_" + state_mode
     if timeline:
         result['profile'] = timeline.resolve(result['decode_seconds'])
+        if baseline:
+            from .inference_profile import draft_cache_snapshot
+            result['profile']['draft_cache'] = draft_cache_snapshot(history, draft)
     return result
+
 

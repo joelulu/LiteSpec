@@ -37,14 +37,49 @@ class DecodeTimeline:
         if self.previous is not None:
             raise RuntimeError('decode timeline must end with mark(None)')
         host, timeline, counts = Counter(), Counter(), Counter()
+        first, later, later_counts = {}, Counter(), Counter()
         for name, wall, start, end in self.intervals:
             host[name] += wall
-            timeline[name] += start.elapsed_time(end)/1000 if self.cuda else wall
+            seconds = start.elapsed_time(end)/1000 if self.cuda else wall
+            timeline[name] += seconds
+            if name not in first:
+                first[name] = seconds
+            else:
+                later[name] += seconds
+                later_counts[name] += 1
             counts[name] += 1
         return dict(clock='cuda_stream_events' if self.cuda else 'cpu_wall',
                     stage_seconds=dict(timeline), host_stage_seconds=dict(host),
                     stage_calls=dict(counts), decode_seconds=decode_seconds,
+                    first_stage_seconds=first, later_stage_seconds=dict(later), later_stage_calls=dict(later_counts),
                     unassigned_seconds=decode_seconds-sum(timeline.values()))
+
+
+def draft_cache_snapshot(history, draft):
+    """Post-decode diagnostic storage, outside the normal benchmark timing."""
+    cache = history.cache
+    tensors = []
+    layers = getattr(cache, 'layers', None)
+    if layers is not None:
+        for layer in layers:
+            tensors.extend(getattr(layer, name, None) for name in ('keys', 'values'))
+    else:
+        try:
+            for pair in cache:
+                tensors.extend(pair[:2])
+        except TypeError:
+            pass
+    storages = {}
+    for tensor in tensors:
+        if tensor is not None and hasattr(tensor, 'untyped_storage'):
+            storage = tensor.untyped_storage()
+            storages[storage.data_ptr()] = storage.nbytes()
+    positions = cache.get_seq_length()
+    raw = history.hidden
+    return dict(projected_kv_positions=int(positions),
+        projected_kv_storage_bytes=sum(storages.values()) if storages or positions == 0 else None,
+        raw_hidden_positions=int(raw.shape[1]), raw_hidden_storage_bytes=raw.untyped_storage().nbytes(),
+        context_slots=int(getattr(draft, 'context_slots', 1)))
 
 
 @contextmanager
@@ -93,3 +128,4 @@ def kernel_environment():
         for name in ('torch_chunk_gated_delta_rule', 'torch_recurrent_gated_delta_rule')
         if hasattr(module, name)}
     return result
+

@@ -52,6 +52,42 @@ equivalence, nonzero-prior block indexing and train/inference parity, optimizer
 classification, real gradient updates, checkpoint reload, and dense/Flex
 forward and gradient agreement. It loads no Target model or evaluation dataset.
 
+The suite also runs a four-rank check with `--fsdp`, using the production
+SHARD_GRAD_OP/use_orig_params setting, BF16 weights, compiled TRITON FlexAttention,
+the FP32-master BF16Optimizer, and two optimizer updates with 16 accumulation
+passes each. Sequence lengths vary while gradients are retained. The learned
+prior must receive a finite nonzero gradient and change after optimization.
+
+### C capture failure and recovery
+
+In torch 2.9.1, a score-modifier closure capturing the original FSDP bias view
+can make Dynamo recursively inspect a full flat-parameter buffer whose gradient
+is a local shard. The resulting error mentions assigning a gradient whose size
+is one quarter of the tensor size on four GPUs. Single-GPU checks cannot cover
+this state. The model now clones the 7-by-5 prior once before entering compiled
+attention, sharing the copy across draft layers. CloneBackward keeps the prior
+trainable; neither detach nor dense-training fallback is used.
+
+If Pivot5/B finished and C failed, retain their exports and run:
+
+```bash
+FAILED_RUN_GROUP=/absolute/path/to/the/failed/experiment/group \
+TRAIN_GPUS=0,1,2,3 bash tests/retry_dflash_exp2_c.sh
+```
+
+The retry launcher checks both completed checkpoints, runs single-GPU and
+four-GPU adapter checks, then starts C **from scratch** with the same 10w data,
+five epochs and global batch 256. It creates a fresh `pivot5_C_retry_*` directory,
+preserving the previous C logs and any exports. On success it evaluates the old
+Pivot5, old B and new C at B=1/n=32 across all eight datasets, writing the report
+under the retry directory's `eval_all_b1_n32`. If the distributed check fails,
+neither long training nor evaluation starts.
+
+Local checks without Torch can exercise the capture boundary and launcher
+orchestration. The real Tensor/FakeTensor checks in
+`tests/test_dflash_layer_prior_fsdp.py` require Torch; the distributed regression
+requires the training environment and multiple GPUs.
+
 ## Preflight reuse
 
 Both suites use `data/finevision_qwen35_10w_img1024_relaxed/train.jsonl`,

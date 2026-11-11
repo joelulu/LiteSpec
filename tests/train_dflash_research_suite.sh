@@ -74,6 +74,8 @@ PY
 if [[ "$1" == adapters ]]; then
     "$PYTHON_BIN" tests/check_dflash_layer_adapters.py --device cuda --flex \
         2>&1 | tee "$RUN_GROUP/layer_adapter_check.log"
+    "$PYTHON_BIN" -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node="$NPROC_PER_NODE" \
+        tests/check_dflash_layer_adapters.py --fsdp 2>&1 | tee "$RUN_GROUP/layer_adapter_fsdp_check.log"
 fi
 # The parallel preflight launcher verifies compatibility before Target loading.
 # Later groups reuse the same validation decisions, regardless of context mode.

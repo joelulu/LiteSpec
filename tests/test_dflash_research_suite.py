@@ -38,13 +38,13 @@ class ConfigTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
-    def exercise(self, preset, micro='4', fail=False):
+    def exercise(self, preset, micro='4', fail=False, retry=False, fail_check=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             repo, workspace = root/'repo', root/'workspace'
             (repo/'tests').mkdir(parents=True)
             (repo/'scripts/dlite').mkdir(parents=True)
-            for name in ('train_dflash_research_suite.sh','train_dflash_exp1.sh','train_dflash_exp2.sh'):
+            for name in ('train_dflash_research_suite.sh','train_dflash_exp1.sh','train_dflash_exp2.sh','retry_dflash_exp2_c.sh'):
                 shutil.copy2(ROOT/'tests'/name, repo/'tests'/name)
             for relative in ('data/finevision_qwen35_10w_img1024_relaxed/train.jsonl',
                              'data/finevision_qwen35_gdn_valid20k_img1024_b8_s42/train.jsonl'):
@@ -55,6 +55,14 @@ class LaunchTests(unittest.TestCase):
                 for filename in ('effective_config.json','skipped_training.jsonl'):
                     (path/filename).touch()
             target=root/'target';target.mkdir()
+            old_group=workspace/'runs/completed'
+            old_files={}
+            if retry:
+                for mode in ('pivot5','pivot5_B','pivot5_C'):
+                    path=old_group/mode/'last/config.json'
+                    path.parent.mkdir(parents=True)
+                    path.write_text('original '+mode)
+                    old_files[path]=path.read_bytes()
             events=root/'events.jsonl'
             recorder=root/'record.py'
             recorder.write_text(
@@ -65,6 +73,7 @@ class LaunchTests(unittest.TestCase):
 import os, pathlib, subprocess, sys
 argv=sys.argv[1:]
 subprocess.run([sys.executable,{str(recorder)!r},'python',*argv],check=True)
+if '--fsdp' in argv and os.environ.get('FAIL_DISTRIBUTED_CHECK')=='1': sys.exit(9)
 if argv[0]=='-':
     code=sys.stdin.read()
     if 'import os, torch' not in code:
@@ -95,11 +104,19 @@ touch "$RESULT_DIR/comparison.md"
                      # Deliberately polluted inputs must not change the preset.
                      INIT_CHECKPOINT='/stale',RESUME='/stale',MAX_STEPS='1',EPOCHS='99',
                      TRAIN_DATA='/stale',MAX_SAMPLES='16',ACCUMULATION_STEPS='99',
-                     SAVE_EVERY_EPOCH='0',VIDEO_SAMPLES='16',EVAL_BATCH_SIZE='64')
-            result=subprocess.run(['bash',str(repo/'tests'/f'train_dflash_exp{preset}.sh')],env=env,capture_output=True,text=True)
+                     SAVE_EVERY_EPOCH='0',VIDEO_SAMPLES='16',EVAL_BATCH_SIZE='64',
+                     FAILED_RUN_GROUP=str(old_group),FAIL_DISTRIBUTED_CHECK='1' if fail_check else '0')
+            script='retry_dflash_exp2_c.sh' if retry else f'train_dflash_exp{preset}.sh'
+            result=subprocess.run(['bash',str(repo/'tests'/script)],env=env,capture_output=True,text=True)
             rows=[json.loads(line) for line in events.read_text().splitlines()]
             trains=[r for r in rows if r['event']=='train']
             evaluations=[r for r in rows if r['event']=='evaluate']
+            for path,content in old_files.items(): self.assertEqual(path.read_bytes(),content)
+            if fail_check:
+                self.assertNotEqual(result.returncode,0)
+                self.assertEqual(trains,[])
+                self.assertEqual(evaluations,[])
+                return
             if fail:
                 self.assertNotEqual(result.returncode,0)
                 self.assertEqual(len(trains),1)
@@ -107,7 +124,7 @@ touch "$RESULT_DIR/comparison.md"
                 return
             self.assertEqual(result.returncode,0,result.stderr+result.stdout)
             modes=['full','recent128','pivot1','pivot5','pivot12'] if preset==1 else ['pivot5','pivot5_B','pivot5_C']
-            self.assertEqual([r['args'][0] for r in trains],modes)
+            self.assertEqual([r['args'][0] for r in trains],['pivot5_C'] if retry else modes)
             for row in trains:
                 e=row['env']
                 self.assertEqual(e['EPOCHS'],'5')
@@ -127,11 +144,17 @@ touch "$RESULT_DIR/comparison.md"
             self.assertEqual([args[i+1] for i,a in enumerate(args) if a=='--checkpoint'],modes)
             checks=[r for r in rows if r['event']=='python' and r['args'][0].endswith('check_dflash_layer_adapters.py')]
             self.assertEqual(len(checks),0 if preset==1 else 1)
+            distributed=[r for r in rows if r['event']=='python' and '--fsdp' in r['args']]
+            self.assertEqual(len(distributed),0 if preset==1 else 1)
+            if preset==2:
+                self.assertIn('--nproc-per-node=4',distributed[0]['args'])
 
     def test_long_preset(self): self.exercise(1)
     def test_adapter_preset_includes_pivot5_control_and_uses_10w_five_epochs(self): self.exercise(2)
     def test_smaller_micro_preserves_global_batch(self): self.exercise(1,micro='2')
     def test_failure_stops_before_other_training_and_eval(self): self.exercise(2,fail=True)
+    def test_c_retry_trains_only_c_and_reuses_unmodified_old_checkpoints(self): self.exercise(2,retry=True)
+    def test_distributed_check_failure_prevents_training(self): self.exercise(2,retry=True,fail_check=True)
 
 
 if __name__=='__main__': unittest.main()

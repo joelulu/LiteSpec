@@ -20,7 +20,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 from typing_extensions import Tuple, Unpack
 
-from .context_layers import PerLayerContextProjection, dense_layer_prior_mask, layer_prior_score_mod
+from .context_layers import PerLayerContextProjection, dense_layer_prior_mask, layer_prior_score_mod, materialize_layer_prior
 from .dflash_kernels import DEFAULT_DFLASH_KERNELS, DFlashKernels
 from .flex_attention import compile_friendly_flex_attention
 from .registry import method_config, register_draft
@@ -893,6 +893,10 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             target_hidden = self.fc(target_hidden)
         target_hidden = self.hidden_norm(target_hidden)
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # Materialize before compiled attention captures the prior. In FSDP
+        # accumulation the original parameter views a full buffer with a local
+        # shard gradient, which Dynamo 2.9.1 cannot recursively fake-ify.
+        context_layer_bias = materialize_layer_prior(self.context_layer_bias)
         for layer_type, layer in zip(self.layer_types, self.layers):
             layer_attention_mask = (
                 attention_mask[layer_type]
@@ -907,7 +911,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 position_embeddings=position_embeddings,
-                context_layer_bias=self.context_layer_bias,
+                context_layer_bias=context_layer_bias,
                 **kwargs,
             )
         return self.norm(hidden_states)

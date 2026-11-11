@@ -2,15 +2,33 @@
 
 Run with the training interpreter on the server:
   python tests/check_dflash_layer_adapters.py --device cuda --flex
+  python -m torch.distributed.run --standalone --nproc-per-node=4 \
+      tests/check_dflash_layer_adapters.py --fsdp
 """
 import argparse
+from datetime import timedelta
+import os
 import tempfile
 from pathlib import Path
 
 
+def tiny_model(device, projection, prior, layers=1):
+    from transformers import Qwen3Config
+    from litespec.modeling.draft.dflash import DFlashDraftModel
+    cfg = Qwen3Config(vocab_size=128, hidden_size=64, intermediate_size=128,
+                      num_hidden_layers=layers, num_attention_heads=4, num_key_value_heads=2,
+                      head_dim=16, layer_types=['full_attention'] * layers, attention_dropout=0.0)
+    cfg.architectures = ['DFlashDraftModel']
+    cfg.num_target_layers, cfg.block_size = 32, 8
+    cfg.dflash_config = dict(target_layer_ids=[1,8,15,22,29], mask_token_id=127,
+                             context_projection=projection, position_layer_bias=prior)
+    cfg.vlm_config = dict(draft_context='pivot5')
+    cfg._attn_implementation = 'sdpa'
+    return DFlashDraftModel(cfg).to(device).eval()
+
+
 def check(device='cpu', flex=False):
     import torch
-    from transformers import Qwen3Config
     from litespec.modeling.draft.dflash import DFlashDraftModel
     from litespec.modeling.draft.context_layers import dense_layer_prior_mask
     from litespec.core.attention_masks import create_dflash_sdpa_mask, create_dflash_flex_mask
@@ -19,19 +37,8 @@ def check(device='cpu', flex=False):
     torch.manual_seed(42)
     block, slots, width, sequence = 8, 5, 64, 20
 
-    def model(projection, prior):
-        cfg = Qwen3Config(vocab_size=128, hidden_size=width, intermediate_size=128,
-                          num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
-                          head_dim=16, layer_types=['full_attention'], attention_dropout=0.0)
-        cfg.architectures = ['DFlashDraftModel']
-        cfg.num_target_layers, cfg.block_size = 32, block
-        cfg.dflash_config = dict(target_layer_ids=[1,8,15,22,29], mask_token_id=127,
-                                 context_projection=projection, position_layer_bias=prior)
-        cfg.vlm_config = dict(draft_context='pivot5')
-        cfg._attn_implementation = 'sdpa'
-        return DFlashDraftModel(cfg).to(device).eval()
-
-    base, b, c = model('shared', False), model('per_layer', False), model('per_layer', True)
+    base = tiny_model(device, 'shared', False)
+    b, c = tiny_model(device, 'per_layer', False), tiny_model(device, 'per_layer', True)
     common = {k: v for k, v in base.state_dict().items() if k != 'fc.weight'}
     b.load_state_dict(common, strict=False)
     with torch.no_grad():
@@ -121,9 +128,82 @@ def check(device='cpu', flex=False):
     print(f'B/C numerical check passed: device={device}, Flex={flex}; projection, prior, gradients, parity and reload', flush=True)
 
 
+def check_fsdp():
+    """Exercise the production FSDP/BF16/Flex/master-optimizer accumulation path."""
+    import torch
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+    from litespec.core.attention_masks import create_dflash_flex_mask
+    from litespec.modeling.draft.flex_attention import flex_kernel_options
+    from litespec.training.optimizer import BF16Optimizer, register_optimizer_parameters
+
+    if int(os.environ.get('WORLD_SIZE', '1')) < 2 or not torch.cuda.is_available():
+        raise ValueError('--fsdp requires torchrun with >=2 CUDA ranks')
+    device = torch.device('cuda', int(os.environ['LOCAL_RANK']))
+    torch.cuda.set_device(device)
+    dist.init_process_group('nccl', timeout=timedelta(minutes=15))
+    try:
+        torch.manual_seed(42)
+        draft = tiny_model(device, 'per_layer', True, layers=2).to(dtype=torch.bfloat16).train()
+        draft.config._attn_implementation = 'flex_attention'
+        with torch.no_grad():
+            draft.context_layer_bias.normal_(0, 0.2)
+        parameters, specs = register_optimizer_parameters(draft)
+        fsdp = FSDP(draft, use_orig_params=True, sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+                    mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16),
+                    device_id=device)
+        optimizer = BF16Optimizer(draft, lr=0.01, weight_decay=0, max_grad_norm=1,
+                                  total_steps=2, warmup_ratio=0, parameters=parameters, parameter_specs=specs)
+        with FSDP.summon_full_params(fsdp, writeback=False):
+            before = draft.context_layer_bias.detach().float().cpu().clone()
+        torch.manual_seed(100 + dist.get_rank())
+        # Same accumulation as the four-GPU experiment. Change physical
+        # sequence length while a reduced shard gradient is already present.
+        for step in range(2):
+            optimizer.zero_grad()
+            for micro in range(16):
+                sequence = (20, 24, 20)[micro % 3]
+                anchors = torch.tensor([[6, 13], [7, 14]], device=device)
+                keep = torch.ones_like(anchors, dtype=torch.bool)
+                positions = torch.cat([
+                    torch.arange(sequence, device=device).repeat_interleave(5)[None].expand(2, -1),
+                    (anchors[...,None] + torch.arange(8, device=device)).flatten(1)], dim=1)
+                mask = create_dflash_flex_mask(anchors, keep, sequence, 8, device, context_window=1, context_slots=5)
+                context = torch.randn(2, sequence, 5*64, device=device, dtype=torch.bfloat16)
+                query = torch.randn(2, 16, 64, device=device, dtype=torch.bfloat16)
+                readout = torch.randn_like(query)
+                output = fsdp(position_ids=positions, target_hidden=context, noise_embedding=query,
+                              attention_mask=mask, is_causal=False, kernel_options=flex_kernel_options('TRITON'))
+                loss = (output.float() * readout.float()).mean() / 16
+                assert torch.isfinite(loss), 'nonfinite FSDP loss'
+                loss.backward()
+            grad = draft.context_layer_bias.grad
+            squared = torch.zeros((), device=device, dtype=torch.float64)
+            if grad is not None:
+                squared += grad.detach().double().square().sum()
+            dist.all_reduce(squared)
+            assert torch.isfinite(squared) and squared.item() > 0, 'layer prior lost its gradient'
+            optimizer.step()
+            if dist.get_rank() == 0:
+                print(f'C FSDP step {step+1}/2: 16 BF16/Flex accumulation passes succeeded', flush=True)
+        with FSDP.summon_full_params(fsdp, writeback=False):
+            after = draft.context_layer_bias.detach().float().cpu().clone()
+        assert not torch.equal(before, after), 'C layer prior was not updated'
+        dist.barrier()
+        if dist.get_rank() == 0:
+            print(f'C distributed check passed: {dist.get_world_size()} GPUs; real FSDP/master optimizer; prior updated', flush=True)
+    finally:
+        dist.destroy_process_group()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--flex', action='store_true')
+    parser.add_argument('--fsdp', action='store_true', help='multi-rank BF16/Flex gradient-accumulation regression')
     args = parser.parse_args()
-    check(args.device, args.flex)
+    if args.fsdp:
+        check_fsdp()
+    else:
+        check(args.device, args.flex)

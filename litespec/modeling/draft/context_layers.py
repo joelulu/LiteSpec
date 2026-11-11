@@ -17,6 +17,18 @@ class PerLayerContextProjection(nn.Module):
                             for i, projection in enumerate(self.projections)], dim=2)
 
 
+def materialize_layer_prior(bias):
+    """Keep FSDP flat-parameter views out of compiled score-modifier closures.
+
+    With use_orig_params=True, a bias parameter can view an unsharded flat
+    buffer whose accumulated gradient is still sharded. Dynamo recursively
+    fake-ifies a captured view's base, encountering incompatible shapes.
+    A real clone has no view base; its CloneBackward still trains the parameter.
+    Call outside compiled FlexAttention, once per draft forward, never detach.
+    """
+    return None if bias is None else bias.clone(memory_format=torch.contiguous_format)
+
+
 def layer_prior_score_mod(bias, block_size, slots, context_length):
     """Anchor is offset zero; learned rows apply to predicted offsets 1..b-1.
 

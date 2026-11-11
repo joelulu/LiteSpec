@@ -149,6 +149,67 @@ class PreparationTests(unittest.TestCase):
             cli.prepare(self.args)
 
 
+    def frozen_source(self):
+        source=self.root/'runs/dflash_exp1_10w_5ep_test/eval_all_b1_n32'
+        self.args.output_dir=source
+        with patch.dict(sys.modules,self.modules):
+            _,jobs=cli.prepare(self.args)
+        self.args.output_dir=self.root/'reused'
+        self.args.reuse_selection_from=str(source)
+        self.calls.clear()
+        return source,jobs
+
+    def test_frozen_selection_skips_raw_readers_and_preserves_all_sample_ids(self):
+        source,prior_jobs=self.frozen_source()
+        self.args.data_dir=self.root/'stale-three-dataset-result'
+        def forbidden(*args,**kwargs): raise AssertionError('raw reader must not be used')
+        modules={name:SimpleNamespace(select_data=forbidden) for name in self.modules}
+        with patch.dict(os.environ,dict(PROMPT_FIELD='first-content',DATA_DIR='/stale')),patch.dict(sys.modules,modules):
+            root,jobs=cli.prepare(self.args)
+        self.assertEqual(len(jobs),8)
+        for prior,current in zip(prior_jobs,jobs):
+            self.assertEqual(Path(prior['snapshot']).read_bytes(),Path(current['snapshot']).read_bytes())
+            self.assertEqual(prior['input_sha256'],current['input_sha256'])
+        manifest=json.loads((root/'manifest.json').read_text())
+        self.assertEqual(manifest['selection_reuse']['manifest'],str(source/'manifest.json'))
+        self.assertEqual(self.calls,[])
+
+    def test_latest_exp1_frozen_selection(self):
+        source,_=self.frozen_source()
+        self.args.reuse_selection_from='latest-exp1'
+        root,jobs=cli.prepare(self.args)
+        self.assertEqual(len(jobs),8)
+        self.assertEqual(json.loads((root/'manifest.json').read_text())['selection_reuse']['manifest'],str(source/'manifest.json'))
+
+    def test_frozen_selection_rejects_changed_input_hash_before_models(self):
+        _,jobs=self.frozen_source()
+        Path(jobs[1]['snapshot']).write_text('{}\n')
+        with patch.object(cli.subprocess,'Popen') as popen:
+            with self.assertRaisesRegex(ValueError,'frozen input hash changed'):
+                cli.prepare(self.args)
+        popen.assert_not_called()
+        self.assertFalse(self.args.output_dir.exists())
+
+    def test_frozen_selection_rejects_mismatched_sample_budget(self):
+        self.frozen_source()
+        self.args.video_samples=32
+        with self.assertRaisesRegex(ValueError,'video_samples'):
+            cli.prepare(self.args)
+        self.assertFalse(self.args.output_dir.exists())
+
+    def test_frozen_cli_dry_run_works_without_model_runtime(self):
+        source,_=self.frozen_source()
+        args=self.args
+        result=subprocess.run([sys.executable,str(ROOT/'tests/evaluate_dflash_all.py'),
+            '--workspace',str(self.root),'--run-group',str(args.run_group),
+            '--target-model',str(args.target_model),'--output-dir',str(args.output_dir),
+            '--reuse-selection-from',str(source),'--dry-run'],capture_output=True,text=True)
+        self.assertEqual(result.returncode,0,result.stderr)
+        manifest=json.loads((args.output_dir/'manifest.json').read_text())
+        self.assertEqual(len(manifest['jobs']),8)
+        self.assertIn('Reusing frozen evaluation inputs',result.stdout)
+
+
 class ExecutionTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

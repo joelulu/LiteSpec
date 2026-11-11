@@ -44,9 +44,60 @@ def fingerprint(path):
                 weights=[dict(name=p.name, bytes=p.stat().st_size, mtime_ns=p.stat().st_mtime_ns) for p in weights])
 
 
+def frozen_selection(args):
+    """Reuse normalized JSONL/video snapshots without reapplying prompt readers."""
+    source = str(args.reuse_selection_from)
+    if source == 'latest-exp1':
+        candidates = list((args.workspace.expanduser()/'runs').glob(
+            'dflash_exp1_10w_5ep_*/eval_all_b1_n32/manifest.json'))
+        if not candidates:
+            raise FileNotFoundError('No experiment-1 evaluation manifest found; pass --reuse-selection-from /path/to/eval_all_b1_n32')
+        manifest_file = max(candidates, key=lambda p: p.stat().st_mtime_ns)
+    else:
+        path = Path(source).expanduser().resolve(strict=True)
+        manifest_file = path/'manifest.json' if path.is_dir() else path
+    manifest_file = manifest_file.resolve(strict=True)
+    prior = json.loads(manifest_file.read_text())
+    for key in ('samples', 'video_samples', 'max_new_tokens', 'seed', 'image_max_tokens', 'frames', 'max_pixels_per_frame'):
+        if prior['settings'].get(key) != getattr(args, key):
+            raise ValueError(f'Frozen selection setting differs: {key}; choose the matching source evaluation')
+    jobs = {job['dataset']: job for job in prior['jobs']}
+    packets, failures = {}, []
+    for name, kind in PLAN:
+        try:
+            job = jobs[name]
+            count = args.video_samples if kind == 'video' else args.samples
+            if job['kind'] != kind or job['samples'] != count:
+                raise ValueError('source modality/sample count differs')
+            path = Path(job['snapshot'])
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != job['input_sha256']:
+                raise ValueError('frozen input hash changed')
+            if kind == 'video':
+                selection = json.loads(raw)
+                if set(selection) != {name}:
+                    raise ValueError('video snapshot must contain its own dataset only')
+                records = selection[name]
+                packets[name] = records
+            else:
+                records = [json.loads(line) for line in raw.splitlines() if line.strip()]
+                if any(not isinstance(row.get('question'), str) or not row['question'].strip() for row in records):
+                    raise ValueError('normalized snapshot requires nonempty question strings')
+                packets[name] = dict(source=job.get('source',str(path)), samples=count,
+                                     serialized=raw.decode('utf-8'), sha256=digest)
+            if len(records) != count or len({row['id'] for row in records}) != count:
+                raise ValueError('frozen snapshot has incorrect/duplicate sample IDs')
+        except Exception as exc:
+            failures.append(f'{name}: {type(exc).__name__}: {exc}')
+    if failures:
+        raise ValueError('Frozen dataset preparation failed before loading models:\n'+'\n'.join(failures))
+    metadata = dict(manifest=str(manifest_file),
+                    manifest_sha256=hashlib.sha256(manifest_file.read_bytes()).hexdigest())
+    return packets, metadata
+
+
 def prepare(args):
-    from run_vlm_matrix import select_data as select_images
-    from video_benchmark_data import select_data as select_videos
 
     root = args.output_dir.expanduser().resolve()
     if root.exists():
@@ -77,20 +128,27 @@ def prepare(args):
     os.environ["IMAGE_ROOT"] = str((args.image_root or args.data_dir / "imgs").expanduser())
     if args.text_data is not None:
         os.environ["TEXT_DATA"] = str(args.text_data.expanduser())
-    packets, failures = {}, []
-    for name, kind in PLAN:
-        try:
-            if kind == "video":
-                packets[name] = select_videos(args.video_data_root, [name], args.video_samples, args.seed)[name]
-            else:
-                selected = select_images(argparse.Namespace(
-                    tests=["text-only" if name == "gsm8k" else name], samples=args.samples, seed=args.seed,
-                ))
-                packets[name] = selected[name]
-        except Exception as exc:
-            failures.append(f"{name}: {type(exc).__name__}: {exc}")
-    if failures:
-        raise ValueError("Dataset preparation failed before loading models:\n" + "\n".join(failures))
+    selection_reuse = None
+    if getattr(args, 'reuse_selection_from', None):
+        packets, selection_reuse = frozen_selection(args)
+        print(f"Reusing frozen evaluation inputs: {selection_reuse['manifest']}", flush=True)
+    else:
+        from run_vlm_matrix import select_data as select_images
+        from video_benchmark_data import select_data as select_videos
+        packets, failures = {}, []
+        for name, kind in PLAN:
+            try:
+                if kind == "video":
+                    packets[name] = select_videos(args.video_data_root, [name], args.video_samples, args.seed)[name]
+                else:
+                    selected = select_images(argparse.Namespace(
+                        tests=["text-only" if name == "gsm8k" else name], samples=args.samples, seed=args.seed,
+                    ))
+                    packets[name] = selected[name]
+            except Exception as exc:
+                failures.append(f"{name}: {type(exc).__name__}: {exc}")
+        if failures:
+            raise ValueError("Dataset preparation failed before loading models:\n" + "\n".join(failures))
 
     vision = json.loads((Path(target["path"]) / "config.json").read_text())["vision_config"]
     image_pixels = args.image_max_tokens * (vision["patch_size"] * vision["spatial_merge_size"]) ** 2
@@ -115,7 +173,7 @@ def prepare(args):
             job["source"] = packets[name]["source"]
         job["command"] = command(args, job, models, target["path"], image_pixels)
         jobs.append(job)
-    manifest = dict(run_group=str(group), target=target, checkpoints=models,
+    manifest = dict(run_group=str(group), target=target, checkpoints=models, selection_reuse=selection_reuse,
                     settings=vars(args), image_max_pixels=image_pixels, jobs=jobs)
     write_json(root / "manifest.json", manifest)
     return root, jobs
@@ -279,6 +337,8 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--checkpoint", nargs=2, action="append", metavar=("LABEL", "PATH"),
                         help="repeat for arbitrary checkpoints; defaults to Full/Pivot1")
+    parser.add_argument('--reuse-selection-from',
+                        help='reuse prior frozen inputs: evaluation directory/manifest or latest-exp1; skips raw prompt readers')
     parser.add_argument("--workspace", type=Path, default=HERE.parent.parent)
     parser.add_argument("--target-model", type=Path, default=Path.home() / "LMM/lmm_model/Qwen3.5-4B")
     parser.add_argument("--data-dir", type=Path, default=Path.home() / "LMM/liyt/datasets/jsonl_datas")

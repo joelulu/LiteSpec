@@ -23,4 +23,5 @@ args=(
 )
 [[ -z "${IMAGE_ROOT:-}" ]] || args+=(--image-root "$IMAGE_ROOT")
 [[ -z "${TEXT_DATA:-}" ]] || args+=(--text-data "$TEXT_DATA")
+[[ -z "${EVAL_REUSE_SELECTION_FROM:-}" ]] || args+=(--reuse-selection-from "$EVAL_REUSE_SELECTION_FROM")
 exec "$PYTHON_BIN" tests/evaluate_dflash_all.py "${args[@]}" "$@"

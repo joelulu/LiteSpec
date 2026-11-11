@@ -72,3 +72,36 @@ marked explicitly; other datasets continue, and the overall command exits
 nonzero if any dataset fails. AR token mismatches are reported without hiding
 throughput measurements. Ctrl+C terminates only this controller's child process
 groups. It does not kill existing training or unrelated evaluation processes.
+
+## Reuse an existing evaluation selection
+
+For direct checkpoint comparisons, reuse all eight dataset snapshots from a
+successful experiment-1 evaluation instead of reading/resampling raw data:
+
+```bash
+export EVAL_REUSE_SELECTION_FROM=latest-exp1
+bash tests/evaluate_dflash_all.sh --checkpoint pivot5 /path/to/pivot5/epoch_5 \
+    --checkpoint pivot5_B /path/to/pivot5_B/epoch_5 \
+    --checkpoint pivot5_C /path/to/pivot5_C_retry/epoch_5
+```
+
+`latest-exp1` finds the most recent
+`runs/dflash_exp1_10w_5ep_*/eval_all_b1_n32/manifest.json`. Alternatively supply
+an exact evaluation directory or manifest through this environment variable or
+`--reuse-selection-from`. Only input selections are reused; checkpoint choices
+remain explicit, and AR plus all selected models are benchmarked again on the
+assigned GPUs.
+
+The controller verifies input hashes, modalities, unique IDs and sample, seed,
+image/video and generation budgets before starting model processes. The new
+manifest records the source manifest and its hash. Normalized image JSONL
+already contains `question`, so reuse bypasses the raw `reference`/`first-content`
+reader. Video snapshots retain their one-dataset selection format. This keeps
+stale DATA_DIR/IMAGE_ROOT/PROMPT_FIELD values from redirecting repeated evaluation
+to an old three-dataset result directory. Existing absolute media paths must
+still be accessible on the machine running the benchmark.
+
+For fresh raw-data selection, set DATA_DIR to the original
+`$HOME/LMM/liyt/datasets/jsonl_datas` and IMAGE_ROOT to its `imgs` directory.
+Raw reference policy expects `prompt` or first `conversations.content`, rather
+than the normalized `question` schema in prior benchmark snapshots.

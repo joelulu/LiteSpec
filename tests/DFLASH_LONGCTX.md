@@ -1,4 +1,4 @@
-# Simple long-context Full/Pivot5 experiment
+# Simple long-context Full/Pivot1/Pivot5/Pivot12 experiment
 
 Two entrypoints:
 
@@ -6,7 +6,8 @@ Two entrypoints:
    and GovReport test Parquet shards, then save **100** fixed single-image
    records and a pool of 50 report texts.
 2. `bash tests/evaluate_dflash_longctx.sh`: take the **first 16** prepared records
-   and evaluate short, 8192, 32768 and 65536 input-token variants, twice each.
+   and evaluate short, 8192, 32768 and 65536 input-token variants, twice each,
+   with AR, Full, Pivot1, Pivot5 and Pivot12.
 
 Both use `PYTHON_BIN` (normally `$DLITE_WORKSPACE/LiteSpec/.venv-vlm/bin/python`).
 Data preparation needs huggingface_hub, pandas, pyarrow and Pillow. It does not
@@ -52,7 +53,7 @@ Defaults:
 
 * Data: `$DLITE_WORKSPACE/data/longctx_mathvista100` (`LONGCTX_DATA_DIR`).
 * Hub cache: `$DLITE_WORKSPACE/data/hf_longctx_cache` (`LONGCTX_HF_CACHE`).
-* Models: Full/Pivot5 `epoch_5` exports from the most recent experiment-1
+* Models: Full/Pivot1/Pivot5/Pivot12 `epoch_5` exports from the most recent experiment-1
   `eval_all_b1_n32/manifest.json`. Each export must match the checkpoint in that
   evaluation. `SOURCE_EVAL_DIR` can specify its exact evaluation directory.
 * Target: the exact local model fingerprint recorded by that evaluation.
@@ -80,11 +81,18 @@ are applied.
 ## Execution and measurements
 
 Before formal evaluation, two samples are tested at short and maximum length
-with AR, Full and Pivot5. Any failure stops the formal sweep. On success the
+with AR, Full, Pivot1, Pivot5 and Pivot12. Any failure stops the formal sweep. On success the
 eight jobs (four lengths times two repetitions) use GPU selectors 0 through 7
-by default. Every job evaluates all three models sequentially on the same GPU.
-Repetition 2 reverses the Full/Pivot5 order. `LONGCTX_GPUS` can change the
+by default. Every job evaluates all five models sequentially on the same GPU.
+Repetition 1 uses Full, Pivot1, Pivot5, Pivot12 after AR; repetition 2 reverses
+the four Draft models after AR. `LONGCTX_GPUS` can change the
 space-separated selectors, and `LONGCTX_RESULT_DIR` can specify fresh output.
+The default result directory begins with `runs/longctx_full_pivots_n16_`.
+Previously prepared 100-record data is reused without another download or conversion.
+For the earlier pair-only evaluation, pass `--models full pivot5`. Full must
+always be included, since all Draft throughput/latency ratios are also compared
+with it. Missing or changed epoch-5 exports fail before loading Target weights;
+models are never silently omitted or selected from experiment 2.
 
 Settings: **16 samples, B=1**, greedy, max_new_tokens=256, warmup=1, SDPA,
 per_token state, correct images. The models are never retrained. Natural EOS

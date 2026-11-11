@@ -1,4 +1,4 @@
-"""Fixed 16-image length sweep: short/8k/32k/64k, AR/Full/Pivot5."""
+"""Fixed 16-image length sweep: short/8k/32k/64k, AR/Full/Pivot1/Pivot5/Pivot12."""
 import argparse
 import csv
 import hashlib
@@ -13,6 +13,7 @@ from evaluate_full_visual import source_directory
 from prepare_longctx_data import verify_dataset
 
 HERE=Path(__file__).resolve().parent
+DEFAULT_MODELS=('full','pivot1','pivot5','pivot12')
 SEPARATOR='\n\nThe preceding reports are unrelated context. Answer the following question about the image.\n'
 
 
@@ -60,7 +61,9 @@ def resolve_models(args):
     prior=json.loads((source/'manifest.json').read_text())
     group=Path(prior['run_group'])
     models={}
-    for label in ('full','pivot5'):
+    for label in args.models:
+        if label not in prior['checkpoints']:
+            raise ValueError(f'{label}: missing from source evaluation {source}; select the complete experiment-1 evaluation')
         item=fingerprint(group/label/'epoch_5')
         if item!=prior['checkpoints'][label]:raise ValueError(f'{label}: source evaluation must use the epoch-5 export')
         cfg=json.loads((Path(item['path'])/'config.json').read_text())
@@ -140,7 +143,7 @@ def make_jobs(args,root,paths,models,target,pixels,smoke=False):
             name='short' if length==0 else f'ctx{length}'
             case=f'{name}_r{repeat+1}'
             gpu=args.gpus[len(jobs)%len(args.gpus)]
-            labels=['full','pivot5'] if repeat%2==0 else ['pivot5','full']
+            labels=list(models) if repeat%2==0 else list(reversed(models))
             count=min(2,args.samples) if smoke else args.samples
             output=root/'results'/case
             cmd=[sys.executable,str(HERE/'benchmark_vlm_static_batch.py'),
@@ -194,7 +197,7 @@ def report(root,jobs):
     if rows:
         with (root/'longctx_comparison.csv').open('w',newline='') as handle:
             writer=csv.DictWriter(handle,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
-    lines=['# Full vs Pivot5 length sweep','',
+    lines=['# Full vs Pivot context length sweep','',
         'B=1; same prompts at every length, each ratio uses a same-GPU baseline. All samples contribute.',
         'Input tokens include visual placeholders and chat overhead. Profile timings are from a separate pass.',
         'AR mismatches and natural EOS remain visible; no task-accuracy or lossless-speedup claim.','',
@@ -219,6 +222,7 @@ def main(argv=None):
     parser.add_argument('--data-dir',type=Path,required=True)
     parser.add_argument('--output-dir',type=Path,required=True)
     parser.add_argument('--source-eval-dir',type=Path)
+    parser.add_argument('--models',nargs='+',choices=DEFAULT_MODELS,default=list(DEFAULT_MODELS))
     parser.add_argument('--samples',type=int,default=16)
     parser.add_argument('--lengths',type=int,nargs='+',default=[0,8192,32768,65536])
     parser.add_argument('--gpus',nargs='+',default=list(map(str,range(8))))
@@ -229,6 +233,7 @@ def main(argv=None):
     parser.add_argument('--profile-samples',type=int,default=2)
     parser.add_argument('--prepare-only',action='store_true')
     args=parser.parse_args(argv)
+    if 'full' not in args.models or len(set(args.models))!=len(args.models):parser.error('models must include full and contain no duplicates')
     if not 1<=len(args.gpus)<=8 or len(set(args.gpus))!=len(args.gpus):parser.error('one to eight distinct GPUs required')
     if min(args.samples,args.repeats,args.image_max_tokens,args.max_new_tokens)<1 or args.profile_samples<0:parser.error('invalid budgets')
     if args.lengths!=sorted(set(args.lengths)) or args.lengths[0]!=0 or len(args.lengths)<2:parser.error('lengths must start at 0 and increase')

@@ -92,7 +92,7 @@ class SweepTests(unittest.TestCase):
         self.root=Path(self.temp.name)
         self.args=argparse.Namespace(samples=16,lengths=[0,256,1024,4096],seed=42,context_limit=131072,
             max_new_tokens=256,repeats=2,gpus=list(map(str,range(8))),profile_samples=2,
-            workspace=self.root,source_eval_dir=None)
+            workspace=self.root,source_eval_dir=None,models=list(cli.DEFAULT_MODELS))
         self.rows=[dict(id=f'q{i}',question='Explain this image.',image='/local/image.png') for i in range(100)]
         self.reports=[dict(id=f'r{i}',text=('Report '+str(i)+' ')*1000) for i in range(50)]
         self.encode=lambda row:(len(row['question'])+100,98)
@@ -118,22 +118,26 @@ class SweepTests(unittest.TestCase):
 
     def test_eight_jobs_same_inputs_reversed_model_order_and_two_sample_smoke(self):
         paths={n:self.root/f'{n}.jsonl' for n in self.args.lengths}
-        models={label:dict(path=f'/weights/{label}') for label in ('full','pivot5')}
+        models={label:dict(path=f'/weights/{label}') for label in cli.DEFAULT_MODELS}
         jobs=cli.make_jobs(self.args,self.root,paths,models,{'path':'/target'},1048576)
         self.assertEqual(len(jobs),8);self.assertEqual([j['gpu'] for j in jobs],self.args.gpus)
         self.assertTrue(all(j['samples']==16 for j in jobs))
-        self.assertEqual(jobs[0]['models'],['ar','full','pivot5'])
-        self.assertEqual(jobs[4]['models'],['ar','pivot5','full'])
+        self.assertEqual(jobs[0]['models'],['ar','full','pivot1','pivot5','pivot12'])
+        self.assertEqual(jobs[4]['models'],['ar','pivot12','pivot5','pivot1','full'])
+        for job in jobs:
+            self.assertEqual(job['command'].count('--checkpoint'),4)
+            for label in cli.DEFAULT_MODELS:self.assertIn(f'/weights/{label}',job['command'])
         for a,b in zip(jobs[:4],jobs[4:]):self.assertEqual(a['snapshot'],b['snapshot'])
         smoke=cli.make_jobs(self.args,self.root,paths,models,{'path':'/target'},1048576,smoke=True)
         self.assertEqual([j['length_bin'] for j in smoke],[0,4096])
         self.assertTrue(all(j['samples']==2 and '--profile-decode' not in j['command'] for j in smoke))
+        self.assertTrue(all(j['models']==['ar',*cli.DEFAULT_MODELS] for j in smoke))
 
     def model_fixture(self):
         group=self.root/'runs/dflash_exp1_10w_5ep_test'
         source=group/'eval_all_b1_n32';source.mkdir(parents=True)
         models={}
-        for label in ('full','pivot5','target'):
+        for label in (*cli.DEFAULT_MODELS,'target'):
             path=group/label/'step_0001108';path.mkdir(parents=True)
             config=dict(architectures=['DFlashDraftModel'],max_position_embeddings=131072,
                         vlm_config=dict(draft_context=label))
@@ -153,6 +157,38 @@ class SweepTests(unittest.TestCase):
         prior['checkpoints']['pivot5']=cli.fingerprint(config.parent);cli.write_json(source/'manifest.json',prior)
         with self.assertRaisesRegex(ValueError,'configured context limit'):cli.resolve_models(self.args)
 
+    def test_added_pivots_cannot_use_changed_or_wrong_context_exports(self):
+        source,prior=self.model_fixture()
+        for label in ('pivot1','pivot12'):
+            with self.subTest(label=label):
+                config=Path(prior['checkpoints'][label]['path'])/'config.json'
+                original=config.read_text()
+                obj=json.loads(original);obj['vlm_config']['draft_context']='pivot5'
+                config.write_text(json.dumps(obj))
+                with self.assertRaisesRegex(ValueError,'source evaluation must use the epoch-5 export'):
+                    cli.resolve_models(self.args)
+                prior['checkpoints'][label]=cli.fingerprint(config.parent)
+                cli.write_json(source/'manifest.json',prior)
+                with self.assertRaisesRegex(ValueError,'Wrong checkpoint architecture/context'):
+                    cli.resolve_models(self.args)
+                config.write_text(original)
+                prior['checkpoints'][label]=cli.fingerprint(config.parent)
+                cli.write_json(source/'manifest.json',prior)
+
+    def test_missing_added_pivot_reports_source_instead_of_silently_omitting(self):
+        source,prior=self.model_fixture()
+        del prior['checkpoints']['pivot12'];cli.write_json(source/'manifest.json',prior)
+        with self.assertRaisesRegex(ValueError,'pivot12: missing from source evaluation'):
+            cli.resolve_models(self.args)
+
+    def test_optional_subset_keeps_full_pivot5_comparison_available(self):
+        self.model_fixture();self.args.models=['full','pivot5']
+        _,models,target=cli.resolve_models(self.args)
+        self.assertEqual(list(models),['full','pivot5'])
+        jobs=cli.make_jobs(self.args,self.root,{n:self.root/f'{n}.jsonl' for n in self.args.lengths},models,target,1024)
+        self.assertEqual(jobs[0]['models'],['ar','full','pivot5'])
+        self.assertEqual(jobs[4]['models'],['ar','pivot5','full'])
+
     def test_smoke_failure_prevents_formal_jobs(self):
         source,prior=self.model_fixture()
         dataset=self.root/'data';dataset.mkdir();(dataset/'manifest.json').write_text('{}')
@@ -171,7 +207,7 @@ class SweepTests(unittest.TestCase):
         job=dict(dataset='ctx4096_r1',length_bin=4096,repeat=1,gpu='0',output=str(self.root/'cell'))
         output=Path(job['output']);output.mkdir()
         summaries=[]
-        for model,tokens in [('ar',50),('full',80),('pivot5',100)]:
+        for model,tokens in [('ar',50),('full',80),('pivot1',90),('pivot5',100),('pivot12',110)]:
             summaries.append(dict(model=model,mean_input_tokens=4096,output_tokens=4096,requests=16,
                 mean_committed_length=None if model=='ar' else 3.0,first_candidate_hit_rate=.8,
                 output_tokens_per_second=tokens,raw_throughput_speedup_vs_ar=tokens/50,
@@ -183,6 +219,9 @@ class SweepTests(unittest.TestCase):
         cli.write_json(self.root/'status.json',{'ctx4096_r1':{'status':'success'}})
         with redirect_stdout(io.StringIO()):cli.report(self.root,[job])
         rows=json.loads((self.root/'longctx_comparison.json').read_text())
+        self.assertEqual([r['model'] for r in rows],['ar',*cli.DEFAULT_MODELS])
+        self.assertTrue(all(r['requests']==16 for r in rows))
+        self.assertEqual(next(r for r in rows if r['model']=='pivot12')['ratio_vs_full'],110/80)
         pivot=next(r for r in rows if r['model']=='pivot5')
         self.assertEqual(pivot['ratio_vs_full'],1.25)
         self.assertEqual((pivot['first_draft_ms'],pivot['later_draft_ms']),(100,100))

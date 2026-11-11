@@ -210,6 +210,7 @@ class SweepTests(unittest.TestCase):
         for model,tokens in [('ar',50),('full',80),('pivot1',90),('pivot5',100),('pivot12',110)]:
             summaries.append(dict(model=model,mean_input_tokens=4096,output_tokens=4096,requests=16,
                 mean_committed_length=None if model=='ar' else 3.0,first_candidate_hit_rate=.8,
+                mean_accepted_draft_tokens=None if model=='ar' else 1.875,
                 output_tokens_per_second=tokens,raw_throughput_speedup_vs_ar=tokens/50,
                 prefill_seconds=10,decode_seconds=40,wall_seconds=50,peak_allocated_gib=20,matched=14))
         (output/'summary.json').write_text(json.dumps(summaries))
@@ -224,9 +225,26 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(next(r for r in rows if r['model']=='pivot12')['ratio_vs_full'],110/80)
         pivot=next(r for r in rows if r['model']=='pivot5')
         self.assertEqual(pivot['ratio_vs_full'],1.25)
+        self.assertEqual(pivot['ac_len'],1.875)
+        self.assertIsNone(next(r for r in rows if r['model']=='ar')['ac_len'])
         self.assertEqual((pivot['first_draft_ms'],pivot['later_draft_ms']),(100,100))
         self.assertEqual((pivot['final_draft_kv_mib'],pivot['final_raw_hidden_mib']),(1,2))
         self.assertTrue((self.root/'longctx_comparison.csv').is_file())
+        self.assertIn('ac_len',(self.root/'longctx_comparison.csv').read_text().splitlines()[0])
+        table=(self.root/'longctx_comparison.md').read_text()
+        self.assertIn('| ac len | Committed |',table)
+        self.assertIn('| 1.875 | 3.000 |',table)
+        self.assertIn('| — | — |',table)
+
+    def test_report_only_uses_saved_jobs_without_reading_data_or_loading_models(self):
+        saved_jobs=[dict(dataset='ctx32768_r1',output='/old/summary')]
+        cli.write_json(self.root/'manifest.json',dict(jobs=saved_jobs))
+        with patch.object(cli,'report') as render, \
+             patch.object(cli,'verify_dataset',side_effect=AssertionError('must not read dataset')), \
+             patch.object(cli,'resolve_models',side_effect=AssertionError('must not load checkpoints')), \
+             patch.object(cli,'execute',side_effect=AssertionError('must not rerun evaluation')):
+            self.assertEqual(cli.main(['--report-only',str(self.root)]),0)
+        render.assert_called_once_with(self.root,saved_jobs)
 
 
 class ProfileTests(unittest.TestCase):

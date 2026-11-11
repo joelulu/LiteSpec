@@ -185,6 +185,7 @@ def report(root,jobs):
             rows.append(dict(length_bin=job['length_bin'],repeat=job['repeat'],gpu=job['gpu'],model=s['model'],
                 input_tokens=s['mean_input_tokens'],output_tokens_per_prompt=s['output_tokens']/s['requests'],
                 committed=s['mean_committed_length'],first_hit=s.get('first_candidate_hit_rate'),
+                ac_len=s['mean_accepted_draft_tokens'],
                 tok_s=s['output_tokens_per_second'],ratio_vs_ar=s['raw_throughput_speedup_vs_ar'],
                 ratio_vs_full=s['output_tokens_per_second']/full['output_tokens_per_second'],
                 prefill_s=s['prefill_seconds'],decode_s=s['decode_seconds'],total_s=s['wall_seconds'],
@@ -200,13 +201,15 @@ def report(root,jobs):
     lines=['# Full vs Pivot context length sweep','',
         'B=1; same prompts at every length, each ratio uses a same-GPU baseline. All samples contribute.',
         'Input tokens include visual placeholders and chat overhead. Profile timings are from a separate pass.',
+        'ac len counts accepted Draft tokens per speculative round; Committed also includes the Target token.',
         'AR mismatches and natural EOS remain visible; no task-accuracy or lossless-speedup claim.','',
-        '| Bin | Repeat | GPU | Model | Input tokens | Output/prompt | Committed | tok/s | /AR | /Full | Prefill s | Decode s | Total s | Peak GiB | Match |',
-        '|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
+        '| Bin | Repeat | GPU | Model | Input tokens | Output/prompt | ac len | Committed | tok/s | /AR | /Full | Prefill s | Decode s | Total s | Peak GiB | Match |',
+        '|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
     for r in rows:
+        ac_len='—' if r['ac_len'] is None else f"{r['ac_len']:.3f}"
         committed='—' if r['committed'] is None else f"{r['committed']:.3f}"
         lines.append(f"| {r['length_bin'] or 'short'} | {r['repeat']} | {r['gpu']} | {r['model']} | {r['input_tokens']:.0f} | "
-            f"{r['output_tokens_per_prompt']:.1f} | {committed} | {r['tok_s']:.2f} | {r['ratio_vs_ar']:.3f} | {r['ratio_vs_full']:.3f} | "
+            f"{r['output_tokens_per_prompt']:.1f} | {ac_len} | {committed} | {r['tok_s']:.2f} | {r['ratio_vs_ar']:.3f} | {r['ratio_vs_full']:.3f} | "
             f"{r['prefill_s']:.2f} | {r['decode_s']:.2f} | {r['total_s']:.2f} | {r['peak_gib']:.2f} | {r['matched']}/{r['requests']} |")
     if any(r['model']=='ar' and r['output_tokens_per_prompt']<64 for r in rows):
         lines+=['','AR outputs average fewer than 64 tokens in at least one cell; inspect output lengths before interpreting steady decode gains.']
@@ -218,9 +221,10 @@ def report(root,jobs):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--workspace',type=Path,required=True)
-    parser.add_argument('--data-dir',type=Path,required=True)
-    parser.add_argument('--output-dir',type=Path,required=True)
+    parser.add_argument('--workspace',type=Path)
+    parser.add_argument('--data-dir',type=Path)
+    parser.add_argument('--output-dir',type=Path)
+    parser.add_argument('--report-only',type=Path,metavar='RESULT_DIR',help='Rebuild tables from existing manifest/status/summaries without loading models')
     parser.add_argument('--source-eval-dir',type=Path)
     parser.add_argument('--models',nargs='+',choices=DEFAULT_MODELS,default=list(DEFAULT_MODELS))
     parser.add_argument('--samples',type=int,default=16)
@@ -233,6 +237,14 @@ def main(argv=None):
     parser.add_argument('--profile-samples',type=int,default=2)
     parser.add_argument('--prepare-only',action='store_true')
     args=parser.parse_args(argv)
+    if args.report_only is not None:
+        if args.prepare_only:parser.error('report-only and prepare-only cannot be combined')
+        root=args.report_only.expanduser().resolve(strict=True)
+        saved=json.loads((root/'manifest.json').read_text())
+        report(root,saved['jobs'])
+        return 0
+    if any(value is None for value in (args.workspace,args.data_dir,args.output_dir)):
+        parser.error('workspace, data-dir and output-dir are required unless using report-only')
     if 'full' not in args.models or len(set(args.models))!=len(args.models):parser.error('models must include full and contain no duplicates')
     if not 1<=len(args.gpus)<=8 or len(set(args.gpus))!=len(args.gpus):parser.error('one to eight distinct GPUs required')
     if min(args.samples,args.repeats,args.image_max_tokens,args.max_new_tokens)<1 or args.profile_samples<0:parser.error('invalid budgets')
@@ -261,7 +273,7 @@ def main(argv=None):
     for name in ('logs','results'):(smoke/name).mkdir(parents=True)
     smoke_jobs=make_jobs(args,smoke,paths,models,target,pixels,smoke=True)
     if execute(smoke,smoke_jobs,1):
-        print(f'Smoke failed; formal 16-sample evaluation was not started. See {smoke}/logs',flush=True)
+        print(f'Smoke failed; formal {args.samples}-sample evaluation was not started. See {smoke}/logs',flush=True)
         return 1
     result=execute(root,jobs,1);report(root,jobs)
     print(f'Results: {root}/longctx_comparison.md',flush=True)

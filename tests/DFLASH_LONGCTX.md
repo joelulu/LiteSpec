@@ -111,10 +111,25 @@ Outputs:
 
 * `manifest.json`, `input_lengths.json`, frozen `inputs/*.jsonl`.
 * `smoke/` and per-job `logs/`, `results/` with per-request details.
-* `longctx_comparison.md`, `.csv`, `.json`: input/output lengths, committed
+* `longctx_comparison.md`, `.csv`, `.json`: input/output lengths, ac len, committed
   length, first hit, tok/s, ratios to local AR/Full, prefill/decode/total times,
   peak memory and token matches. CSV/JSON additionally include first/later
   draft times, final cache/raw-hidden MiB and total-latency ratio to Full.
+
+`ac len` uses the benchmark's `mean_accepted_draft_tokens`: the average accepted
+Draft tokens per speculative round, excluding the Target token. `Committed`
+uses `mean_committed_length` and includes that token. Both are pooled over all
+measured rounds, including AR-mismatching requests; AR shows a dash for both.
+Values are read from the existing raw summary, not inferred from token match counts.
+After updating this code, existing results can be re-rendered without GPU work:
+
+```bash
+"$PYTHON_BIN" tests/evaluate_dflash_longctx.py --report-only /path/to/result_directory
+```
+
+This rewrites only the Markdown/CSV/JSON comparison files. It does not load
+checkpoints, re-tokenize inputs or start model processes. Run it after the
+evaluation has finished writing its status and summary files.
 
 The main question is whether throughput relative to Full crosses 1 as input
 length grows, and what acceptance/end-to-end latency tradeoff accompanies it.

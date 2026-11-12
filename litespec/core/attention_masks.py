@@ -60,6 +60,8 @@ def create_dflash_sdpa_mask(
 ):
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
+    if context_window is not None and context_window < 0:
+        raise ValueError("context_window must be >= 0")
     bsz, num_blocks = anchor_positions.shape
     C = S * context_slots
     q_len, kv_len = num_blocks * block_size, C + num_blocks * block_size
@@ -98,6 +100,8 @@ def create_dflash_flex_mask(
         raise RuntimeError("flex_attention is not available")
     if sliding_window is not None and sliding_window <= 0:
         raise ValueError("sliding_window must be > 0")
+    if context_window is not None and context_window < 0:
+        raise ValueError("context_window must be >= 0")
     bsz, num_blocks = anchor_positions.shape
     C = S * context_slots
 

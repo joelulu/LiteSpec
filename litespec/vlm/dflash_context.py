@@ -1,7 +1,7 @@
 """DFlash-only context controls; never modify the Target's image or cache."""
 import torch
 
-CONTEXTS = ("full", "recent128", "pivot1", "pivot5", "pivot12")
+CONTEXTS = ("full", "recent256", "recent128", "recent64", "pivot1", "pivot5", "pivot12", "recent0")
 CONDITIONS = ("correct", "wrong", "mask")
 
 
@@ -38,10 +38,17 @@ def propose_features(draft, target, features, pending, *, vision_mask=None,
                      condition="correct", donor_features=None):
     """Uncached fixed-prefix oracle with original absolute text positions."""
     anchor = features.size(1)
-    features, keep, metadata = intervene_visual(features, vision_mask, condition, donor_features)
     window = getattr(draft, "context_window", None)
-    if window is not None:
-        features, keep = features[:, -window:], keep[:, -window:]
+    if window == 0:
+        if condition != "correct":
+            raise ValueError("recent0 has no visual feature input to intervene on")
+        features = features.new_empty((features.size(0), 0, draft.config.hidden_size))
+        keep = torch.empty(features.shape[:2], device=features.device, dtype=torch.bool)
+        metadata = dict(condition="correct", visual_slots=0, donor_slots=0)
+    else:
+        features, keep, metadata = intervene_visual(features, vision_mask, condition, donor_features)
+        if window is not None:
+            features, keep = features[:, -window:], keep[:, -window:]
     ids = pending.new_full((pending.size(0), draft.block_size), draft.mask_token_id)
     ids[:, :1] = pending
     positions = torch.cat([

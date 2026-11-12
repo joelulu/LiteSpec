@@ -23,8 +23,8 @@ PLAN = (
     ("flickr30k", "image"), ("hr_bench_4k", "image"), ("hr_bench_8k", "image"),
     ("VideoDetailCaption", "video"), ("Video-MME", "video"),
 )
-FIELDS = ("dataset", "kind", "gpu", "model", "samples", "batch_size", "committed_length",
-          "first_hit_rate", "tok_s", "speedup", "matched", "requests", "peak_gib")
+FIELDS = ("dataset", "kind", "gpu", "model", "samples", "batch_size", "ac_len", "committed_length",
+          "first_hit_rate", "tok_s", "speedup", "speedup_vs_full", "matched", "requests", "peak_gib")
 
 
 def write_json(path, value):
@@ -112,7 +112,7 @@ def prepare(args):
     for label, item in models.items():
         config = json.loads((Path(item["path"]) / "config.json").read_text())
         context = config.get("vlm_config", {}).get("draft_context", "full")
-        known = {name: name for name in ("full", "recent128", "pivot1", "pivot5", "pivot12")}
+        known = {name: name for name in ("full", "recent256", "recent128", "recent64", "pivot1", "pivot5", "pivot12", "recent0")}
         known.update(pivot5_B="pivot5", pivot5_C="pivot5")
         if config.get("architectures") != ["DFlashDraftModel"] or context != known.get(label, context):
             raise ValueError(f"Checkpoint {label} has the wrong architecture/context: {item['path']}")
@@ -200,13 +200,16 @@ def command(args, job, models, target, image_pixels):
     return cmd
 
 
-def normalized(job, row):
+def normalized(job, row, full=None):
     video = job["kind"] == "video"
+    throughput="decode_tok_s" if video else "output_tokens_per_second"
     return dict(dataset=job["dataset"], kind=job["kind"], gpu=job["gpu"], model=row["model"],
                 samples=job["samples"], batch_size=row["batch_size"],
+                ac_len=row.get("mean_accepted_draft_tokens"),
                 committed_length=row["mean_committed_length"], first_hit_rate=row.get("first_candidate_hit_rate"),
                 tok_s=row["decode_tok_s" if video else "output_tokens_per_second"],
                 speedup=row["raw_decode_ratio_vs_ar" if video else "raw_throughput_speedup_vs_ar"],
+                speedup_vs_full=row[throughput]/full[throughput] if full is not None else None,
                 matched=row["matched"], requests=row["requests"], peak_gib=row["peak_allocated_gib"])
 
 
@@ -219,7 +222,8 @@ def read_summary(job, batch_size):
     if any(row["batch_size"] != batch_size or row["requests"] != job["samples"] * batch_size for row in rows):
         raise ValueError("Summary batch/sample counts differ from the requested job")
     # Token mismatches remain visible but do not hide measured throughput.
-    return [normalized(job, row) for row in rows]
+    full=next((row for row in rows if row['model']=='full'),None)
+    return [normalized(job, row, full) for row in rows]
 
 
 def report(root, jobs, statuses):
@@ -227,7 +231,8 @@ def report(root, jobs, statuses):
     for job in jobs:
         if statuses.get(job["dataset"], {}).get("status") == "success":
             data = json.loads((Path(job["output"]) / "summary.json").read_text())
-            rows.extend(normalized(job, row) for row in data)
+            full=next((row for row in data if row['model']=='full'),None)
+            rows.extend(normalized(job, row, full) for row in data)
     write_json(root / "status.json", statuses)
     write_json(root / "comparison.json", rows)
     with (root / "comparison.csv").open("w", newline="") as handle:
@@ -237,13 +242,16 @@ def report(root, jobs, statuses):
     lines = ["# DFlash evaluation", "",
              "B is static batch size. Ratios use same-GPU AR; timing is decode-only.",
              "Video-MME uses the existing video-description protocol, not official QA accuracy.", "",
-             "| Dataset | GPU | Model | B | Committed | First hit | tok/s | Speedup | AR match | Peak GiB |",
-             "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|"]
+             "ac len counts accepted Draft tokens; Committed includes the Target token.", "",
+             "| Dataset | GPU | Model | B | ac len | Committed | First hit | tok/s | Speedup / AR | / Full | AR match | Peak GiB |",
+             "|---|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for row in rows:
+        ac_len = "—" if row["ac_len"] is None else f"{row['ac_len']:.3f}"
         length = "—" if row["committed_length"] is None else f"{row['committed_length']:.3f}"
         hit = "—" if row["first_hit_rate"] is None else f"{row['first_hit_rate']:.1%}"
-        lines.append(f"| {row['dataset']} | {row['gpu']} | {row['model']} | {row['batch_size']} | {length} | {hit} | "
-                     f"{row['tok_s']:.2f} | {row['speedup']:.3f}x | {row['matched']}/{row['requests']} | {row['peak_gib']:.3f} |")
+        vs_full="—" if row['speedup_vs_full'] is None else f"{row['speedup_vs_full']:.3f}x"
+        lines.append(f"| {row['dataset']} | {row['gpu']} | {row['model']} | {row['batch_size']} | {ac_len} | {length} | {hit} | "
+                     f"{row['tok_s']:.2f} | {row['speedup']:.3f}x | {vs_full} | {row['matched']}/{row['requests']} | {row['peak_gib']:.3f} |")
     for name, status in statuses.items():
         if status["status"] != "success":
             lines += ["", f"{name}: {status['status']}; see logs/{name}.log"]

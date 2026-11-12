@@ -14,6 +14,7 @@ from prepare_longctx_data import verify_dataset
 
 HERE=Path(__file__).resolve().parent
 DEFAULT_MODELS=('full','pivot1','pivot5','pivot12')
+AVAILABLE_MODELS=('full','recent256','recent128','recent64','pivot1','pivot5','pivot12','recent0')
 SEPARATOR='\n\nThe preceding reports are unrelated context. Answer the following question about the image.\n'
 
 
@@ -60,12 +61,25 @@ def resolve_models(args):
     source=source_directory(args.workspace,args.source_eval_dir)
     prior=json.loads((source/'manifest.json').read_text())
     group=Path(prior['run_group'])
+    supplement=None
+    if any(name in ('recent256','recent64','recent0') for name in args.models):
+        from prepare_dflash_recent_supplement import read,verify_baseline
+        directory=getattr(args,'supplement_run_group',None)
+        if directory is None:raise ValueError('New recent models require --supplement-run-group')
+        supplement=read(directory.expanduser().resolve(strict=True)/'experiment.json')
+        if supplement.get('schema')!='dflash_recent_supplement_v1' or Path(supplement['baseline_run_group']).resolve()!=group.resolve():
+            raise ValueError('Supplement must reference this exact experiment-1 group')
+        verify_baseline(supplement)
     models={}
     for label in args.models:
-        if label not in prior['checkpoints']:
+        if label in ('recent256','recent64','recent0'):
+            item=fingerprint(args.supplement_run_group/label/'epoch_5')
+            if item!=supplement.get('checkpoints',{}).get(label):raise ValueError(f'{label}: supplement must be finalized with matching epoch-5 exports')
+        elif label not in prior['checkpoints']:
             raise ValueError(f'{label}: missing from source evaluation {source}; select the complete experiment-1 evaluation')
-        item=fingerprint(group/label/'epoch_5')
-        if item!=prior['checkpoints'][label]:raise ValueError(f'{label}: source evaluation must use the epoch-5 export')
+        else:
+            item=fingerprint(group/label/'epoch_5')
+            if item!=prior['checkpoints'][label]:raise ValueError(f'{label}: source evaluation must use the epoch-5 export')
         cfg=json.loads((Path(item['path'])/'config.json').read_text())
         if cfg.get('architectures')!=['DFlashDraftModel'] or cfg.get('vlm_config',{}).get('draft_context','full')!=label:
             raise ValueError(f'Wrong checkpoint architecture/context: {label}')
@@ -226,7 +240,8 @@ def main(argv=None):
     parser.add_argument('--output-dir',type=Path)
     parser.add_argument('--report-only',type=Path,metavar='RESULT_DIR',help='Rebuild tables from existing manifest/status/summaries without loading models')
     parser.add_argument('--source-eval-dir',type=Path)
-    parser.add_argument('--models',nargs='+',choices=DEFAULT_MODELS,default=list(DEFAULT_MODELS))
+    parser.add_argument('--supplement-run-group',type=Path)
+    parser.add_argument('--models',nargs='+',choices=AVAILABLE_MODELS,default=list(DEFAULT_MODELS))
     parser.add_argument('--samples',type=int,default=16)
     parser.add_argument('--lengths',type=int,nargs='+',default=[0,8192,32768,65536])
     parser.add_argument('--gpus',nargs='+',default=list(map(str,range(8))))

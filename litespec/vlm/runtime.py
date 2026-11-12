@@ -218,7 +218,7 @@ def generate_steps(target, draft, example, *, max_new_tokens=128, policy=None, v
     history = None
     pivot = None
     baseline_cache = DraftCache(draft, target, output, anchor) if baseline else None
-    if draft is not None:
+    if draft is not None and not baseline:
         pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
                                 draft.config.num_target_layers)[:, -1:].detach().clone()
         if not baseline and not draft.is_student:
@@ -307,8 +307,9 @@ def generate_steps(target, draft, example, *, max_new_tokens=128, policy=None, v
             predictions = restored.logits.argmax(-1)
             recovery_seconds += clock(device) - t
         del before
-        pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
-                                draft.config.num_target_layers)[:, kept - 1:kept].detach().clone()
+        if not baseline:
+            pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
+                                    draft.config.num_target_layers)[:, kept - 1:kept].detach().clone()
         if baseline:
             baseline_cache.commit(draft, output, kept)
         elif not draft.is_student:

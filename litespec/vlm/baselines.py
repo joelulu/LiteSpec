@@ -49,6 +49,8 @@ def make_draft(target, processor, cfg):
     config._attn_implementation = "sdpa"
     layers = cfg.get("target_layer_ids") or build_target_layer_ids(text.num_hidden_layers, cfg["num_draft_layers"])
     context = cfg.get("draft_context", "full")
+    if context == "recent0":
+        layers = []
     if context != "full" and family != "dflash":
         raise ValueError("context ablation is DFlash only")
     if context == "pivot5" and not cfg.get("target_layer_ids"):
@@ -89,7 +91,9 @@ def prepare_forward(target, online, example, mask):
     with torch.no_grad():
         output = target(**example.inputs, output_hidden_states=True, use_cache=False, logits_to_keep=1)
         draft = online.draft_model
-        hidden = selected_layers(output.hidden_states, draft.target_layer_ids, draft.config.num_target_layers).flatten(-2)
+        hidden = (output.hidden_states[-1].new_empty((example.inputs["input_ids"].shape[0], 0, draft.config.hidden_size))
+                  if getattr(draft, "context_window", None) == 0 else
+                  selected_layers(output.hidden_states, draft.target_layer_ids, draft.config.num_target_layers).flatten(-2))
     return dict(input_ids=example.inputs["input_ids"], hidden_states=hidden, loss_mask=mask,
                 target_last_hidden_states=output.hidden_states[-1])
 
@@ -99,16 +103,24 @@ class DraftCache:
     def __init__(self, draft, target, output, prefill_length, vision_mask=None, visual_condition="correct", donor_features=None):
         from transformers import DynamicCache
         self.cache = DynamicCache()
-        self.hidden = self.features(draft, output)
+        self.window = getattr(draft, "context_window", None)
         self.history_tokens = prefill_length
+        if self.window == 0:
+            if visual_condition != "correct":
+                raise ValueError("recent0 has no visual feature input to intervene on")
+            self.hidden = target.get_input_embeddings().weight.new_empty((output.logits.shape[0], 0, draft.config.hidden_size))
+            self.visual_keep = torch.empty(self.hidden.shape[:2], device=self.hidden.device, dtype=torch.bool)
+            self.visual_metadata = dict(condition="correct", visual_slots=0, donor_slots=0)
+            self.mask_visual = False
+            return
+        self.hidden = self.features(draft, output)
         from .dflash_context import intervene_visual
         self.hidden, self.visual_keep, self.visual_metadata = intervene_visual(
             self.hidden, vision_mask, visual_condition, donor_features)
         self.mask_visual = visual_condition == "mask"
-        self.window = getattr(draft, "context_window", None)
         if self.window is not None:
-            self.hidden = self.hidden[:, -self.window:]
-            self.visual_keep = self.visual_keep[:, -self.window:]
+            self.hidden = self.hidden[:, -self.window:].clone()
+            self.visual_keep = self.visual_keep[:, -self.window:].clone()
 
 
     @staticmethod
@@ -141,12 +153,14 @@ class DraftCache:
         return tokens, dict(physical_history=anchor, visible_history=anchor)
 
     def commit(self, draft, output, kept):
+        if self.window == 0:
+            return  # Never extract or retain verifier hidden states.
         new = self.features(draft, output)[:, :kept]
         self.visual_keep = torch.cat([self.visual_keep, torch.ones(new.shape[:2], device=new.device, dtype=torch.bool)], 1)
         if self.window is None:
             self.hidden = new
         else:
-            self.hidden = torch.cat([self.hidden, new], 1)[:, -self.window:]
-            self.visual_keep = self.visual_keep[:, -self.window:]
+            self.hidden = torch.cat([self.hidden, new], 1)[:, -self.window:].clone()
+            self.visual_keep = self.visual_keep[:, -self.window:].clone()
 
 

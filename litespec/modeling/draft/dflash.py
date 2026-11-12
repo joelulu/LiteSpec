@@ -746,12 +746,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             _rope_config(config, self.attention_mode)
         )
         context = getattr(config, "vlm_config", {}).get("draft_context", "full")
-        if context not in ("full", "recent128", "pivot1", "pivot5", "pivot12"):
+        if context not in ("full", "recent256", "recent128", "recent64", "pivot1", "pivot5", "pivot12", "recent0"):
             raise ValueError(f"unknown DFlash context: {context}")
         self.context_slots = {"pivot5": 5, "pivot12": 12}.get(context, 1)
         if self.context_slots > 1 and len(self.target_layer_ids) != self.context_slots:
             raise ValueError(f"{context} requires exactly {self.context_slots} selected Target layers")
-        self.context_window = {"full": None, "recent128": 128, "pivot1": 1, "pivot5": 1, "pivot12": 1}[context]
+        self.context_window = {"full": None, "recent256": 256, "recent128": 128, "recent64": 64,
+                               "pivot1": 1, "pivot5": 1, "pivot12": 1, "recent0": 0}[context]
         if self.context_slots > 1:
             self.context_depth = nn.Embedding(self.context_slots, config.hidden_size)
         self.context_projection = draft_config.get("context_projection", "shared")
@@ -763,7 +764,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             raise ValueError("layer adapters require pivot5 or pivot12 context")
         if position_layer_bias and self.context_projection != "per_layer":
             raise ValueError("C requires B's per-layer input projections")
-        self.fc = (PerLayerContextProjection(self.context_slots, config.hidden_size)
+        self.fc = nn.Identity() if self.context_window == 0 else (PerLayerContextProjection(self.context_slots, config.hidden_size)
                    if self.context_projection == "per_layer" else nn.Linear(
                        (1 if self.context_slots > 1 else len(self.target_layer_ids)) * config.hidden_size,
                        config.hidden_size, bias=False))
@@ -774,9 +775,13 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             self.context_layer_bias = nn.Parameter(torch.zeros(self.block_size - 1, self.context_slots))
         else:
             self.register_parameter("context_layer_bias", None)
-        self.hidden_norm = kernels.make_rms_norm(
+        self.hidden_norm = nn.Identity() if self.context_window == 0 else kernels.make_rms_norm(
             config.hidden_size, config.rms_norm_eps
         )
+        if self.context_window == 0:
+            # No trainable, unused conditioning parameters in the FSDP model.
+            self.target_layer_ids = []
+            draft_config["target_layer_ids"] = []
         self.mask_token_id = draft_config.get("mask_token_id", None)
         self.projector_type = draft_config.get("projector_type", None)
         self.pure_draft_prefix_len = draft_config.get("pure_draft_prefix_len", 0)
@@ -881,7 +886,15 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states = noise_embedding
-        if self.context_slots > 1:
+        if self.context_window == 0:
+            if use_cache or past_key_values is not None:
+                raise ValueError("recent0 has no cross-round Draft cache")
+            if position_ids.shape[-1] != hidden_states.shape[1]:
+                raise ValueError("recent0 position_ids must cover only anchor/MASK blocks")
+            # Ignore any supplied Target features: zero-width physical context,
+            # not zero-valued memory tokens or a learned null/pivot slot.
+            target_hidden = hidden_states.new_empty((hidden_states.shape[0], 0, self.config.hidden_size))
+        elif self.context_slots > 1:
             batch, positions, _ = target_hidden.shape
             target_hidden = target_hidden.reshape(batch, positions, self.context_slots, -1)
             target_hidden = target_hidden + self.context_depth.weight[None, None]

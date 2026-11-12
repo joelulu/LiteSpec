@@ -460,8 +460,11 @@ class DFlashTrainingBase(nn.Module):
             input_ids, anchor_positions, block_keep_mask
         )
 
+        context_len = 0 if getattr(self.draft_model, "context_window", None) == 0 else seq_len
+        if context_len == 0:
+            target_context_hidden = noise_embedding.new_empty((bsz, 0, noise_embedding.shape[-1]))
         context_position_ids = (
-            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+            torch.arange(context_len, device=device).unsqueeze(0).expand(bsz, -1)
         )
         slots = getattr(self.draft_model, "context_slots", 1)
         context_position_ids = context_position_ids.repeat_interleave(slots, dim=1)
@@ -476,7 +479,7 @@ class DFlashTrainingBase(nn.Module):
         mask_args = {
             "anchor_positions": anchor_positions,
             "block_keep_mask": block_keep_mask,
-            "S": seq_len,
+            "S": context_len,
             "block_size": self.block_size,
             "device": device,
             "context_slots": slots,

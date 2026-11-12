@@ -116,6 +116,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     if max_new_tokens < 1 or verification not in {"block", "sequential"}:
         raise ValueError("positive output cap and block/sequential verification required")
     baseline = draft is not None and is_baseline(draft)
+    needs_hidden = draft is not None and getattr(draft, "context_window", None) != 0
     augmentation = getattr(draft, "pivot_augmentation", None) if draft is not None else None
     if augmentation is not None and verification != "block":
         raise ValueError("pivot augmentation evaluation requires block verification")
@@ -135,12 +136,12 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     started = clock(device)  # Replication/CPU image preparation excluded.
     cache = make_hybrid_cache(target, anchor + max_new_tokens + width)
     output = target(**inputs, past_key_values=cache, use_cache=True, logits_to_keep=1,
-                    output_hidden_states=draft is not None)
+                    output_hidden_states=needs_hidden)
     cache = output.past_key_values
     pending = output.logits[:, -1:].argmax(-1)
     pivot = (selected_layers(output.hidden_states, draft.target_layer_ids,
                              draft.config.num_target_layers)[:, -1:].detach().clone()
-             if draft is not None and getattr(draft, "context_window_size", 1) == 1 else None)
+             if draft is not None and not baseline and getattr(draft, "context_window_size", 1) == 1 else None)
     history = DraftCache(draft, target, output, anchor, vision_mask=example.vision_mask,
                          visual_condition=visual_condition, donor_features=donor_features) if baseline else None
     recent = None
@@ -185,14 +186,14 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                 states, predictions = [], []
                 for index in range(candidates.shape[1]):
                     output = target(input_ids=candidates[:, index:index+1], past_key_values=cache,
-                                    use_cache=True, output_hidden_states=True, logits_to_keep=1)
+                                    use_cache=True, output_hidden_states=needs_hidden, logits_to_keep=1)
                     cache = output.past_key_values
                     target_calls += 1
-                    states.append(output.hidden_states)
+                    if needs_hidden: states.append(output.hidden_states)
                     predictions.append(output.logits[:, -1:].argmax(-1))
                     if index + 1 == candidates.shape[1] or not torch.equal(candidates[:, index+1:index+2], predictions[-1]):
                         break
-                kept = len(states)
+                kept = len(predictions)
                 pending = predictions[-1]
                 features = tuple(torch.cat(parts, 1) for parts in zip(*states))
                 output.hidden_states = features
@@ -207,11 +208,11 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                 if timeline: timeline.mark("target_verify")
                 if transaction is None:
                     output = target(input_ids=candidates, past_key_values=cache, use_cache=True,
-                                    output_hidden_states=True)
+                                    output_hidden_states=needs_hidden)
                 else:
                     with transaction.capture(cache):
                         output = target(input_ids=candidates, past_key_values=cache, use_cache=True,
-                                        output_hidden_states=True)
+                                        output_hidden_states=needs_hidden)
                 cache = output.past_key_values
                 target_calls += 1
                 if timeline: timeline.mark("acceptance")
@@ -234,7 +235,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                     _restore_recurrent_cache_transaction(snapshot)
                     if timeline: timeline.mark("target_replay")
                     output = target(input_ids=candidates[:, :kept], past_key_values=cache,
-                                    use_cache=True, output_hidden_states=True, logits_to_keep=1)
+                                    use_cache=True, output_hidden_states=needs_hidden, logits_to_keep=1)
                     cache = output.past_key_values
                     replays += 1
                     target_calls += 1
@@ -252,7 +253,7 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                 augmentation_state.commit(output.hidden_states, kept)
             if recent is not None:
                 recent.commit(output.hidden_states, kept, anchor)
-            else:
+            elif not baseline:
                 pivot = selected_layers(output.hidden_states, draft.target_layer_ids,
                                         draft.config.num_target_layers)[:, kept-1:kept].detach().clone()
             if baseline:

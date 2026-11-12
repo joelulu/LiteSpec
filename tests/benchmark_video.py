@@ -44,6 +44,8 @@ def report(root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     workspace = Path.home()/'LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/dllm_vllm/dlite-vlm'
+    parser.add_argument('--prefill-hidden-mode',choices=['all','selected'],default='all')
+    parser.add_argument('--sample-memory',action='store_true')
     parser.add_argument('--context-window-size',type=int,help='inference override; omit to use trained window')
     parser.add_argument('--checkpoint',nargs=2,action='append',default=[],metavar=('LABEL','PATH'))
     parser.add_argument('--selection-file',type=Path,help='frozen select_data JSON snapshot')
@@ -175,7 +177,7 @@ def main():
                     gpu=replace(example, inputs={k:v.to('cuda') if torch.is_tensor(v) else v for k,v in example.inputs.items()},
                                 vision_mask=example.vision_mask.to('cuda'))
                     with RequestPositionState(target).activate(),torch.inference_mode():
-                        return generate_static_batch(target,draft,gpu,batch_size=batch,max_new_tokens=cap,state_mode='per_token')
+                        return generate_static_batch(target,draft,gpu,batch_size=batch,max_new_tokens=cap,state_mode='per_token',prefill_hidden_mode=args.prefill_hidden_mode)
                 if draft is not None:
                     warmup_state_kernels(target,batch_size=batch,width=draft.block_size,mode='per_token')
                 print(f'Warmup {dataset} {label} B={batch}',flush=True)
@@ -186,7 +188,12 @@ def main():
                 with request_path.open('w') as f:
                     for i,example in enumerate(examples):
                         print(f'Running {dataset} {label} B={batch} {i+1}/{len(examples)}',flush=True)
-                        result=run(example,args.max_new_tokens)
+                        if args.sample_memory:
+                            from sample_memory import measured_request
+                            result=measured_request(run,example,args.max_new_tokens,path=root/'sample_memory.jsonl',
+                                label=label,index=i+1,count=len(examples),batch_size=batch)
+                        else:
+                            result=run(example,args.max_new_tokens)
                         match=True if references is None else result['token_ids']==references[i]['token_ids']
                         results.append(result)
                         f.write(json.dumps(dict(id=example.sample_id,token_match=match,result=result,
@@ -206,7 +213,8 @@ def main():
                     first_candidate_hit_rate=(sum(r.get('first_candidate_hits',0) for r in results)/opportunities if opportunities else None),
                     mean_accepted_draft_tokens=sum(n-1 for n in lengths)/len(lengths) if lengths else None,
                     speculative_rounds=len(lengths),matched=matched,valid_token_match=matched==len(results)*batch,
-                    peak_allocated_gib=torch.cuda.max_memory_allocated()/1024**3,
+                    peak_allocated_gib=(max(r['sample_memory']['peak_allocated_gib'] for r in results) if args.sample_memory else torch.cuda.max_memory_allocated()/1024**3),
+                    prefill_hidden_mode=args.prefill_hidden_mode,
                     mean_input_tokens=sum(m['input_tokens'] for m in metadata)/len(metadata),
                     mean_video_tokens=sum(m['video_tokens'] for m in metadata)/len(metadata),
                     context_window_size=getattr(draft,'context_window_size',None),

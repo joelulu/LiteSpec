@@ -58,6 +58,8 @@ def summarize_batches(results, batch_size):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--prefill-hidden-mode", choices=["all", "selected"], default="all")
+    parser.add_argument("--sample-memory", action="store_true", help="per-sample memory/events outside timed generation")
     parser.add_argument("--visual-condition", choices=["correct", "wrong", "mask"], default="correct")
     parser.add_argument("--context-window-size", type=int, help="inference override; omit to use trained window")
     parser.add_argument("--target-model", required=True)
@@ -235,13 +237,21 @@ def main():
                     donor_features = donor_cache[key].to(args.device)
                 with RequestPositionState(target).activate():
                     return generate_static_batch(target, draft, example, batch_size=batch_size, max_new_tokens=cap,
-                                                 profile=profile, state_mode=args.state_mode, visual_condition=args.visual_condition, donor_features=donor_features)
+                                                 profile=profile, state_mode=args.state_mode, visual_condition=args.visual_condition, donor_features=donor_features,
+                                                 prefill_hidden_mode=args.prefill_hidden_mode)
             for _ in range(args.warmup):
                 run(examples[0], min(16, args.max_new_tokens))
             if torch.device(args.device).type == "cuda":
                 torch.cuda.reset_peak_memory_stats(args.device)
             print(f"Running {label}: B={batch_size}, {len(examples)} unique prompts / {len(examples)*batch_size} sequences", flush=True)
-            results = [run(example, args.max_new_tokens) for example in examples]
+            if args.sample_memory:
+                from sample_memory import measured_request
+                results = [measured_request(run, example, args.max_new_tokens,
+                    path=root/"sample_memory.jsonl", label=label, index=index+1, count=len(examples),
+                    batch_size=batch_size, pages=len(records[index].get("images", [])) or
+                        (1 if records[index].get("image") else None)) for index,example in enumerate(examples)]
+            else:
+                results = [run(example, args.max_new_tokens) for example in examples]
             tokens = [result["token_ids"] for result in results]
             if label == "ar":
                 references[batch_size] = tokens
@@ -252,7 +262,7 @@ def main():
                 input_mode=args.input_mode if args.reference_input else "from_manifest",
                 mean_visual_tokens=sum(meta["visual_tokens_with_delimiters"] for meta in input_metadata)/len(input_metadata),
                 mean_image_tokens=sum(meta["image_tokens"] for meta in input_metadata)/len(input_metadata),
-                attention_backend=attention, **summarize_batches(results, batch_size))
+                prefill_hidden_mode=args.prefill_hidden_mode, attention_backend=attention, **summarize_batches(results, batch_size))
             summary.update(context_window_size=getattr(draft,"context_window_size",None),
                 context_slots=getattr(draft,"condition_slot_count",None),
                 state_mode=args.state_mode, gdn_verify_backend=results[0]["gdn_verify_backend"],
@@ -263,7 +273,8 @@ def main():
                 raw_wall_speedup_vs_ar=base["wall_seconds"]/summary["wall_seconds"],
                 raw_end_to_end_speedup_vs_ar=summary["end_to_end_tokens_per_second"]/base["end_to_end_tokens_per_second"],
                 mismatch_sample_ids=[example.sample_id for example, a, b in zip(examples, tokens, expected) if a != b],
-                peak_allocated_gib=torch.cuda.max_memory_allocated(args.device)/1024**3
+                peak_allocated_gib=(max(r['sample_memory']['peak_allocated_gib'] for r in results)
+                    if args.sample_memory else torch.cuda.max_memory_allocated(args.device)/1024**3)
                     if torch.device(args.device).type == "cuda" else None)
             with (root/f"{label}_b{batch_size}.jsonl").open("w") as handle:
                 for example, result, reference in zip(examples, results, expected):

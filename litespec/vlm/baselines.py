@@ -113,7 +113,11 @@ class DraftCache:
             self.visual_metadata = dict(condition="correct", visual_slots=0, donor_slots=0)
             self.mask_visual = False
             return
-        self.hidden = self.features(draft, output)
+        bounded_correct = self.window is not None and visual_condition == "correct"
+        token_slice = slice(-self.window, None) if bounded_correct else None
+        self.hidden = self.features(draft, output, token_slice=token_slice)
+        if bounded_correct and vision_mask is not None:
+            vision_mask = vision_mask[..., -self.window:]
         from .dflash_context import intervene_visual
         self.hidden, self.visual_keep, self.visual_metadata = intervene_visual(
             self.hidden, vision_mask, visual_condition, donor_features)
@@ -124,8 +128,12 @@ class DraftCache:
 
 
     @staticmethod
-    def features(draft, output):
-        return selected_layers(output.hidden_states, draft.target_layer_ids,
+    def features(draft, output, token_slice=None):
+        states = output.hidden_states
+        if token_slice is not None:
+            # Slice before stacking to avoid a full-prefix allocation for Pivot1/recent windows.
+            states = tuple(h[:, token_slice] if h is not None else None for h in states)
+        return selected_layers(states, draft.target_layer_ids,
                                draft.config.num_target_layers).flatten(-2).detach()
 
     def propose(self, draft, target, pending, anchor):

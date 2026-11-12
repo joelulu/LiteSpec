@@ -85,3 +85,33 @@ cat "$RESULT_DIR/comparison.md"
 CPU tests validate command budgets, shared smoke/full snapshots, multi-page
 routing and report handling. GPU throughput and complete real datasets must be
 validated on the user's server; CPU tests are not GPU benchmark evidence.
+
+## Long-prefill memory mitigation
+
+The four-GPU runner now explicitly requests `--prefill-hidden-mode selected` and
+`--sample-memory`. Standalone benchmark defaults remain `all` for backwards
+compatibility; pass these two flags to opt in when retrying a frozen cell.
+Transformers' native layer-list capture retains only requested decoder outputs
+for prefill (not all language layers or the embedding output). The selected
+last layer follows the same final-norm convention. Decode/verification math,
+GDN state scheme, images/pages and sample selection are unchanged. For bounded
+Pivot/recent contexts, slice the last window BEFORE stacking layer features.
+
+`sample_memory.jsonl` writes start/complete/failed events for each timed request,
+with sample ID/index, input length, page count (documents), visible physical GPU
+IDs, and allocated/reserved/peak memory. Events and peak-counter resets occur
+outside model timing; no additional synchronizations are inserted inside decode.
+Per-model peak reports take the maximum across all sampled requests. Failed
+requests are re-raised and never silently skipped. These statistics do not by
+themselves establish a memory leak or guarantee that every long document fits.
+
+The shell wrapper defaults to `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+when not already set. This can help fragmentation but does not replace reducing
+live tensor memory. No `empty_cache()` call is inserted in timed generation.
+Chunked prefill is not introduced: it needs separate MRoPE/GDN/cache equivalence
+validation. No page/token-budget reduction is used as an OOM fallback.
+
+CPU tests compare dense/selected hidden values (including final norm), logits,
+generated tokens and acceptance lengths using a tiny real Qwen3.5, image/text,
+Full/Pivot1 and per_token/replay state modes. Real GPU FLA peak reduction and the
+previously failing document must still be measured on the user's machine.

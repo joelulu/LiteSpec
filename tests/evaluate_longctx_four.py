@@ -86,7 +86,7 @@ def case_command(args, name, variant, path, count, output):
     video=name in ('Video-MME','VideoDetailCaption')
     command=[sys.executable,str(HERE/('benchmark_video.py' if video else 'benchmark_vlm_static_batch.py')),
         '--target-model',str(args.target_model),'--output-dir',str(output),'--batch-sizes','1',
-        '--max-new-tokens',str(args.max_new_tokens),'--seed',str(args.seed),'--warmup','1']
+        '--max-new-tokens',str(args.max_new_tokens),'--seed',str(args.seed),'--warmup','1','--prefill-hidden-mode',getattr(args,'prefill_hidden_mode','selected'),'--sample-memory']
     for label in ('full','pivot1'):
         command+=['--checkpoint',label,str((args.run_group/label/args.checkpoint_name).resolve())]
     if video:
@@ -174,6 +174,7 @@ def main(argv=None):
     p.add_argument('--output-dir',type=Path,required=True)
     p.add_argument('--target-model',type=Path,required=True)
     p.add_argument('--run-group',type=Path,required=True)
+    p.add_argument('--prefill-hidden-mode',choices=['selected','all'],default='selected')
     p.add_argument('--checkpoint-name',default='epoch_5')
     p.add_argument('--gpus',nargs='+',default=['0','1','2','3'])
     p.add_argument('--samples',type=int,default=16)

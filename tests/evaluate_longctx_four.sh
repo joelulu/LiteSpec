@@ -5,7 +5,8 @@ cd "$REPO"
 export DLITE_WORKSPACE="${DLITE_WORKSPACE:-$(dirname -- "$REPO")}"
 export PYTHON_BIN="${PYTHON_BIN:-$DLITE_WORKSPACE/LiteSpec/.venv-vlm/bin/python}"
 export PYTHONUNBUFFERED=1
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}}"
+unset PYTORCH_CUDA_ALLOC_CONF
 export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export RESULT_DIR="${RESULT_DIR:-$DLITE_WORKSPACE/runs/longctx_four_n16_$(date +%Y%m%d_%H%M%S)_$$}"
@@ -23,4 +24,4 @@ exec "$PYTHON_BIN" tests/evaluate_longctx_four.py \
  --gpus "${GPU_IDS[@]}" \
  --samples "${EVAL_SAMPLES:-16}" \
  --max-new-tokens "${EVAL_MAX_NEW_TOKENS:-256}" \
- --smoke-samples "${SMOKE_SAMPLES:-2}" "$@"
+ --smoke-samples "${SMOKE_SAMPLES:-1}" "$@"

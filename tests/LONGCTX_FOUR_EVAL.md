@@ -14,9 +14,11 @@ No training or checkpoint modification occurs.
 
 GPU assignment can be changed by `EVAL_GPUS="0 1 2 3"`. Fewer GPUs serialize
 dataset queues; no tensor parallelism or online concurrency is implied.
-Each variant first runs all three models on its first two samples. Only a
-successful smoke proceeds to the full 16-sample cell. `SMOKE_SAMPLES=0` disables
-this gate. IDs match across variants and models. A run uses a fresh result
+All 11 variants first run all three models on one sample (`SMOKE_SAMPLES=1`).
+Only after EVERY dataset/variant smoke succeeds do any 16-sample cells start.
+Document smoke selects the most pages among the frozen 16; other cases use the
+first selected sample. Formal IDs/order remain unchanged across phases and models.
+Smoke cannot be disabled in this gated runner. A run uses a fresh result
 directory; it does not overwrite completed preparation or evaluation files.
 
 ## Local sources
@@ -52,7 +54,7 @@ Video-MME retains the existing **description** task, not official MCQ accuracy.
 export DLITE_WORKSPACE="$HOME/LMM/gaohl/project/from_aliyun/LDM/dllm_dflash/dllm_vllm/dlite-vlm"
 export PYTHON_BIN="$DLITE_WORKSPACE/LiteSpec/.venv-vlm/bin/python"
 export RESULT_DIR="$DLITE_WORKSPACE/runs/longctx_four_n16_$(date +%Y%m%d_%H%M%S)_$$"
-EVAL_GPUS="0 1 2 3" EVAL_SAMPLES=16 EVAL_MAX_NEW_TOKENS=256 \
+EVAL_GPUS="0 1 2 3" SMOKE_SAMPLES=1 EVAL_SAMPLES=16 EVAL_MAX_NEW_TOKENS=256 \
   bash tests/evaluate_longctx_four.sh
 ```
 
@@ -63,8 +65,15 @@ missing `epoch_5` to `last`. Fingerprints and context types are checked before
 launch. All models must have matching block size. `--tests Video-MME ...` can
 select a subset; mapping follows the selected order.
 
-Outputs: `manifest.json`, `status.json`, four dataset logs, frozen `inputs/`,
-per-case `results/`, smoke outputs, `comparison.md` and `.csv`.
+To reuse the exact inputs from a previous four-dataset run, append
+`--reuse-inputs-from "$PREVIOUS_RESULT_DIR"`. Existing frozen inputs or prepared
+variant files are reused without resampling or PDF rendering. Missing variants
+fail explicitly. Per-case hashes detect changes between smoke and evaluation.
+
+Outputs: `manifest.json`, `phase.json`, `status.json`, phase-specific dataset logs,
+frozen `inputs/`, per-case `results/`, `smoke/`, `smoke_comparison.md`,
+`comparison.md` and `.csv`. `smoke_passed.json` is written only after all requested
+smokes pass; `smoke_status.json` and `evaluation_status.json` record each phase.
 Acceptance is **committed length including the guaranteed Target token**;
 accepted draft count is also in CSV. Speedups are raw observed same-case ratios.
 Match is recorded, not a gate for reporting throughput. Model end-to-end timing
@@ -78,7 +87,9 @@ final exit; completed cells in other queues are still reported. Reports ignore
 partial summary files and require all three model rows for a cell.
 
 ```bash
-tail -f "$RESULT_DIR/logs/MMLongBench-Doc.log"
+tail -f "$RESULT_DIR/logs/smoke_MMLongBench-Doc.log"
+cat "$RESULT_DIR/phase.json"
+cat "$RESULT_DIR/smoke_comparison.md"
 cat "$RESULT_DIR/comparison.md"
 ```
 
@@ -105,8 +116,8 @@ Per-model peak reports take the maximum across all sampled requests. Failed
 requests are re-raised and never silently skipped. These statistics do not by
 themselves establish a memory leak or guarantee that every long document fits.
 
-The shell wrapper defaults to `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-when not already set. This can help fragmentation but does not replace reducing
+The shell wrapper defaults to `PYTORCH_ALLOC_CONF=expandable_segments:True`
+when not already set, migrating an existing legacy `PYTORCH_CUDA_ALLOC_CONF`. This can help fragmentation but does not replace reducing
 live tensor memory. No `empty_cache()` call is inserted in timed generation.
 Chunked prefill is not introduced: it needs separate MRoPE/GDN/cache equivalence
 validation. No page/token-budget reduction is used as an OOM fallback.

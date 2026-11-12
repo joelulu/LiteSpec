@@ -107,30 +107,121 @@ def case_command(args, name, variant, path, count, output):
     return command
 
 
+def expected_variants(args, name):
+    if name == 'mathvista-govreport':
+        return ['short' if n == 0 else f'ctx{n}' for n in args.lengths]
+    if name == 'MMLongBench-Doc':return ['all_pages']
+    return [f'frames{n}' for n in args.frames]
+
+
+def reused_inputs(args, name):
+    source = args.reuse_inputs_from
+    variants = []
+    for variant in expected_variants(args, name):
+        path = source/'inputs'/f'{name}_{variant}.jsonl'
+        if not path.is_file():
+            # Prior workers materialize every variant before starting GPU tests.
+            if name == 'mathvista-govreport':
+                path = source/'prepared/mathvista_encoded/inputs'/f'{variant}.jsonl'
+            elif name in ('Video-MME','VideoDetailCaption'):
+                path = source/'prepared'/name/f'frames_{variant.removeprefix("frames")}.jsonl'
+            else:path = source/'prepared'/name/'base.jsonl'
+        if not path.is_file():raise FileNotFoundError(f'Missing frozen {name}/{variant}: {path}')
+        variants.append((variant,path))
+    return variants
+
+
+def freeze_inputs(args, name):
+    variants = reused_inputs(args,name) if getattr(args,'reuse_inputs_from',None) else select_inputs(args,name)
+    if [v for v,_ in variants] != expected_variants(args,name):raise ValueError('Variant plan differs')
+    source_rows=jsonl(variants[0][1])
+    ids=[r['id'] for r in source_rows[:args.samples]]
+    if len(ids)!=args.samples or len(set(ids))!=len(ids):raise ValueError('Need requested unique samples')
+    write_json(args.output_dir/'inputs'/f'{name}_ids.json',ids)
+    plan=[]
+    for variant,path in variants:
+        rows=jsonl(path)[:args.samples]
+        if [r['id'] for r in rows] != ids:raise ValueError('Length/frame variants have different sample IDs')
+        dest=args.output_dir/'inputs'/f'{name}_{variant}.jsonl'
+        dest.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows))
+        smoke_indices = (sorted(range(len(rows)), key=lambda i: (-len(rows[i].get('images',[])),i))
+                         if name == 'MMLongBench-Doc' else list(range(len(rows))))[:args.smoke_samples]
+        smoke_rows = [rows[i] for i in smoke_indices]
+        smoke_path = args.output_dir/'inputs'/f'{name}_{variant}_smoke.jsonl'
+        smoke_path.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in smoke_rows))
+        plan.append(dict(variant=variant,path=str(dest),sha256=sha256(dest),
+            smoke_path=str(smoke_path),smoke_sha256=sha256(smoke_path),smoke_ids=[r['id'] for r in smoke_rows],
+            smoke_policy='most_pages' if name=='MMLongBench-Doc' else 'first_selected',
+            source_path=str(path),source_sha256=sha256(path)))
+        print(f'{name}/{variant}: {args.samples} fixed samples; sha256={sha256(dest)}',flush=True)
+    write_json(args.output_dir/'inputs'/f'{name}_plan.json',dict(samples=args.samples,seed=args.seed,ids=ids,cases=plan))
+    return plan
+
+
+def checked_plan(args,name):
+    plan=json.loads((args.output_dir/'inputs'/f'{name}_plan.json').read_text())
+    if plan['samples']!=args.samples or plan['seed']!=args.seed:raise ValueError('Frozen sample settings changed')
+    if [r['variant'] for r in plan['cases']]!=expected_variants(args,name):raise ValueError('Frozen variants changed')
+    for item in plan['cases']:
+        path=Path(item['path'])
+        if sha256(path)!=item['sha256']:raise ValueError(f'Frozen input changed: {path}')
+        if [r['id'] for r in jsonl(path)]!=plan['ids']:raise ValueError('Frozen IDs changed')
+        smoke_path=Path(item['smoke_path'])
+        if sha256(smoke_path)!=item['smoke_sha256']:raise ValueError('Smoke input changed')
+        if [r['id'] for r in jsonl(smoke_path)]!=item['smoke_ids']:raise ValueError('Smoke IDs changed')
+        if len(item['smoke_ids'])!=args.smoke_samples or not set(item['smoke_ids'])<=set(plan['ids']):
+            raise ValueError('Smoke samples must come from the formal sample set')
+    return plan['cases']
+
+
+def validate_cell(output,count):
+    rows=json.loads((output/'summary.json').read_text())
+    if len(rows)!=3 or {r['model'] for r in rows}!={'ar','full','pivot1'}:
+        raise ValueError(f'Incomplete AR/Full/Pivot1 results: {output}')
+    if any(r['batch_size']!=1 or r['requests']!=count or r.get('state_mode')!='per_token'
+           or r.get('prefill_hidden_mode')!='selected' for r in rows):
+        raise ValueError(f'Unexpected sample/batch/state/hidden settings: {output}')
+    # AR token matches are recorded but are not a smoke gate for raw speed diagnostics.
+
+
 def worker(args):
     name=args.worker
-    variants=select_inputs(args,name)
-    source_rows=jsonl(variants[0][1])
-    write_json(args.output_dir/'inputs'/f'{name}_ids.json',[r['id'] for r in source_rows[:args.samples]])
-    for variant,path in variants:
-        rows=jsonl(path)
-        if len(rows)<args.samples:raise ValueError(f'{name}: only {len(rows)} rows')
-        if [r['id'] for r in rows[:args.samples]] != [r['id'] for r in source_rows[:args.samples]]:
-            raise ValueError('Length/frame variants have different sample IDs')
-        # Freeze the actual file each benchmark reads (including image/page order).
-        dest=args.output_dir/'inputs'/f'{name}_{variant}.jsonl'
-        dest.write_text(''.join(json.dumps(r,ensure_ascii=False)+'\n' for r in rows[:args.samples]))
-        print(f'{name}/{variant}: {args.samples} fixed samples; sha256={sha256(dest)}',flush=True)
-        if args.smoke_samples:
-            out=args.output_dir/'smoke'/f'{name}_{variant}'
-            subprocess.run(case_command(args,name,variant,dest,min(args.smoke_samples,args.samples),out),check=True,cwd=HERE.parent)
-        out=args.output_dir/'results'/f'{name}_{variant}'
-        subprocess.run(case_command(args,name,variant,dest,args.samples,out),check=True,cwd=HERE.parent)
+    phase=args.worker_phase
+    if phase=='smoke':
+        freeze_inputs(args,name)
+    elif not (args.output_dir/'smoke_passed.json').is_file():
+        raise RuntimeError('Formal evaluation requires all-dataset smoke success')
+    cases=checked_plan(args,name)
+    count=args.smoke_samples if phase=='smoke' else args.samples
+    for item in cases:
+        variant=item['variant']
+        path=Path(item['smoke_path'] if phase=='smoke' else item['path'])
+        out=args.output_dir/('smoke' if phase=='smoke' else 'results')/f'{name}_{variant}'
+        subprocess.run(case_command(args,name,variant,path,count,out),check=True,cwd=HERE.parent)
+        validate_cell(out,count)
 
 
-def report(root):
+def run_gated(args, run_phase):
+    write_json(args.output_dir/'phase.json',dict(phase='smoke',evaluation_started=False))
+    smoke=run_phase('smoke')
+    if set(smoke)!=set(args.tests) or any(s['status']!='success' for s in smoke.values()):
+        write_json(args.output_dir/'phase.json',dict(phase='smoke_failed',evaluation_started=False))
+        raise RuntimeError('Smoke failed; NO 16-sample evaluation started. Inspect logs/smoke_*.log')
+    write_json(args.output_dir/'smoke_passed.json',dict(samples=args.smoke_samples,tests=args.tests,
+        models=['ar','full','pivot1'],cases={name:checked_plan(args,name) for name in args.tests}))
+    write_json(args.output_dir/'phase.json',dict(phase='smoke_passed',evaluation_started=False))
+    print('ALL SMOKE CASES PASSED. Starting full fixed-sample evaluation.',flush=True)
+    write_json(args.output_dir/'phase.json',dict(phase='evaluation',evaluation_started=True))
+    evaluation=run_phase('evaluation')
+    success=set(evaluation)==set(args.tests) and all(s['status']=='success' for s in evaluation.values())
+    write_json(args.output_dir/'phase.json',dict(phase='complete' if success else 'evaluation_failed',evaluation_started=True))
+    if not success:raise RuntimeError('Some evaluations failed; completed cells remain in comparison.md')
+
+
+
+def report(root, directory="results", prefix="comparison"):
     rows=[]
-    for path in sorted((root/'results').glob('*/summary.json')):
+    for path in sorted((root/directory).glob('*/summary.json')):
         case=path.parent.name
         try:
             summaries=json.loads(path.read_text())
@@ -150,9 +241,9 @@ def report(root):
                 end_to_end_speedup=r['raw_end_to_end_ratio_vs_ar'] if video else r['raw_end_to_end_speedup_vs_ar'],
                 prefill_seconds=r['prefill_seconds'],end_to_end_tok_s=tokens/total,
                 peak_gib=r['peak_allocated_gib'],matched=r['matched']))
-    write_json(root/'comparison.json',rows)
+    write_json(root/f'{prefix}.json',rows)
     if rows:
-        with (root/'comparison.csv').open('w',newline='') as f:
+        with (root/f'{prefix}.csv').open('w',newline='') as f:
             w=csv.DictWriter(f,fieldnames=list(rows[0]));w.writeheader();w.writerows(rows)
     lines=['# Long multimodal context: AR / Full / Pivot1','',
         'B=1, greedy, per_token. Acceptance below is committed length INCLUDING the guaranteed Target token.',
@@ -163,7 +254,7 @@ def report(root):
     for r in rows:
         accept='—' if r['committed_length'] is None else f"{r['committed_length']:.3f}"
         lines.append(f"| {r['case']} | {r['model']} | {r['input_tokens']:.0f} | {accept} | {r['decode_tok_s']:.2f} | {r['decode_speedup']:.3f}× | {r['end_to_end_speedup']:.3f}× | {r['prefill_seconds']:.2f} | {r['peak_gib']:.2f} | {r['matched']}/{r['samples']} |")
-    (root/'comparison.md').write_text('\n'.join(lines)+'\n')
+    (root/f'{prefix}.md').write_text('\n'.join(lines)+'\n')
     return rows
 
 
@@ -180,7 +271,7 @@ def main(argv=None):
     p.add_argument('--samples',type=int,default=16)
     p.add_argument('--max-new-tokens',type=int,default=256)
     p.add_argument('--seed',type=int,default=42)
-    p.add_argument('--smoke-samples',type=int,default=2)
+    p.add_argument('--smoke-samples',type=int,default=1)
     p.add_argument('--lengths',nargs='+',type=int,default=[0,8192,32768,65536])
     p.add_argument('--frames',nargs='+',type=int,default=[32,64,128])
     p.add_argument('--image-max-tokens',type=int,default=1024)
@@ -190,10 +281,12 @@ def main(argv=None):
     for name in ('mathvista-source','mathvista-parquet','govreport-parquet','doc-parquet','doc-root'):
         p.add_argument('--'+name,type=Path)
     p.add_argument('--tests',nargs='+',choices=SETS,default=list(SETS))
+    p.add_argument('--reuse-inputs-from',type=Path,help='Reuse fixed JSONL/prepared inputs from a previous four-dataset run')
     p.add_argument('--worker',choices=SETS,help=argparse.SUPPRESS)
+    p.add_argument('--worker-phase',choices=['smoke','evaluation'],default='smoke',help=argparse.SUPPRESS)
     p.add_argument('--report-only',action='store_true')
     args=p.parse_args(argv)
-    if not 1<=args.samples<=100 or args.max_new_tokens<1 or args.smoke_samples<0:p.error('invalid sample/output budget')
+    if not 1<=args.samples<=100 or args.max_new_tokens<1 or not 1<=args.smoke_samples<=args.samples:p.error('invalid sample/output budget')
     if len(set(args.tests))!=len(args.tests) or len(args.gpus)!=len(set(args.gpus)):p.error('duplicate tests/GPUs')
     if not args.gpus or any(not g.isdecimal() for g in args.gpus):p.error('physical GPU IDs required')
     if any(f<2 or f%2 for f in args.frames):p.error('even video frame counts required')
@@ -201,6 +294,7 @@ def main(argv=None):
     if min(args.image_max_tokens,args.video_max_pixels,args.doc_page_edge)<1:p.error('invalid image budgets')
     for key,value in vars(args).items():
         if isinstance(value,Path):setattr(args,key,value.expanduser().resolve())
+    if args.prefill_hidden_mode!='selected':p.error('This gated runner requires selected hidden capture; use standalone benchmark for all-mode controls')
     if args.report_only:report(args.output_dir);return
     if args.worker:worker(args);return
     target,drafts=models(args)
@@ -209,43 +303,53 @@ def main(argv=None):
     write_json(args.output_dir/'manifest.json',dict(settings=vars(args),target=target,checkpoints=drafts,
         gpu_assignments={name:args.gpus[i%len(args.gpus)] for i,name in enumerate(args.tests)}))
     raw=list(sys.argv[1:] if argv is None else argv)
-    statuses={};processes=set();lock=threading.Lock()
-    def launch(name,gpu):
-        # Multiple datasets on a selected GPU serialize through this queue's worker.
+    processes=set();lock=threading.Lock();stop=threading.Event()
+    queues={gpu:[] for gpu in args.gpus}
+    for i,name in enumerate(args.tests):queues[args.gpus[i%len(args.gpus)]].append(name)
+    def launch(name,gpu,phase):
         env=dict(os.environ,CUDA_VISIBLE_DEVICES=gpu,PYTHONUNBUFFERED='1',OMP_NUM_THREADS='1',
             MKL_NUM_THREADS='1',TOKENIZERS_PARALLELISM='false',PYTHONPATH=str(HERE.parent))
-        print(f'Starting {name} on physical GPU {gpu}: {args.output_dir}/logs/{name}.log',flush=True)
-        with (args.output_dir/'logs'/f'{name}.log').open('w') as log:
+        logfile=args.output_dir/'logs'/f'{phase}_{name}.log'
+        print(f'{phase}: {name}, physical GPU {gpu}: {logfile}',flush=True)
+        with logfile.open('w') as log:
             with lock:
-                child=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),*raw,'--worker',name],
-                    cwd=HERE.parent,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+                if stop.is_set():return dict(status='cancelled',returncode=130,gpu=gpu)
+                child=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),*raw,
+                    '--worker',name,'--worker-phase',phase],cwd=HERE.parent,env=env,
+                    stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
                 processes.add(child)
             try:code=child.wait()
             finally:
                 with lock:processes.discard(child)
-        return dict(status='success' if code==0 else 'failed',returncode=code,gpu=gpu)
-    queues={gpu:[] for gpu in args.gpus}
-    for i,name in enumerate(args.tests):queues[args.gpus[i%len(args.gpus)]].append(name)
-    def queue(gpu,names):
-        for name in names:
-            status=launch(name,gpu)
+        return dict(status='success' if code==0 else 'failed',returncode=code,gpu=gpu,phase=phase,log=str(logfile))
+    def run_phase(phase):
+        statuses={}
+        def queue(gpu,names):
+            for name in names:
+                status=launch(name,gpu,phase)
+                with lock:
+                    statuses[name]=status
+                    write_json(args.output_dir/f'{phase}_status.json',statuses)
+                    write_json(args.output_dir/'status.json',dict(phase=phase,datasets=statuses))
+                    report(args.output_dir, 'smoke' if phase=='smoke' else 'results',
+                           'smoke_comparison' if phase=='smoke' else 'comparison')
+                print(f'{phase}: {name}: {status["status"]}; GPU={gpu}',flush=True)
+        pool=ThreadPoolExecutor(max_workers=len(args.gpus))
+        try:
+            futures=[pool.submit(queue,gpu,names) for gpu,names in queues.items() if names]
+            for future in as_completed(futures):future.result()
+        except BaseException:
+            stop.set()
             with lock:
-                statuses[name]=status;write_json(args.output_dir/'status.json',statuses);report(args.output_dir)
-            print(f'{name}: {status["status"]}; GPU={gpu}; logs/{name}.log',flush=True)
-    pool=ThreadPoolExecutor(max_workers=len(args.gpus))
-    try:
-        futures=[pool.submit(queue,gpu,names) for gpu,names in queues.items() if names]
-        for f in as_completed(futures):f.result()
-    except BaseException:
-        with lock:
-            for child in list(processes):
-                try:os.killpg(child.pid,signal.SIGTERM)
-                except ProcessLookupError:pass
-        raise
-    finally:pool.shutdown(wait=True)
+                for child in list(processes):
+                    try:os.killpg(child.pid,signal.SIGTERM)
+                    except ProcessLookupError:pass
+            raise
+        finally:pool.shutdown(wait=True)
+        return statuses
+    run_gated(args,run_phase)
     report(args.output_dir)
     print(f'Results: {args.output_dir}/comparison.md',flush=True)
-    if any(s['status']!='success' for s in statuses.values()):raise SystemExit(1)
 
 
 if __name__=='__main__':main()

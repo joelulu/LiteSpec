@@ -23,8 +23,9 @@ class LongContextTests(unittest.TestCase):
         (target/'config.json').write_text(json.dumps(dict(vision_config=dict(patch_size=16,spatial_merge_size=2))))
         self.args=argparse.Namespace(target_model=target,run_group=self.root/'models',checkpoint_name='epoch_5',
             workspace=self.root,data_dir=self.root/'data',output_dir=self.root/'out',video_root=self.root/'videos',
-            max_new_tokens=256,seed=42,samples=16,smoke_samples=2,image_max_tokens=1024,
-            video_max_pixels=200704,worker='MMLongBench-Doc')
+            max_new_tokens=256,seed=42,samples=16,smoke_samples=1,image_max_tokens=1024,
+            video_max_pixels=200704,worker='MMLongBench-Doc',worker_phase='smoke',
+            tests=['MMLongBench-Doc'],lengths=[0,8192,32768,65536],frames=[32,64,128],reuse_inputs_from=None)
         for name in ('inputs','smoke','results'):(self.args.output_dir/name).mkdir(parents=True)
 
     def test_document_command_uses_explicit_multi_page_and_per_token(self):
@@ -48,15 +49,75 @@ class LongContextTests(unittest.TestCase):
             self.assertEqual(actual,rows[:count])
             self.assertEqual(command[command.index('--frames')+1],'128')
 
-    def test_worker_smokes_then_evaluates_same_snapshot(self):
+    def test_worker_phases_share_formal_selection_and_smoke_uses_most_pages(self):
         path=self.root/'source.jsonl'
-        lines(path,[dict(id=str(i),question='Q',images=['/page.png']) for i in range(16)])
-        with patch.object(cli,'select_inputs',return_value=[('all_pages',path)]),patch.object(cli.subprocess,'run') as run,redirect_stdout(io.StringIO()):
+        rows=[dict(id=str(i),question='Q',images=['/page.png']*(i+1)) for i in range(16)]
+        lines(path,rows)
+        with patch.object(cli,'select_inputs',return_value=[('all_pages',path)]),patch.object(cli.subprocess,'run') as run,patch.object(cli,'validate_cell'),redirect_stdout(io.StringIO()):
             cli.worker(self.args)
         commands=[call.args[0] for call in run.call_args_list]
-        self.assertEqual(len(commands),2)
-        self.assertEqual([c[c.index('--max-samples')+1] for c in commands],['2','16'])
-        self.assertEqual(commands[0][commands[0].index('--data')+1],commands[1][commands[1].index('--data')+1])
+        self.assertEqual(len(commands),1)
+        self.assertEqual(commands[0][commands[0].index('--max-samples')+1],'1')
+        smoke_path=Path(commands[0][commands[0].index('--data')+1])
+        self.assertEqual([r['id'] for r in cli.jsonl(smoke_path)],['15'])
+        self.assertEqual(list((self.args.output_dir/'results').iterdir()),[])
+        self.args.worker_phase='evaluation'
+        with self.assertRaisesRegex(RuntimeError,'all-dataset smoke'):
+            cli.worker(self.args)
+        (self.args.output_dir/'smoke_passed.json').write_text('{}')
+        with patch.object(cli,'select_inputs',side_effect=AssertionError('must not resample')),patch.object(cli.subprocess,'run') as run,patch.object(cli,'validate_cell'):
+            cli.worker(self.args)
+        command=run.call_args.args[0]
+        self.assertEqual(command[command.index('--max-samples')+1],'16')
+        full_path=Path(command[command.index('--data')+1])
+        self.assertEqual(cli.jsonl(full_path),rows)
+
+    def test_failed_global_smoke_never_starts_formal_stage(self):
+        self.args.tests=list(cli.SETS)
+        phases=[]
+        def run(phase):
+            phases.append(phase)
+            return {name:dict(status='failed' if name=='Video-MME' else 'success') for name in self.args.tests}
+        with self.assertRaisesRegex(RuntimeError,'NO 16-sample'):
+            cli.run_gated(self.args,run)
+        self.assertEqual(phases,['smoke'])
+        self.assertFalse((self.args.output_dir/'smoke_passed.json').exists())
+
+    def test_all_four_smokes_finish_before_formal_phase(self):
+        self.args.tests=list(cli.SETS)
+        phases=[]
+        def run(phase):
+            phases.append(phase)
+            if phase=='smoke':self.assertFalse((self.args.output_dir/'smoke_passed.json').exists())
+            else:self.assertTrue((self.args.output_dir/'smoke_passed.json').exists())
+            return {name:dict(status='success') for name in self.args.tests}
+        with patch.object(cli,'checked_plan',return_value=[]),redirect_stdout(io.StringIO()):
+            cli.run_gated(self.args,run)
+        self.assertEqual(phases,['smoke','evaluation'])
+        self.assertEqual(json.loads((self.args.output_dir/'phase.json').read_text())['phase'],'complete')
+
+    def test_reuse_previous_materialized_variants_without_resampling(self):
+        source=self.root/'old';self.args.reuse_inputs_from=source
+        for frames in self.args.frames:
+            path=source/'prepared/Video-MME'/f'frames_{frames}.jsonl'
+            path.parent.mkdir(parents=True,exist_ok=True)
+            lines(path,[dict(id=str(i),question='Q',video='/video.mp4') for i in range(16)])
+        with patch.object(cli,'select_inputs',side_effect=AssertionError('no resampling')),redirect_stdout(io.StringIO()):
+            cli.freeze_inputs(self.args,'Video-MME')
+        cases=cli.checked_plan(self.args,'Video-MME')
+        self.assertEqual(len(cases),3)
+        self.assertTrue(all(c['smoke_ids']==['0'] for c in cases))
+        Path(cases[0]['path']).write_text('tampered')
+        with self.assertRaisesRegex(ValueError,'changed'):cli.checked_plan(self.args,'Video-MME')
+
+    def test_gate_rejects_partial_or_wrong_count_results_but_allows_mismatches(self):
+        output=self.root/'cell';output.mkdir()
+        rows=[dict(model=name,batch_size=1,requests=1,state_mode='per_token',prefill_hidden_mode='selected',matched=0)
+              for name in ('ar','full','pivot1')]
+        (output/'summary.json').write_text(json.dumps(rows));cli.validate_cell(output,1)
+        rows[-1]['requests']=16
+        (output/'summary.json').write_text(json.dumps(rows))
+        with self.assertRaises(ValueError):cli.validate_cell(output,1)
 
     def test_report_keeps_raw_ratios_despite_mismatch_and_skips_partial(self):
         case=self.args.output_dir/'results'/'doc_all';case.mkdir()

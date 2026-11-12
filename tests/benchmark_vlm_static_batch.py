@@ -18,6 +18,21 @@ from litespec.vlm.static_batch import generate_static_batch
 from vlm_benchmark_data import read_eval_records
 
 
+def prepare_benchmark_example(processor, config, record, *, device, base_dir, document_input=False):
+    if record.get("images"):
+        if not document_input:
+            raise ValueError("Multi-page records require --document-input; refusing to ignore images")
+        from encode_multimodal_longctx import document_example
+        row = dict(record, images=[str((base_dir / p).resolve()) if not Path(p).is_absolute() else p
+                                   for p in record["images"]])
+        example = document_example(processor, config, row)
+        return replace(example, inputs={k: v.to(device) if torch.is_tensor(v) else v
+                       for k, v in example.inputs.items()}, vision_mask=example.vision_mask.to(device))
+    if document_input:
+        raise ValueError("Document records require a nonempty images list")
+    return prepare_example(processor, config, record, device=device, base_dir=base_dir, training=False)
+
+
 def summarize_batches(results, batch_size):
     tokens = sum(row["output_tokens"] for row in results)
     prefill = sum(row["prefill_seconds"] for row in results)
@@ -50,6 +65,7 @@ def main():
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--data-split", choices=["train", "validation", "smoke", "unspecified"], default="unspecified")
     parser.add_argument("--dataset-name", default="unspecified")
+    parser.add_argument("--document-input", action="store_true", help="ordered multi-page images + one question; evaluation only")
     parser.add_argument("--reference-input", action="store_true", help="read prompt or first conversations.content, sample with seed")
     parser.add_argument("--input-mode", choices=["text", "vision"], default="vision")
     parser.add_argument("--image-root", type=Path)
@@ -122,8 +138,15 @@ def main():
     image_size = getattr(getattr(processor, "image_processor", None), "size", None)
     settings["effective_image_processor_size"] = dict(image_size) if image_size is not None else None
     (root/"settings.json").write_text(json.dumps(settings, default=str, indent=2))
-    examples = [prepare_example(processor, target.config, record, device="cpu" if args.cpu_inputs else args.device,
-                               base_dir=data.parent, training=False) for record in records]
+    examples = [prepare_benchmark_example(processor, target.config, record, device="cpu" if args.cpu_inputs else args.device,
+                               base_dir=data.parent, document_input=args.document_input) for record in records]
+    text_config = getattr(target.config, "text_config", target.config)
+    context_limit = getattr(text_config, "max_position_embeddings", None)
+    if context_limit is not None:
+        for example in examples:
+            if example.prefill_length + args.max_new_tokens > context_limit:
+                raise ValueError(f"{example.sample_id}: input {example.prefill_length} + output cap "
+                                 f"{args.max_new_tokens} exceeds model context {context_limit}; not truncating")
     input_metadata = []
     for record, example in zip(records, examples):
         grid = example.inputs.get("image_grid_thw")
@@ -138,6 +161,8 @@ def main():
             processed_image_hw=[[int(row[1])*patch_size, int(row[2])*patch_size] for row in grid.tolist()]
                 if grid is not None and patch_size is not None else None,
             image_grid_thw=grid.tolist() if grid is not None else None)
+        if record.get("images"):
+            metadata["image_paths"] = record["images"]
         input_metadata.append(metadata)
     (root/"inputs.json").write_text(json.dumps(input_metadata, indent=2))
     if args.reference_input:
@@ -162,8 +187,9 @@ def main():
         directory = args.ar_reference.resolve()
         prior = json.loads((directory/"settings.json").read_text())
         for key in ("target_model", "data", "sample_ids", "actual_attention_backend", "max_new_tokens",
-                    "batch_sizes", "effective_image_processor_size", "cuda_visible_devices", "cpu_inputs"):
-            if prior.get(key) != settings.get(key):
+                    "batch_sizes", "effective_image_processor_size", "cuda_visible_devices", "cpu_inputs", "document_input"):
+            previous = prior.get(key, False) if key == "document_input" else prior.get(key)
+            if previous != settings.get(key):
                 raise ValueError(f"AR reference differs in {key}; require same GPU, inputs and generation settings")
         if json.loads((directory/"inputs.json").read_text()) != input_metadata:
             raise ValueError("AR reference has different processed input metadata")

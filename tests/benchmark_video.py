@@ -147,6 +147,12 @@ def main():
             print(f'Preparing {dataset} {i+1}/{len(records)}: {record["id"]}',flush=True)
             example,meta=prepare_video(processor,target.config,record,args.frames,args.max_pixels_per_frame)
             examples.append(example); metadata.append(meta)
+        text_config=getattr(target.config,'text_config',target.config)
+        context_limit=getattr(text_config,'max_position_embeddings',None)
+        if context_limit is not None:
+            for example in examples:
+                if example.prefill_length+args.max_new_tokens>context_limit:
+                    raise ValueError(f'{example.sample_id}: input + output exceeds context {context_limit}; not truncating')
         metadata_path=root/f'{dataset}_inputs.json'
         if args.resume and metadata_path.exists():
             prior=json.loads(metadata_path.read_text())

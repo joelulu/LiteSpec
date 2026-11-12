@@ -74,7 +74,9 @@ def check_fsdp():
     device=torch.device('cuda',torch.cuda.current_device())
     dist.init_process_group('nccl',timeout=timedelta(minutes=20))
     try:
-        if dist.get_world_size()!=8:raise ValueError('Supplement check requires exactly eight ranks')
+        world=dist.get_world_size()
+        if world not in (4,8):raise ValueError('Supplement check requires four or eight ranks')
+        accumulation=64//world
         for mode,window in MODES:
             torch.manual_seed(42)
             draft=tiny(mode,device,width=64).to(dtype=torch.bfloat16).train()
@@ -95,11 +97,11 @@ def check_fsdp():
             torch.manual_seed(100+dist.get_rank())
             for step in range(2):
                 optimizer.zero_grad()
-                for micro in range(8):
+                for micro in range(accumulation):
                     length=(40,48)[micro%2]
                     ids=torch.randint(0,120,(2,length),device=device)
                     hidden=torch.randn(2,length,320,device=device,dtype=torch.bfloat16)
-                    loss=fsdp(input_ids=ids,hidden_states=hidden,loss_mask=torch.ones_like(ids).float()).loss/8
+                    loss=fsdp(input_ids=ids,hidden_states=hidden,loss_mask=torch.ones_like(ids).float()).loss/accumulation
                     assert torch.isfinite(loss),'nonfinite FSDP loss'
                     loss.backward()
                 norm=torch.zeros((),device=device,dtype=torch.float64)
@@ -112,7 +114,7 @@ def check_fsdp():
             with FSDP.summon_full_params(fsdp,writeback=False):
                 after=draft.layers[0].mlp.down_proj.weight.detach().float().cpu().clone()
             assert not torch.equal(before,after),'optimizer did not update Draft weights'
-            if dist.get_rank()==0:print(f'{mode}: eight-rank BF16/Flex/FSDP, two optimizer steps x eight accumulation passed',flush=True)
+            if dist.get_rank()==0:print(f'{mode}: {world}-rank BF16/Flex/FSDP, two optimizer steps x {accumulation} accumulation passed',flush=True)
             del optimizer,layouts,fsdp,online,draft,parameters
             torch.cuda.empty_cache();dist.barrier()
     finally:dist.destroy_process_group()

@@ -35,6 +35,16 @@ def digest(path):
 def read(path):return json.loads(Path(path).read_text())
 
 
+def training_layout(base,world_size):
+    if world_size not in (4,8):raise ValueError('Supplement requires four or eight training ranks')
+    micro=base['batch_size'];accumulation=256//(world_size*micro)
+    per_rank=(base['eligible_samples']+world_size-1)//world_size
+    batches=per_rank//micro
+    if batches<1:raise ValueError('Not enough eligible samples for one full batch per rank')
+    return dict(world_size=world_size,batch_size=micro,accumulation_steps=accumulation,
+        samples_per_rank=per_rank,total_optimizer_steps=(batches*base['num_epochs']+accumulation-1)//accumulation)
+
+
 def verify_baseline(manifest):
     if digest(Path(manifest['source_evaluation'])/'manifest.json')!=manifest['source_evaluation_manifest_sha256']:
         raise ValueError('Frozen baseline evaluation manifest changed')
@@ -48,8 +58,12 @@ def verify_baseline(manifest):
 def prepare(args):
     baseline=args.baseline_run_group.expanduser().resolve(strict=True)
     root=args.output_dir.expanduser().resolve()
-    if root.exists() or root==baseline or baseline in root.parents:
-        raise FileExistsError('Choose a fresh supplement directory outside the old run group')
+    if root.exists() or root==baseline:
+        raise FileExistsError('Choose a fresh supplement subdirectory; the original group itself is reserved')
+    for name in OLD:
+        control=(baseline/name).resolve()
+        if root==control or control in root.parents:
+            raise FileExistsError(f'Cannot place a supplement inside an old model directory: {name}')
     recorded=read(baseline/'experiment.json')
     if recorded.get('suite')!='exp1_10w_5ep' or recorded.get('global_batch')!=256:
         raise ValueError('Expected the original experiment-1 10w/5-epoch/global-batch-256 run')
@@ -68,6 +82,7 @@ def prepare(args):
         if cfg.get('draft_context','full')!=name:raise ValueError(f'Wrong old context: {name}')
         for key in MATCH_KEYS:
             if cfg.get(key)!=base.get(key):raise ValueError(f'Old recipe mismatch: {name}/{key}')
+    layout=training_layout(base,getattr(args,'world_size',8))
     data=Path(base['train_data']).expanduser().resolve(strict=True)
     if digest(data)!=base['data_sha256']:raise ValueError('Training JSONL differs from original Full run')
     target=fingerprint(base['target_model'])
@@ -98,6 +113,7 @@ def prepare(args):
     generated={}
     for name in NEW:
         cfg=copy.deepcopy(base)
+        cfg.update(layout)
         for key in ('init_checkpoint','resume'):cfg.pop(key,None)
         cfg.update(upstream_config='scripts/config/dflash.yaml',draft_context=name,context_experiment_variant=name,context_projection='shared',
             position_layer_bias=False,output_dir=str(root/name),save_every_epoch=True,final_only=False,
@@ -113,11 +129,12 @@ def prepare(args):
         train_data=str(data),data_sha256=base['data_sha256'],eligible_samples=base['eligible_samples'],
         eligible_indices_sha256=base['eligible_indices_sha256'],reuse_validation_from=str(reuse),
         new_modes=list(NEW),comparison_modes=list(ALL),initialization='from_scratch',global_batch=256,
+        training_layout=layout,baseline_world_size=base['world_size'],
         config_sha256=generated,git_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip())
     write_json(root/'experiment.json',manifest)
     env=dict(BASELINE_RUN_GROUP=str(baseline),BASELINE_EVAL_DIR=str(source),TARGET_MODEL=target['path'],
-        TRAIN_DATA=str(data),REUSE_VALIDATION_FROM=str(reuse),ALGORITHM='dflash',NPROC_PER_NODE='8',
-        EPOCHS='5',MICRO_BATCH_SIZE='4',ACCUMULATION_STEPS='8',IMAGE_MAX_TOKENS='1024',MAX_SAMPLES='0',
+        TRAIN_DATA=str(data),REUSE_VALIDATION_FROM=str(reuse),ALGORITHM='dflash',NPROC_PER_NODE=str(layout['world_size']),
+        EPOCHS='5',MICRO_BATCH_SIZE=str(layout['batch_size']),ACCUMULATION_STEPS=str(layout['accumulation_steps']),IMAGE_MAX_TOKENS='1024',MAX_SAMPLES='0',
         SAVE_EVERY_EPOCH='1',SAVE_TRAINING_STATE='0',REPORT_TO=str(base.get('report_to','tensorboard')))
     (root/'launch.env').write_text(''.join(f'export {key}={shlex.quote(value)}\n' for key,value in env.items()))
     print(f'Prepared three fresh runs from {baseline}\nOutput: {root}\nEligible records: {base["eligible_samples"]}',flush=True)
@@ -134,8 +151,9 @@ def finalize(root):
         if digest(root/name/'config.yaml')!=manifest['config_sha256'][name]:raise ValueError(f'Training config changed: {name}')
         cfg=read(root/name/'effective_config.json')
         original=read(Path(manifest['baseline_run_group'])/'full/effective_config.json')
+        expected=dict(original,**manifest.get('training_layout',{}))
         for key in MATCH_KEYS:
-            if cfg.get(key)!=original.get(key):raise ValueError(f'Completed training recipe mismatch: {name}/{key}')
+            if cfg.get(key)!=expected.get(key):raise ValueError(f'Completed training recipe mismatch: {name}/{key}')
         if cfg.get('draft_context')!=name or cfg.get('init_checkpoint'):raise ValueError(f'Wrong trained variant: {name}')
         item=fingerprint(root/name/'epoch_5')
         checkpoint=read(Path(item['path'])/'config.json')
@@ -155,6 +173,7 @@ def main(argv=None):
     prep=sub.add_parser('prepare');prep.add_argument('--baseline-run-group',type=Path,required=True)
     prep.add_argument('--output-dir',type=Path,required=True);prep.add_argument('--reuse-validation-from',type=Path,required=True)
     prep.add_argument('--source-eval-dir',type=Path)
+    prep.add_argument('--world-size',type=int,choices=(4,8),default=8)
     done=sub.add_parser('finalize');done.add_argument('--run-group',type=Path,required=True)
     args=parser.parse_args(argv)
     if args.command=='prepare':prepare(args)

@@ -29,13 +29,14 @@ class SupplementTests(unittest.TestCase):
         self.baseline=self.workspace/'runs/dflash_exp1_10w_5ep_fixture';self.baseline.mkdir(parents=True)
         target=self.workspace/'target';target.mkdir();(target/'config.json').write_text(json.dumps(dict(max_position_embeddings=131072)))
         (target/'model.safetensors').write_bytes(b'target')
-        data=self.workspace/'data/train.jsonl';data.parent.mkdir();data.write_text('{"id":"x"}\n')
+        data=self.workspace/'data/train.jsonl';data.parent.mkdir();data.write_text(''.join(json.dumps(dict(id=f'x{i}'))+'\n' for i in range(64)))
         self.cfg=dict(upstream_config_sha256=prep.digest(HERE.parent/'scripts/config/dflash.yaml'),
             algorithm='dflash',world_size=8,batch_size=4,accumulation_steps=8,num_epochs=5,
             block_size=8,num_draft_layers=5,num_anchors=512,image_max_tokens=1024,seed=42,sampler_seed=0,
             max_length=4096,learning_rate=.0006,weight_decay=0.,warmup_ratio=.04,max_grad_norm=1.,use_muon=False,
             loss_decay_gamma=4.,objective_chunk_blocks=512,train_data=str(data),target_model=str(target),
-            data_sha256=prep.digest(data),eligible_samples=1,eligible_indices_sha256='fixture',debug_max_samples=0,
+            data_sha256=prep.digest(data),eligible_samples=64,samples_per_rank=8,total_optimizer_steps=2,
+            eligible_indices_sha256='fixture',debug_max_samples=0,
             debug_max_steps=None,report_to='tensorboard')
         old={}
         for name in prep.OLD:
@@ -95,6 +96,32 @@ class SupplementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Training JSONL differs'):self.prepare()
         self.assertFalse(self.args.output_dir.exists())
 
+    def test_four_rank_layout_preserves_global_batch_and_actual_step_budget(self):
+        base=dict(self.cfg,eligible_samples=56712)
+        four=prep.training_layout(base,4);eight=prep.training_layout(base,8)
+        self.assertEqual((four['accumulation_steps'],eight['accumulation_steps']),(16,8))
+        self.assertEqual((four['samples_per_rank'],eight['samples_per_rank']),(14178,7089))
+        self.assertEqual((four['total_optimizer_steps'],eight['total_optimizer_steps']),(1108,1108))
+        for world in (4,8):
+            cfg=prep.training_layout(base,world)
+            self.assertEqual(cfg['world_size']*cfg['batch_size']*cfg['accumulation_steps'],256)
+
+    def test_four_rank_nested_supplement_finalizes_without_changing_old_results(self):
+        self.args.world_size=4;self.args.output_dir=self.baseline/'recent_supplement_4gpu_fixture'
+        self.prepare();result=self.finish()
+        self.assertEqual(result['training_layout']['world_size'],4)
+        self.assertEqual(result['training_layout']['accumulation_steps'],16)
+        for name in prep.NEW:
+            cfg=prep.read(self.args.output_dir/name/'effective_config.json')
+            self.assertEqual((cfg['world_size'],cfg['batch_size'],cfg['accumulation_steps']),(4,4,16))
+        for path,content in self.old_bytes.items():self.assertEqual(path.read_bytes(),content)
+
+    def test_old_group_root_and_old_model_children_remain_reserved(self):
+        for output in (self.baseline,self.baseline/'full/new_run'):
+            self.args.output_dir=output
+            with self.assertRaises(FileExistsError):self.prepare()
+        for path,content in self.old_bytes.items():self.assertEqual(path.read_bytes(),content)
+
     def test_real_training_config_loader_accepts_all_new_modes_and_keeps_recipe(self):
         self.prepare()
         path=HERE.parent/'litespec/vlm/train_aligned.py'
@@ -140,7 +167,8 @@ class SupplementTests(unittest.TestCase):
         write_json(path,dict(prep.read(path),learning_rate=.01))
         with self.assertRaisesRegex(ValueError,'Completed training recipe mismatch'):prep.finalize(self.args.output_dir)
 
-    def exercise_shell(self,fail_check=False,fail_mode=''):
+    def exercise_shell(self,fail_check=False,fail_mode='',world=8,nested=False):
+        if nested:self.args.output_dir=self.baseline/'recent_supplement_4gpu_fixture'
         repo=self.root/'repo';(repo/'tests').mkdir(parents=True);(repo/'scripts/dlite').mkdir(parents=True)
         for name in ('train_dflash_recent_supplement.sh','evaluate_dflash_recent_supplement.sh',
                      'prepare_dflash_recent_supplement.py','evaluate_dflash_all.py'):
@@ -187,6 +215,7 @@ PY
             PATH=str(bindir)+':'+os.environ['PATH'],FAIL_CHECK='1' if fail_check else '0',FAIL_MODE=fail_mode,
             INIT_CHECKPOINT='/stale',RESUME='/stale',MAX_STEPS='1',EPOCHS='99',TRAIN_DATA='/stale',
             MICRO_BATCH_SIZE='99',ACCUMULATION_STEPS='99',NPROC_PER_NODE='4',MAX_SAMPLES='16')
+        env['TRAIN_GPUS']=','.join(map(str,range(world)))
         result=subprocess.run(['bash',str(repo/'tests/train_dflash_recent_supplement.sh')],env=env,capture_output=True,text=True)
         rows=[json.loads(line) for line in events.read_text().splitlines()]
         for path,content in self.old_bytes.items():self.assertEqual(path.read_bytes(),content)
@@ -211,6 +240,20 @@ PY
         result,rows=self.exercise_shell(fail_check=True)
         self.assertNotEqual(result.returncode,0)
         self.assertFalse(any(r['event'] in ('train','evaluate_all','evaluate_long') for r in rows))
+
+    def test_four_card_launcher_writes_fresh_child_and_uses_sixteen_accumulation(self):
+        result,rows=self.exercise_shell(world=4,nested=True)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        trains=[r for r in rows if r['event']=='train']
+        self.assertEqual([r['mode'] for r in trains],list(prep.NEW))
+        for row in trains:
+            env=row['env']
+            self.assertEqual([env[k] for k in ('NPROC_PER_NODE','EPOCHS','MICRO_BATCH_SIZE','ACCUMULATION_STEPS')],['4','5','4','16'])
+            self.assertEqual(Path(env['OUTPUT_DIR']).parent,self.args.output_dir)
+        fsdp=next(r for r in rows if r['event']=='python' and '--fsdp' in r['args'])
+        self.assertIn('--nproc-per-node=4',fsdp['args'])
+        evaluation=next(r for r in rows if r['event']=='evaluate_all')
+        self.assertEqual(evaluation['env']['EVAL_GPUS'],'0 1 2 3')
 
     def test_training_failure_stops_before_remaining_models_and_evaluation(self):
         result,rows=self.exercise_shell(fail_mode='recent64')

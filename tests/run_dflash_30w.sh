@@ -18,6 +18,9 @@ export EVAL_GPUS="${CUDA_VISIBLE_DEVICES//,/ }" LONGCTX_GPUS="${CUDA_VISIBLE_DEV
 export BLOCK_SIZES="${BLOCK_SIZES:-8,16}"
 case "$BLOCK_SIZES" in 8|16|8,16) ;; *) echo 'BLOCK_SIZES must be 8, 16 or 8,16' >&2; exit 2 ;; esac
 IFS=, read -r -a blocks <<< "$BLOCK_SIZES"
+export TRAIN_CONTEXTS="${TRAIN_CONTEXTS:-full,pivot1}"
+case "$TRAIN_CONTEXTS" in full|pivot1|full,pivot1) ;; *) echo 'TRAIN_CONTEXTS must be full, pivot1 or full,pivot1' >&2; exit 2 ;; esac
+IFS=, read -r -a contexts <<< "$TRAIN_CONTEXTS"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1 TORCH_DISABLE_ADDR2LINE=1
 export VALIDATION_WORKERS="${VALIDATION_WORKERS:-8}"
@@ -53,13 +56,17 @@ if [[ "$stage" == all || "$stage" == data ]]; then
 fi
 export MAX_SAMPLES=0
 mkdir -p "$DATA_ROOT"
+evaluation_source_tmp="$(mktemp)"
 "$PYTHON_BIN" tests/dflash_30w.py inputs --workspace "$DLITE_WORKSPACE" \
-    --longctx-data-dir "$LONGCTX_DATA_DIR" --result-file "$DATA_ROOT/evaluation_source.env"
-source "$DATA_ROOT/evaluation_source.env"
+    --longctx-data-dir "$LONGCTX_DATA_DIR" --result-file "$evaluation_source_tmp" || {
+    rm -f -- "$evaluation_source_tmp"; exit 1;
+}
+source "$evaluation_source_tmp"
+rm -f -- "$evaluation_source_tmp"
 if [[ "$stage" != eval ]]; then
-    export RUN_GROUP="${SUITE_RUN_GROUP:-$DLITE_WORKSPACE/runs/dflash_full_pivot1_30w_5ep_b${BLOCK_SIZES//,/_b}_mb2_acc32_$(date +%Y%m%d_%H%M%S)_$$}"
+    export RUN_GROUP="${SUITE_RUN_GROUP:-$DLITE_WORKSPACE/runs/dflash_${TRAIN_CONTEXTS//,/_}_30w_5ep_b${BLOCK_SIZES//,/_b}_mb2_acc32_$(date +%Y%m%d_%H%M%S)_$$}"
     "$PYTHON_BIN" tests/dflash_30w.py run --common "$COMMON_DATA_DIR" \
-        --target-model "$TARGET_MODEL" --run-group "$RUN_GROUP" --blocks "${blocks[@]}"
+        --target-model "$TARGET_MODEL" --run-group "$RUN_GROUP" --blocks "${blocks[@]}" --contexts "${contexts[@]}"
     source "$RUN_GROUP/launch.env"
     read -r -a variants <<< "${RUN_VARIANTS:-full_b8 pivot1_b8 full_b16 pivot1_b16}"
     "$PYTHON_BIN" - <<'PY'

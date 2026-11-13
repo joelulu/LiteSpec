@@ -13,6 +13,14 @@ Both reuse the SAME common data and two preflight caches; block16 does not need
 to regenerate answers. Leave `BLOCK_SIZES` unset (or `8,16`) for all four runs.
 Generation, CPU-import visibility and evaluation follow the selected GPUs too.
 
+To split by context, set `TRAIN_CONTEXTS=full` on GPUs0-3 and
+`TRAIN_CONTEXTS=pivot1` on GPUs4-7, both with `BLOCK_SIZES=8,16`.
+Run the `dflash_30w.py data` command once on completed regeneration before
+starting both `train` launchers concurrently. This avoids launching generation
+again and fixes shared eligibility before either trainer starts. Context groups
+finalize and evaluate independently; Pivot-only /Full ratios are unavailable
+until combined with Full controls, while same-GPU AR ratios remain available.
+
 ## Data
 
 The existing confirmed FineVision adapter reads `conversations[0].content`,

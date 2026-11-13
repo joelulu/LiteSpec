@@ -195,7 +195,7 @@ def report(root,jobs):
         controls={s['model']:s for s in summaries}
         for s in summaries:
             reference = 'full' if 'full' in controls else ('full_b16' if s['model'].endswith('_b16') or 'full_b8' not in controls else 'full_b8')
-            full = controls[reference]
+            full = controls.get(reference)
             first,later,calls=[],0.0,0
             cache_bytes,raw_bytes=[],[]
             path=output/f"{s['model']}_b1_profile.jsonl"
@@ -214,12 +214,12 @@ def report(root,jobs):
                 committed=s['mean_committed_length'],first_hit=s.get('first_candidate_hit_rate'),
                 ac_len=s['mean_accepted_draft_tokens'],
                 tok_s=s['output_tokens_per_second'],ratio_vs_ar=s['raw_throughput_speedup_vs_ar'],
-                ratio_vs_full=s['output_tokens_per_second']/full['output_tokens_per_second'],
+                ratio_vs_full=s['output_tokens_per_second']/full['output_tokens_per_second'] if full else None,
                 prefill_s=s['prefill_seconds'],decode_s=s['decode_seconds'],total_s=s['wall_seconds'],
                 first_draft_ms=statistics.mean(first) if first else None,later_draft_ms=later/calls if calls else None,
                 final_draft_kv_mib=statistics.mean(cache_bytes)/1024**2 if cache_bytes else None,
                 final_raw_hidden_mib=statistics.mean(raw_bytes)/1024**2 if raw_bytes else None,
-                total_latency_ratio_vs_full=full['wall_seconds']/s['wall_seconds'],
+                total_latency_ratio_vs_full=full['wall_seconds']/s['wall_seconds'] if full else None,
                 peak_gib=s['peak_allocated_gib'],matched=s['matched'],requests=s['requests']))
     write_json(root/'longctx_comparison.json',rows)
     if rows:
@@ -236,8 +236,9 @@ def report(root,jobs):
     for r in rows:
         ac_len='—' if r['ac_len'] is None else f"{r['ac_len']:.3f}"
         committed='—' if r['committed'] is None else f"{r['committed']:.3f}"
+        full_ratio='—' if r['ratio_vs_full'] is None else f"{r['ratio_vs_full']:.3f}"
         lines.append(f"| {r['length_bin'] or 'short'} | {r['repeat']} | {r['gpu']} | {r['model']} | {r['input_tokens']:.0f} | "
-            f"{r['output_tokens_per_prompt']:.1f} | {ac_len} | {committed} | {r['tok_s']:.2f} | {r['ratio_vs_ar']:.3f} | {r['ratio_vs_full']:.3f} | "
+            f"{r['output_tokens_per_prompt']:.1f} | {ac_len} | {committed} | {r['tok_s']:.2f} | {r['ratio_vs_ar']:.3f} | {full_ratio} | "
             f"{r['prefill_s']:.2f} | {r['decode_s']:.2f} | {r['total_s']:.2f} | {r['peak_gib']:.2f} | {r['matched']}/{r['requests']} |")
     if any(r['model']=='ar' and r['output_tokens_per_prompt']<64 for r in rows):
         lines+=['','AR outputs average fewer than 64 tokens in at least one cell; inspect output lengths before interpreting steady decode gains.']

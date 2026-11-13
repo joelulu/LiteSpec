@@ -33,7 +33,7 @@ def check(device='cpu', flex=False):
     if flex and not str(device).startswith('cuda'): raise ValueError('Flex check requires CUDA')
     dtype=torch.bfloat16 if str(device).startswith('cuda') else torch.float32
     torch.set_num_threads(1)
-    for label,(mode,block) in selected_variants(os.environ.get('BLOCK_SIZES','8,16')).items():
+    for label,(mode,block) in selected_variants(os.environ.get('BLOCK_SIZES','8,16'),os.environ.get('TRAIN_CONTEXTS','full,pivot1')).items():
         torch.manual_seed(42)
         draft=tiny(mode,block,device,dtype).eval()
         emb=torch.nn.Embedding(128,64,device=device,dtype=dtype).requires_grad_(False)
@@ -93,7 +93,7 @@ def check_fsdp():
     dist.init_process_group('nccl',timeout=timedelta(minutes=20))
     try:
         assert dist.get_world_size()==4
-        for label,(mode,block) in selected_variants(os.environ.get('BLOCK_SIZES','8,16')).items():
+        for label,(mode,block) in selected_variants(os.environ.get('BLOCK_SIZES','8,16'),os.environ.get('TRAIN_CONTEXTS','full,pivot1')).items():
             torch.manual_seed(42)
             draft=tiny(mode,block,device,torch.bfloat16).train()
             draft.config._attn_implementation='flex_attention'

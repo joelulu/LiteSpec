@@ -43,12 +43,13 @@ class SuiteTests(unittest.TestCase):
             dict(target_model=str(self.target),target=all_eval.fingerprint(self.target),
                  source_files={str(self.source):cli.sha(self.source)},candidates=300000),reuse)
 
-    def run_fixture(self,blocks=(8,16)):
+    def run_fixture(self,blocks=(8,16),contexts=('full','pivot1')):
         if not self.common.exists(): self.common_fixture()
         group=self.root/('run' if tuple(blocks)==(8,16) else 'run_b'+'_'.join(map(str,blocks)))
+        if tuple(contexts)!=('full','pivot1'):group=group.with_name(group.name+'_'+'_'.join(contexts))
         with patch.object(cli.subprocess,'check_output',return_value='test-head\n'),redirect_stdout(io.StringIO()):
-            cli.prepare_run(argparse.Namespace(common=self.common,target_model=self.target,run_group=group,blocks=blocks))
-        for label,(mode,block) in cli.selected_variants(blocks).items():
+            cli.prepare_run(argparse.Namespace(common=self.common,target_model=self.target,run_group=group,blocks=blocks,contexts=contexts))
+        for label,(mode,block) in cli.selected_variants(blocks,contexts).items():
             directory=group/label
             cfg=dict(cli.RECIPE,block_size=block,draft_context=mode,world_size=4,
                      target_model=str(self.target),train_data=str(self.common/'train.jsonl'),
@@ -194,7 +195,7 @@ class SuiteTests(unittest.TestCase):
         verify.assert_called_once_with(args.longctx_data_dir)
         self.assertIn('/previous',args.result_file.read_text())
 
-    def exercise_shell(self,fail=None,blocks='8,16',gpus='0,1,2,3'):
+    def exercise_shell(self,fail=None,blocks='8,16',gpus='0,1,2,3',contexts='full,pivot1'):
         repo=self.root/'shell';(repo/'tests').mkdir(parents=True)
         (repo/'scripts/data').mkdir(parents=True);(repo/'scripts/dlite').mkdir(parents=True)
         shutil.copy(HERE/'run_dflash_30w.sh',repo/'tests')
@@ -209,7 +210,7 @@ if 'dflash_30w.py' in ' '.join(a):
  if a[1]=='data':Path(os.environ['COMMON_DATA_DIR']).mkdir(parents=True)
  if a[1]=='run':
   root=Path(os.environ['RUN_GROUP']);root.mkdir()
-  labels=[mode+'_b'+b for b in os.environ['BLOCK_SIZES'].split(',') for mode in ('full','pivot1')]
+  labels=[mode+'_b'+b for b in os.environ['BLOCK_SIZES'].split(',') for mode in os.environ['TRAIN_CONTEXTS'].split(',')]
   (root/'launch.env').write_text('export TRAIN_DATA='+os.environ['COMMON_DATA_DIR']+'/train.jsonl\\n'+'export RUN_VARIANTS="'+' '.join(labels)+'"\\n')
   for label in labels:(root/label).mkdir()
 if os.environ.get('FAIL_STAGE') and os.environ['FAIL_STAGE'] in ' '.join(a):sys.exit(1)
@@ -222,7 +223,7 @@ if os.environ.get('FAIL_STAGE') and os.environ['FAIL_STAGE'] in ' '.join(a):sys.
         env=dict(os.environ,PYTHON_BIN=str(python),TARGET_MODEL=str(self.target),SOURCE_DATA=str(raw),
             DATA_ROOT=str(data),SUITE_RUN_GROUP=str(group),CALLS=str(log),FAIL_STAGE=fail or '',
             MICRO_BATCH_SIZE='99',ACCUMULATION_STEPS='99',MAX_SAMPLES='7',INIT_CHECKPOINT='/old',
-            DATA_GPUS='4,5,6,7',CUDA_VISIBLE_DEVICES='4,5,6,7',BLOCK_SIZES=blocks,TRAIN_GPUS=gpus)
+            DATA_GPUS='4,5,6,7',CUDA_VISIBLE_DEVICES='4,5,6,7',BLOCK_SIZES=blocks,TRAIN_GPUS=gpus,TRAIN_CONTEXTS=contexts)
         result=subprocess.run(['bash',str(repo/'tests/run_dflash_30w.sh'),'all'],env=env,capture_output=True,text=True)
         return result,[json.loads(l) for l in log.read_text().splitlines()]
 
@@ -267,6 +268,24 @@ if os.environ.get('FAIL_STAGE') and os.environ['FAIL_STAGE'] in ' '.join(a):sys.
         result,calls=self.exercise_shell('inputs')
         self.assertNotEqual(result.returncode,0)
         self.assertFalse(any(r['args'][0]=='scripts/dlite/run_training_vlm.sh' for r in calls))
+
+    def test_context_groups_finalize_independently(self):
+        for context in ('full','pivot1'):
+            group=self.run_fixture(contexts=[context])
+            self.assertEqual(set(cli.finalize(group)['checkpoints']),{context+'_b8',context+'_b16'})
+
+    def test_full_only_front_gpu_launcher(self):
+        result,calls=self.exercise_shell(contexts='full')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rows=[r for r in calls if r['args'][0]=='scripts/dlite/run_training_vlm.sh']
+        self.assertEqual([Path(r['env']['CONFIG']).parent.name for r in rows],['full_b8','full_b16'])
+
+    def test_pivot_only_back_gpu_launcher(self):
+        result,calls=self.exercise_shell(contexts='pivot1',gpus='4,5,6,7')
+        self.assertEqual(result.returncode,0,result.stderr)
+        rows=[r for r in calls if r['args'][0]=='scripts/dlite/run_training_vlm.sh']
+        self.assertEqual([Path(r['env']['CONFIG']).parent.name for r in rows],['pivot1_b8','pivot1_b16'])
+        self.assertTrue(all(r['env']['CUDA_VISIBLE_DEVICES']=='4,5,6,7' for r in rows))
 
 
 if __name__=='__main__':unittest.main()

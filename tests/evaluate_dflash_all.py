@@ -213,6 +213,12 @@ def normalized(job, row, full=None):
                 matched=row["matched"], requests=row["requests"], peak_gib=row["peak_allocated_gib"])
 
 
+def matching_full(rows, row):
+    label = 'full_b16' if row['model'].endswith('_b16') else 'full_b8'
+    return next((r for r in rows if r['model'] == label),
+                next((r for r in rows if r['model'] == 'full'), None))
+
+
 def read_summary(job, batch_size):
     rows = json.loads((Path(job["output"]) / "summary.json").read_text())
     labels = [row["model"] for row in rows]
@@ -222,8 +228,7 @@ def read_summary(job, batch_size):
     if any(row["batch_size"] != batch_size or row["requests"] != job["samples"] * batch_size for row in rows):
         raise ValueError("Summary batch/sample counts differ from the requested job")
     # Token mismatches remain visible but do not hide measured throughput.
-    full=next((row for row in rows if row['model']=='full'),None)
-    return [normalized(job, row, full) for row in rows]
+    return [normalized(job, row, matching_full(rows, row)) for row in rows]
 
 
 def report(root, jobs, statuses):
@@ -231,8 +236,7 @@ def report(root, jobs, statuses):
     for job in jobs:
         if statuses.get(job["dataset"], {}).get("status") == "success":
             data = json.loads((Path(job["output"]) / "summary.json").read_text())
-            full=next((row for row in data if row['model']=='full'),None)
-            rows.extend(normalized(job, row, full) for row in data)
+            rows.extend(normalized(job, row, matching_full(data, row)) for row in data)
     write_json(root / "status.json", statuses)
     write_json(root / "comparison.json", rows)
     with (root / "comparison.csv").open("w", newline="") as handle:
@@ -241,6 +245,7 @@ def report(root, jobs, statuses):
         writer.writerows(rows)
     lines = ["# DFlash evaluation", "",
              "B is static batch size. Ratios use same-GPU AR; timing is decode-only.",
+             "Block8/16 suites use the matching Full block for /Full; AR rows use Full block8.",
              "Video-MME uses the existing video-description protocol, not official QA accuracy.", "",
              "ac len counts accepted Draft tokens; Committed includes the Target token.", "",
              "| Dataset | GPU | Model | B | ac len | Committed | First hit | tok/s | Speedup / AR | / Full | AR match | Peak GiB |",
@@ -386,3 +391,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

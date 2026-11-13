@@ -58,6 +58,17 @@ def filler_for(row,reports,tokenizer,needed,seed):
 
 
 def resolve_models(args):
+    if getattr(args, 'suite_run_group', None) is not None:
+        from dflash_30w import finalize
+        saved = finalize(args.suite_run_group)
+        models, target = saved['checkpoints'], saved['target']
+        args.models = list(models)
+        for label, item in [('target', target), *models.items()]:
+            cfg = json.loads((Path(item['path']) / 'config.json').read_text())
+            limit = cfg.get('text_config', cfg).get('max_position_embeddings')
+            if limit is not None and max(args.lengths) + args.max_new_tokens > limit:
+                raise ValueError(f'{label}: requested context exceeds configured limit {limit}')
+        return Path(args.suite_run_group).resolve(), models, target
     source=source_directory(args.workspace,args.source_eval_dir)
     prior=json.loads((source/'manifest.json').read_text())
     group=Path(prior['run_group'])
@@ -181,8 +192,10 @@ def report(root,jobs):
     for job in jobs:
         if statuses[job['dataset']]['status']!='success':continue
         output=Path(job['output']);summaries=json.loads((output/'summary.json').read_text())
-        full=next(s for s in summaries if s['model']=='full')
+        controls={s['model']:s for s in summaries}
         for s in summaries:
+            reference = 'full' if 'full' in controls else ('full_b16' if s['model'].endswith('_b16') else 'full_b8')
+            full = controls[reference]
             first,later,calls=[],0.0,0
             cache_bytes,raw_bytes=[],[]
             path=output/f"{s['model']}_b1_profile.jsonl"
@@ -214,6 +227,7 @@ def report(root,jobs):
             writer=csv.DictWriter(handle,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
     lines=['# Full vs Pivot context length sweep','',
         'B=1; same prompts at every length, each ratio uses a same-GPU baseline. All samples contribute.',
+        'For block8/16 suites, /Full uses the Full model with the same block size (AR rows use Full block8).',
         'Input tokens include visual placeholders and chat overhead. Profile timings are from a separate pass.',
         'ac len counts accepted Draft tokens per speculative round; Committed also includes the Target token.',
         'AR mismatches and natural EOS remain visible; no task-accuracy or lossless-speedup claim.','',
@@ -241,6 +255,7 @@ def main(argv=None):
     parser.add_argument('--report-only',type=Path,metavar='RESULT_DIR',help='Rebuild tables from existing manifest/status/summaries without loading models')
     parser.add_argument('--source-eval-dir',type=Path)
     parser.add_argument('--supplement-run-group',type=Path)
+    parser.add_argument('--suite-run-group',type=Path,help='Finalized Full/Pivot1 block8/16 training group')
     parser.add_argument('--models',nargs='+',choices=AVAILABLE_MODELS,default=list(DEFAULT_MODELS))
     parser.add_argument('--samples',type=int,default=16)
     parser.add_argument('--lengths',type=int,nargs='+',default=[0,8192,32768,65536])
@@ -296,3 +311,4 @@ def main(argv=None):
 
 
 if __name__=='__main__':raise SystemExit(main())
+

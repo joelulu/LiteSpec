@@ -40,7 +40,15 @@ def summarize_batches(results, batch_size):
     total = sum(row["total_seconds"] for row in results)
     lengths = [length for row in results for length in row["accept_lengths"]]
     opportunities = sum(row.get("first_candidate_opportunities", 0) for row in results)
+    width = max((len(r.get('draft_position_opportunities', [])) for r in results), default=0)
+    totals = {key: [sum(r.get(key, [])[i] if i < len(r.get(key, [])) else 0 for r in results)
+                    for i in range(width)] for key in ('draft_position_agreement_hits',
+                    'draft_position_prefix_hits', 'draft_position_opportunities')}
+    counts = totals['draft_position_opportunities']
     return dict(batch_size=batch_size, concurrency=batch_size, unique_prompts=len(results),
+        draft_position_verifier_agreement=[h/n if n else None for h,n in zip(totals['draft_position_agreement_hits'],counts)],
+        draft_position_prefix_acceptance=[h/n if n else None for h,n in zip(totals['draft_position_prefix_hits'],counts)],
+        draft_position_opportunities=counts,
         requests=len(results)*batch_size, output_tokens=tokens,
         first_candidate_hit_rate=(sum(row.get("first_candidate_hits", 0) for row in results)/opportunities if opportunities else None),
         output_tokens_per_second=tokens/decode, decode_tokens_per_second=tokens/decode,
@@ -334,4 +342,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

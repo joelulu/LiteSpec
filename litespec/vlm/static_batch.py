@@ -162,6 +162,8 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
     blocks, lengths, emitted, replays, target_calls = [], [], 0, 0, 0
     peak_snapshot_bytes = 0
     first_candidate_hits = first_candidate_opportunities = 0
+    position_width = draft.block_size - 1 if draft is not None else 0
+    position_agreements = []
     while emitted < max_new_tokens:
         if draft is None:
             if timeline: timeline.mark("emit")
@@ -218,7 +220,10 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
                 target_calls += 1
                 if timeline: timeline.mark("acceptance")
                 predictions = output.logits.argmax(-1)
-                accepted = (candidates[:, 1:] == predictions[:, :-1]).cumprod(1).sum(1)
+                agreement = candidates[:, 1:] == predictions[:, :-1]
+                prefix_agreement = agreement.cumprod(1)
+                position_agreements.append(agreement)
+                accepted = prefix_agreement.sum(1)
                 kept = int(accepted.min()) + 1
                 if augmentation_state is not None:
                     augmentation_state.capture_feedback(output.hidden_states, candidates, kept, predictions)
@@ -284,6 +289,17 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
             del output
     if timeline: timeline.mark(None)
     finished = clock(device)
+    # Reduce tiny verifier masks on CPU AFTER the decode timer. No diagnostic
+    # GPU reductions or host transfers are added to each timed drafting round.
+    position_hits = torch.zeros(position_width, dtype=torch.long)
+    position_prefix_hits = torch.zeros_like(position_hits)
+    position_opportunities = torch.zeros_like(position_hits)
+    for agreement in position_agreements:
+        agreement = agreement.cpu().long()
+        n = agreement.shape[1]
+        position_hits[:n] += agreement.sum(0)
+        position_prefix_hits[:n] += agreement.cumprod(1).sum(0)
+        position_opportunities[:n] += batch_size
     tokens = torch.cat(blocks, 1)
     if not torch.equal(tokens, tokens[:1].expand_as(tokens)):
         raise RuntimeError("greedy replicas diverged within a batch; lockstep replicated-input benchmark assumptions failed")
@@ -297,6 +313,9 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
         recovery_replays=replays, replicas_identical=True,
         first_candidate_hits=first_candidate_hits,
         first_candidate_opportunities=first_candidate_opportunities,
+        draft_position_agreement_hits=position_hits.tolist(),
+        draft_position_prefix_hits=position_prefix_hits.tolist(),
+        draft_position_opportunities=position_opportunities.tolist(),
         cache_policy="preallocated_attention_kv_recurrent_snapshot_and_prefix_replay",
         verification=verification, state_mode=state_mode,
         gdn_verify_backend="native_hf" if transaction is None else
@@ -314,5 +333,6 @@ def _generate_static_batch(target, draft, example, *, batch_size, max_new_tokens
             from .inference_profile import draft_cache_snapshot
             result['profile']['draft_cache'] = draft_cache_snapshot(history, draft)
     return result
+
 
 

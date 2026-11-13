@@ -216,7 +216,7 @@ def normalized(job, row, full=None):
 def matching_full(rows, row):
     label = 'full_b16' if row['model'].endswith('_b16') else 'full_b8'
     return next((r for r in rows if r['model'] == label),
-                next((r for r in rows if r['model'] == 'full'), None))
+                next((r for r in rows if r['model'] in ('full','full_b8','full_b16')), None))
 
 
 def read_summary(job, batch_size):
@@ -245,7 +245,7 @@ def report(root, jobs, statuses):
         writer.writerows(rows)
     lines = ["# DFlash evaluation", "",
              "B is static batch size. Ratios use same-GPU AR; timing is decode-only.",
-             "Block8/16 suites use the matching Full block for /Full; AR rows use Full block8.",
+             "Block8/16 suites use the matching Full block for /Full; AR uses the available Full control.",
              "Video-MME uses the existing video-description protocol, not official QA accuracy.", "",
              "ac len counts accepted Draft tokens; Committed includes the Target token.", "",
              "| Dataset | GPU | Model | B | ac len | Committed | First hit | tok/s | Speedup / AR | / Full | AR match | Peak GiB |",

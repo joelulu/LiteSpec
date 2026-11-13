@@ -25,6 +25,14 @@ RECIPE = dict(algorithm='dflash', num_epochs=5, batch_size=2, accumulation_steps
               save_interval=10**12, log_interval=1)
 
 
+def selected_variants(blocks):
+    if isinstance(blocks, str): blocks = [int(b) for b in blocks.split(',')]
+    blocks = list(blocks)
+    if not blocks or len(set(blocks)) != len(blocks) or any(b not in (8,16) for b in blocks):
+        raise ValueError('Choose block 8, 16, or both without duplicates')
+    return {label: value for label,value in VARIANTS.items() if value[1] in blocks}
+
+
 def read(path):
     return json.loads(Path(path).read_text())
 
@@ -217,8 +225,10 @@ def prepare_run(args):
     if root.exists():
         raise FileExistsError(f'Choose a new training run group: {root}')
     root.mkdir(parents=True)
+    blocks = sorted(getattr(args, 'blocks', [8,16]))
+    variants = selected_variants(blocks)
     hashes = {}
-    for label, (mode, block) in VARIANTS.items():
+    for label, (mode, block) in variants.items():
         directory = root / label
         directory.mkdir()
         cfg = config(mode, block)
@@ -228,13 +238,14 @@ def prepare_run(args):
         hashes[label] = sha(path)
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=HERE.parent, text=True).strip()
     common = args.common.expanduser().resolve()
-    write(root / 'experiment.json', dict(schema='dflash_30w_b8_b16_v1', variants=VARIANTS,
+    write(root / 'experiment.json', dict(schema='dflash_30w_b8_b16_v1', variants=variants, blocks=blocks,
         common=str(common), common_manifest_sha256=sha(common / 'manifest.json'),
         config_sha256=hashes, target=saved['target'], recipe=RECIPE, world_size=4,
         global_batch=256, initialization='from_scratch', git_commit=revision,
         data_sha256=sha(saved['train_data']), eligible_samples=saved['eligible_samples']))
     (root / 'launch.env').write_text(''.join('export ' + k + '=' + shlex.quote(v) + '\n' for k, v in
-        dict(TRAIN_DATA=saved['train_data'], TARGET_MODEL=saved['target_model'], COMMON_DATA_DIR=str(common)).items()))
+        dict(TRAIN_DATA=saved['train_data'], TARGET_MODEL=saved['target_model'], COMMON_DATA_DIR=str(common),
+             RUN_VARIANTS=' '.join(variants), BLOCK_SIZES=','.join(map(str,blocks))).items()))
     print(f'Run: {root}; eligible={saved["eligible_samples"]}; 4x2x32=256; 5 epochs', flush=True)
 
 
@@ -248,8 +259,11 @@ def finalize(root):
     if sha(common / 'manifest.json') != saved['common_manifest_sha256']:
         raise ValueError('Common-data manifest changed')
     data = verify_common(common)
+    variants = selected_variants(saved.get('blocks', [8,16]))
+    if {k:tuple(v) for k,v in saved['variants'].items()} != variants:
+        raise ValueError('Run variants differ from selected block sizes')
     checkpoints = {}
-    for label, (mode, block) in VARIANTS.items():
+    for label, (mode, block) in variants.items():
         directory = root / label
         if sha(directory / 'config.yaml') != saved['config_sha256'][label]:
             raise ValueError(f'Config changed: {label}')
@@ -319,6 +333,7 @@ def main():
     run.add_argument('--common', type=Path, required=True)
     run.add_argument('--target-model', type=Path, required=True)
     run.add_argument('--run-group', type=Path, required=True)
+    run.add_argument('--blocks', type=int, nargs='+', choices=(8,16), default=[8,16])
     done = sub.add_parser('finalize')
     done.add_argument('--run-group', type=Path, required=True)
     verify = sub.add_parser('verify')

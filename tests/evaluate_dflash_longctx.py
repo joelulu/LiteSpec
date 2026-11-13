@@ -194,7 +194,7 @@ def report(root,jobs):
         output=Path(job['output']);summaries=json.loads((output/'summary.json').read_text())
         controls={s['model']:s for s in summaries}
         for s in summaries:
-            reference = 'full' if 'full' in controls else ('full_b16' if s['model'].endswith('_b16') else 'full_b8')
+            reference = 'full' if 'full' in controls else ('full_b16' if s['model'].endswith('_b16') or 'full_b8' not in controls else 'full_b8')
             full = controls[reference]
             first,later,calls=[],0.0,0
             cache_bytes,raw_bytes=[],[]
@@ -227,7 +227,7 @@ def report(root,jobs):
             writer=csv.DictWriter(handle,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
     lines=['# Full vs Pivot context length sweep','',
         'B=1; same prompts at every length, each ratio uses a same-GPU baseline. All samples contribute.',
-        'For block8/16 suites, /Full uses the Full model with the same block size (AR rows use Full block8).',
+        'For block8/16 suites, /Full uses the matching Full block; AR uses Full block8 when present, otherwise Full block16.',
         'Input tokens include visual placeholders and chat overhead. Profile timings are from a separate pass.',
         'ac len counts accepted Draft tokens per speculative round; Committed also includes the Target token.',
         'AR mismatches and natural EOS remain visible; no task-accuracy or lossless-speedup claim.','',

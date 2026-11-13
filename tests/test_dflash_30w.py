@@ -43,11 +43,12 @@ class SuiteTests(unittest.TestCase):
             dict(target_model=str(self.target),target=all_eval.fingerprint(self.target),
                  source_files={str(self.source):cli.sha(self.source)},candidates=300000),reuse)
 
-    def run_fixture(self):
-        self.common_fixture();group=self.root/'run'
+    def run_fixture(self,blocks=(8,16)):
+        if not self.common.exists(): self.common_fixture()
+        group=self.root/('run' if tuple(blocks)==(8,16) else 'run_b'+'_'.join(map(str,blocks)))
         with patch.object(cli.subprocess,'check_output',return_value='test-head\n'),redirect_stdout(io.StringIO()):
-            cli.prepare_run(argparse.Namespace(common=self.common,target_model=self.target,run_group=group))
-        for label,(mode,block) in cli.VARIANTS.items():
+            cli.prepare_run(argparse.Namespace(common=self.common,target_model=self.target,run_group=group,blocks=blocks))
+        for label,(mode,block) in cli.selected_variants(blocks).items():
             directory=group/label
             cfg=dict(cli.RECIPE,block_size=block,draft_context=mode,world_size=4,
                      target_model=str(self.target),train_data=str(self.common/'train.jsonl'),
@@ -168,6 +169,19 @@ class SuiteTests(unittest.TestCase):
         self.assertEqual(all_eval.matching_full(rows,rows[-1])['model'],'full_b16')
         self.assertEqual(all_eval.matching_full(rows,rows[2])['model'],'full_b8')
 
+    def test_independent_b8_and_b16_groups_finalize_and_long_eval(self):
+        for block in (8,16):
+            group=self.run_fixture([block]);wanted={f'full_b{block}',f'pivot1_b{block}'}
+            saved=cli.finalize(group)
+            self.assertEqual(set(saved['checkpoints']),wanted)
+            self.assertEqual(set(saved['variants']),wanted)
+            self.assertFalse((group/f'full_b{24-block}').exists())
+            args=argparse.Namespace(suite_run_group=group,lengths=[0,65536],max_new_tokens=256)
+            _,models,_=long_eval.resolve_models(args)
+            self.assertEqual(set(models),wanted)
+            rows=[dict(model='ar'),dict(model=f'full_b{block}'),dict(model=f'pivot1_b{block}')]
+            self.assertEqual(all_eval.matching_full(rows,rows[0])['model'],f'full_b{block}')
+
     def test_inputs_accept_existing_100_record_long_context_pool(self):
         import prepare_longctx_data
         args=argparse.Namespace(workspace=self.root,longctx_data_dir=self.root/'longctx100',
@@ -180,7 +194,7 @@ class SuiteTests(unittest.TestCase):
         verify.assert_called_once_with(args.longctx_data_dir)
         self.assertIn('/previous',args.result_file.read_text())
 
-    def exercise_shell(self,fail=None):
+    def exercise_shell(self,fail=None,blocks='8,16',gpus='0,1,2,3'):
         repo=self.root/'shell';(repo/'tests').mkdir(parents=True)
         (repo/'scripts/data').mkdir(parents=True);(repo/'scripts/dlite').mkdir(parents=True)
         shutil.copy(HERE/'run_dflash_30w.sh',repo/'tests')
@@ -195,8 +209,9 @@ if 'dflash_30w.py' in ' '.join(a):
  if a[1]=='data':Path(os.environ['COMMON_DATA_DIR']).mkdir(parents=True)
  if a[1]=='run':
   root=Path(os.environ['RUN_GROUP']);root.mkdir()
-  (root/'launch.env').write_text('export TRAIN_DATA='+os.environ['COMMON_DATA_DIR']+'/train.jsonl\\n')
-  for label in ('full_b8','pivot1_b8','full_b16','pivot1_b16'):(root/label).mkdir()
+  labels=[mode+'_b'+b for b in os.environ['BLOCK_SIZES'].split(',') for mode in ('full','pivot1')]
+  (root/'launch.env').write_text('export TRAIN_DATA='+os.environ['COMMON_DATA_DIR']+'/train.jsonl\\n'+'export RUN_VARIANTS="'+' '.join(labels)+'"\\n')
+  for label in labels:(root/label).mkdir()
 if os.environ.get('FAIL_STAGE') and os.environ['FAIL_STAGE'] in ' '.join(a):sys.exit(1)
 ''');python.chmod(0o755)
         for path in ['scripts/data/generate_finevision_8gpu.sh','scripts/dlite/run_training_vlm.sh',
@@ -207,7 +222,7 @@ if os.environ.get('FAIL_STAGE') and os.environ['FAIL_STAGE'] in ' '.join(a):sys.
         env=dict(os.environ,PYTHON_BIN=str(python),TARGET_MODEL=str(self.target),SOURCE_DATA=str(raw),
             DATA_ROOT=str(data),SUITE_RUN_GROUP=str(group),CALLS=str(log),FAIL_STAGE=fail or '',
             MICRO_BATCH_SIZE='99',ACCUMULATION_STEPS='99',MAX_SAMPLES='7',INIT_CHECKPOINT='/old',
-            DATA_GPUS='4,5,6,7',CUDA_VISIBLE_DEVICES='4,5,6,7')
+            DATA_GPUS='4,5,6,7',CUDA_VISIBLE_DEVICES='4,5,6,7',BLOCK_SIZES=blocks,TRAIN_GPUS=gpus)
         result=subprocess.run(['bash',str(repo/'tests/run_dflash_30w.sh'),'all'],env=env,capture_output=True,text=True)
         return result,[json.loads(l) for l in log.read_text().splitlines()]
 
@@ -231,6 +246,22 @@ if os.environ.get('FAIL_STAGE') and os.environ['FAIL_STAGE'] in ' '.join(a):sys.
         result,calls=self.exercise_shell('check_dflash_blocks.py')
         self.assertNotEqual(result.returncode,0)
         self.assertFalse(any(r['args'][0]=='scripts/dlite/run_training_vlm.sh' for r in calls))
+
+    def test_b8_only_shell_trains_and_evaluates_two_models(self):
+        result,calls=self.exercise_shell(blocks='8')
+        self.assertEqual(result.returncode,0,result.stderr)
+        train=[r for r in calls if r['args'][0]=='scripts/dlite/run_training_vlm.sh']
+        self.assertEqual([Path(r['env']['CONFIG']).parent.name for r in train],['full_b8','pivot1_b8'])
+        job=next(r for r in calls if r['args'][0]=='tests/evaluate_dflash_all.sh')
+        self.assertEqual(job['args'].count('--checkpoint'),2)
+        self.assertNotIn('full_b16',job['args'])
+
+    def test_b16_only_shell_uses_back_four_gpus(self):
+        result,calls=self.exercise_shell(blocks='16',gpus='4,5,6,7')
+        self.assertEqual(result.returncode,0,result.stderr)
+        train=[r for r in calls if r['args'][0]=='scripts/dlite/run_training_vlm.sh']
+        self.assertEqual([Path(r['env']['CONFIG']).parent.name for r in train],['full_b16','pivot1_b16'])
+        self.assertTrue(all(r['env']['CUDA_VISIBLE_DEVICES']=='4,5,6,7' for r in calls))
 
     def test_missing_evaluation_inputs_stop_before_training(self):
         result,calls=self.exercise_shell('inputs')

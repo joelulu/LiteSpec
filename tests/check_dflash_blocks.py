@@ -29,11 +29,11 @@ def check(device='cpu', flex=False):
     from litespec.core.dflash import OnlineDFlashModel
     from litespec.modeling.draft.flex_attention import flex_kernel_options
     from litespec.vlm.baselines import load_draft
-    from dflash_30w import VARIANTS
+    from dflash_30w import selected_variants
     if flex and not str(device).startswith('cuda'): raise ValueError('Flex check requires CUDA')
     dtype=torch.bfloat16 if str(device).startswith('cuda') else torch.float32
     torch.set_num_threads(1)
-    for label,(mode,block) in VARIANTS.items():
+    for label,(mode,block) in selected_variants(os.environ.get('BLOCK_SIZES','8,16')).items():
         torch.manual_seed(42)
         draft=tiny(mode,block,device,dtype).eval()
         emb=torch.nn.Embedding(128,64,device=device,dtype=dtype).requires_grad_(False)
@@ -87,13 +87,13 @@ def check_fsdp():
     from litespec.core.dflash import OnlineDFlashModel
     from litespec.training.optimizer import BF16Optimizer, register_optimizer_parameters
     from litespec.training.fsdp_layout import build_fsdp_layouts
-    from dflash_30w import VARIANTS
+    from dflash_30w import selected_variants
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     device=torch.device('cuda',torch.cuda.current_device())
     dist.init_process_group('nccl',timeout=timedelta(minutes=20))
     try:
         assert dist.get_world_size()==4
-        for label,(mode,block) in VARIANTS.items():
+        for label,(mode,block) in selected_variants(os.environ.get('BLOCK_SIZES','8,16')).items():
             torch.manual_seed(42)
             draft=tiny(mode,block,device,torch.bfloat16).train()
             draft.config._attn_implementation='flex_attention'

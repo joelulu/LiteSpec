@@ -1,10 +1,17 @@
 # Full / Pivot1, 300k candidates, block 8 / 16
 
 Entry: `bash tests/run_dflash_30w.sh all`. Stages: `data`, `train`, `eval`.
-All stages use GPUs **0,1,2,3**, never GPUs 4-7. The generation client and
+All stages use the four GPUs in `TRAIN_GPUS` (default **0,1,2,3**). The generation client and
 training use `PYTHON_BIN` (the HF VLM environment). Serving uses the separate
 `SGLANG_PYTHON`, defaulting to `$HOME/.conda/envs/dflash/bin/python` through the
 existing pipeline. Do not install SGLang into the VLM training environment.
+
+Run block8 now with `TRAIN_GPUS=0,1,2,3 BLOCK_SIZES=8 bash tests/run_dflash_30w.sh all`.
+Later run block16 with `TRAIN_GPUS=4,5,6,7 BLOCK_SIZES=16 bash tests/run_dflash_30w.sh train`.
+Each creates a fresh two-model group and evaluates only its two completed exports.
+Both reuse the SAME common data and two preflight caches; block16 does not need
+to regenerate answers. Leave `BLOCK_SIZES` unset (or `8,16`) for all four runs.
+Generation, CPU-import visibility and evaluation follow the selected GPUs too.
 
 ## Data
 
@@ -85,7 +92,7 @@ nonzero. Checkpoint exports remain available for `eval` reruns.
 
 Reports include accepted Draft length, Committed (including Target token),
 First hit, decode tok/s, same-GPU AR ratio, matches and peak memory. /Full uses
-the Full control with the SAME block size; AR rows use Full block8. All samples
+the Full control with the SAME block size; AR uses the available Full control. All samples
 contribute irrespective of AR matches. Long-context reports add prefill/total
 timings and separate Draft profiling.
 Image/text request JSONL and summary JSON additionally save per-position verifier
